@@ -246,9 +246,19 @@ or decision exists rather than restating what the code does.
 
 # Fork-specific guidance (teeny)
 
-The above is the upstream Rust project's agent policy and applies in full. What
-follows is additional guidance for this fork's own code (the MLIR codegen backend,
-Triton integration, and RVV/TritonCPU dialects).
+The above is the upstream Rust project's agent policy, carried over verbatim
+from `rust-lang/rust`. It is written for that repository and governs work headed
+there: changes to rustc, the standard library, or anything intended to be
+upstreamed. Its gates -- named reviewer, prohibited text, soundness -- apply to
+that work.
+
+It does not govern this fork's own additions: the MLIR codegen backend
+(`compiler/rustc_mlir`, `compiler/rustc_codegen_mlir`), the Triton integration
+and its submodule, and the RVV/TritonCPU dialects. That code is not upstreamed,
+and is covered by the fork-specific standards below instead.
+
+If a change touches both -- for example a rustc-side change needed to support
+the MLIR backend -- treat it as upstream work and apply the gates above.
 
 
 ## Rust Engineering Standards

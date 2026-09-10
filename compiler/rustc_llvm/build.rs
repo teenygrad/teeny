@@ -242,6 +242,17 @@ fn build_triton(llvm_config: &Path, workspace_root: &Path) -> PathBuf {
         .define("TRITON_BUILD_WITH_CCACHE", "OFF")
         .define("TRITON_CODEGEN_BACKENDS", backends)
         .define("TRITON_WHEEL_DIR", "/tmp")
+        // Triton 3.8 hard-fails configure unless a cache path is set or can be
+        // derived from TRITON_HOME/HOME. Point it at the build directory so the
+        // build doesn't depend on the invoking user's HOME.
+        .define("TRITON_CACHE_PATH", triton_build_out.join("cache"))
+        .env("TRITON_HOME", triton_build_out.join("cache"))
+        // Triton 3.8's nvidia backend compiles the gsan runtime with clang++,
+        // and looks for it ONLY under ${LLVM_SYSPATH}/bin (NO_DEFAULT_PATH).
+        // rustc's LLVM install ships no clang, so point it at the system one --
+        // clang 22, since GSanLibrary.cu uses __scoped_atomic_thread_fence,
+        // which clang 18 does not have.
+        .define("TRITON_GSAN_CLANGXX", "/usr/bin/clang++-22")
         .define("CMAKE_BUILD_TYPE", build_type)
         .define("CMAKE_INCLUDE_PATH", triton_src.join("third_party"))
         .out_dir(&triton_build_out)
