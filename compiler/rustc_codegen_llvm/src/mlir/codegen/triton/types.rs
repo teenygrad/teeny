@@ -108,7 +108,7 @@ impl TypeMapper {
             }
             TyKind::Never => IntegerType::new(context, 64).into(),
             TyKind::Tuple(tys) => self.create_tuple_type(context, tcx, tys.as_slice()),
-            TyKind::Alias(alias_ty) => self.map_alias_ty(context, tcx, ty, alias_ty),
+            TyKind::Alias(_is_rigid, alias_ty) => self.map_alias_ty(context, tcx, ty, alias_ty),
             TyKind::Param(_param_ty) => self.create_param_type(context, tcx, _param_ty),
             TyKind::Bound(bound_var_index_kind, _bound_ty) => {
                 todo!("Bound: {:?} {:?}", bound_var_index_kind, _bound_ty)
@@ -158,7 +158,7 @@ impl TypeMapper {
         ty: &Ty<'tcx>,
         alias_ty: &AliasTy<'tcx>,
     ) -> Type<'c> {
-        let typing_env = TypingEnv::post_analysis(*tcx, alias_ty.kind.def_id());
+        let typing_env = TypingEnv::fully_monomorphized();
         let normalized = tcx.try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(*ty));
         if let Ok(normalized) = normalized {
             self.map_type(context, tcx, &normalized)

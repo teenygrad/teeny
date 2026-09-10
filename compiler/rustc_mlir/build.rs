@@ -65,6 +65,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Link the built library
     println!("cargo:rustc-link-search=native={}", dst.join("lib").display());
     println!("cargo:rustc-link-lib=static=mlir-wrapper");
+    // The wrapper's RISC-V backend references the in-tree RVV dialect, which cmake
+    // builds as its own archive. It must follow mlir-wrapper on the link line.
+    println!("cargo:rustc-link-lib=static=MLIRRVVDialect");
 
     // Link MLIR libraries
     let mlir_lib_dir = llvm.install_dir.join("lib");

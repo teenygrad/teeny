@@ -374,10 +374,10 @@ impl<'tcx> MirVisitor<'tcx> {
             TerminatorKind::Unreachable => {
                 this.log("Unreachable");
             }
-            TerminatorKind::Drop { place, target, unwind, replace, drop, async_fut } => {
+            TerminatorKind::Drop { place, target, unwind, replace, drop } => {
                 this.log(&format!(
-                    "Drop: target={:?}, unwind={:?}, replace={}, drop={:?}, async_fut={:?}",
-                    target, unwind, replace, drop, async_fut
+                    "Drop: target={:?}, unwind={:?}, replace={}, drop={:?}",
+                    target, unwind, replace, drop
                 ));
                 this.visit_place("Place", place);
             }

@@ -38,9 +38,9 @@ use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_errors::DiagCtxtHandle;
 use rustc_middle::dep_graph;
-use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
+use rustc_middle::dep_graph::{WorkProduct, WorkProductId, WorkProductMap};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::Session;
+use rustc_session::{IncrCompSession, Session};
 use rustc_session::config::{self, OutputFilenames, PrintKind, PrintRequest};
 use rustc_span::Symbol;
 use rustc_target::spec::Arch;
@@ -63,6 +63,8 @@ impl MlirCodegenBackend {
 }
 
 impl ExtraBackendMethods for MlirCodegenBackend {
+    type Module = MlirModule<'static>;
+
     fn codegen_allocator<'tcx>(
         &self,
         _tcx: TyCtxt<'tcx>,
@@ -399,6 +401,7 @@ fn write_compiled_module(
         name: module.name,
         kind: module.kind,
         object: Some(out_path),
+        global_asm_object: None,
         dwarf_object: None,
         bytecode: None,
         assembly: None,
@@ -420,8 +423,7 @@ impl CodegenBackend for MlirCodegenBackend {
         // To Do: Implement MLIR-specific target config for the target
         // defined in the session
         TargetConfig {
-            target_features: Vec::new(),
-            unstable_target_features: Vec::new(),
+            internal_target_features: Default::default(),
             has_reliable_f16: false,
             has_reliable_f16_math: false,
             has_reliable_f128: false,
@@ -442,15 +444,16 @@ impl CodegenBackend for MlirCodegenBackend {
         &self,
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
+        incr_comp_session: Option<&IncrCompSession>,
         _outputs: &OutputFilenames,
         crate_info: &CrateInfo,
-    ) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
+    ) -> (CompiledModules, WorkProductMap) {
         info!("=== MLIR join_codegen ===");
 
         let (compiled_modules, work_products) = ongoing_codegen
             .downcast::<rustc_codegen_ssa::back::write::OngoingCodegen<MlirCodegenBackend>>()
             .expect("Expected OngoingCodegen<MlirCodegenBackend>")
-            .join(sess, crate_info);
+            .join(sess, incr_comp_session, crate_info);
 
         info!("Codegen completed");
         info!("  Work products: {}", work_products.len());

@@ -254,7 +254,7 @@ fn compute_const_disc_locals<'tcx>(
         let instantiated = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(c.const_),
+            EarlyBinder::bind(tcx, c.const_),
         );
         match instantiated {
             Const::Val(ConstValue::Scalar(Scalar::Int(s)), _) => Some(s.to_bits_unchecked() as u64),
@@ -343,7 +343,7 @@ pub(crate) fn extract_switch_const<'tcx>(
             let instantiated = instance.instantiate_mir_and_normalize_erasing_regions(
                 tcx,
                 TypingEnv::fully_monomorphized(),
-                EarlyBinder::bind(c.const_),
+                EarlyBinder::bind(tcx, c.const_),
             );
             match instantiated {
                 Const::Val(ConstValue::Scalar(Scalar::Int(s)), _) => {
@@ -1465,7 +1465,7 @@ impl<'a> TritonCodegen<'a> {
             Const::Unevaluated(uv, _) => {
                 // Substitute the function's generic params with the instance's concrete args.
                 let concrete_args =
-                    EarlyBinder::bind(uv.args).instantiate(tcx, instance.args).skip_norm_wip();
+                    EarlyBinder::bind(tcx, uv.args).instantiate(tcx, instance.args).skip_norm_wip();
                 let concrete_uv =
                     MirUnevaluatedConst { def: uv.def, args: concrete_args, promoted: uv.promoted };
                 match tcx.const_eval_resolve(
@@ -1781,7 +1781,7 @@ impl<'a> TritonCodegen<'a> {
                 let normalized_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     TypingEnv::fully_monomorphized(),
-                    EarlyBinder::bind(discr.ty(mir, tcx)),
+                    EarlyBinder::bind(tcx, discr.ty(mir, tcx)),
                 );
                 self.codegen_operand(
                     tcx,
@@ -2289,7 +2289,7 @@ impl<'a> TritonCodegen<'a> {
                 let normalized_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     typing_env,
-                    EarlyBinder::bind(ty),
+                    EarlyBinder::bind(tcx, ty),
                 );
 
                 // Route Option<T> locals into the option_table instead of ssa_values.
@@ -2370,7 +2370,7 @@ impl<'a> TritonCodegen<'a> {
                     let const_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                         tcx,
                         TypingEnv::fully_monomorphized(),
-                        EarlyBinder::bind(c.const_.ty()),
+                        EarlyBinder::bind(tcx, c.const_.ty()),
                     );
                     if let Some(shape) =
                         self.try_read_array_ref_const(tcx, *instance, const_ty, &c.const_)
@@ -2423,7 +2423,7 @@ impl<'a> TritonCodegen<'a> {
                         let src_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                             tcx,
                             TypingEnv::fully_monomorphized(),
-                            EarlyBinder::bind(const_op.const_.ty()),
+                            EarlyBinder::bind(tcx, const_op.const_.ty()),
                         );
                         if let Some(shape) =
                             self.try_read_array_ref_const(tcx, *instance, src_ty, &const_op.const_)
@@ -2468,7 +2468,7 @@ impl<'a> TritonCodegen<'a> {
                     let norm_place_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                         tcx,
                         TypingEnv::fully_monomorphized(),
-                        EarlyBinder::bind(place.ty(mir, tcx).ty),
+                        EarlyBinder::bind(tcx, place.ty(mir, tcx).ty),
                     );
                     if is_option_ty(tcx, norm_place_ty) {
                         return self.codegen_option_aggregate(
@@ -2556,7 +2556,7 @@ impl<'a> TritonCodegen<'a> {
                                 let ty = instance.instantiate_mir_and_normalize_erasing_regions(
                                     tcx,
                                     TypingEnv::fully_monomorphized(),
-                                    EarlyBinder::bind(op.ty(mir, tcx)),
+                                    EarlyBinder::bind(tcx, op.ty(mir, tcx)),
                                 );
                                 self.codegen_operand(
                                     tcx, instance, op, ty, location, mlir_block, state,
@@ -2587,7 +2587,7 @@ impl<'a> TritonCodegen<'a> {
                                         .instantiate_mir_and_normalize_erasing_regions(
                                             tcx,
                                             TypingEnv::fully_monomorphized(),
-                                            EarlyBinder::bind(op.ty(mir, tcx)),
+                                            EarlyBinder::bind(tcx, op.ty(mir, tcx)),
                                         );
                                     self.codegen_operand(
                                         tcx, instance, op, ty, location, mlir_block, state,
@@ -2688,7 +2688,7 @@ impl<'a> TritonCodegen<'a> {
                 let op_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     TypingEnv::fully_monomorphized(),
-                    EarlyBinder::bind(operand.ty(mir, tcx)),
+                    EarlyBinder::bind(tcx, operand.ty(mir, tcx)),
                 );
                 let val = self
                     .codegen_operand(tcx, instance, operand, op_ty, location, mlir_block, state)?;
@@ -2732,7 +2732,7 @@ impl<'a> TritonCodegen<'a> {
                 let norm_src_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     TypingEnv::fully_monomorphized(),
-                    EarlyBinder::bind(src_ty),
+                    EarlyBinder::bind(tcx, src_ty),
                 );
                 if is_option_ty(tcx, norm_src_ty) {
                     // The discriminant of an Option is statically known from the option_table.
@@ -2823,7 +2823,7 @@ impl<'a> TritonCodegen<'a> {
         let arg1_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(arg1.ty(mir, tcx)),
+            EarlyBinder::bind(tcx, arg1.ty(mir, tcx)),
         );
 
         let pointee_ty = match arg1_ty.kind() {
@@ -2855,7 +2855,7 @@ impl<'a> TritonCodegen<'a> {
         let arg1_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(arg1.ty(mir, tcx)),
+            EarlyBinder::bind(tcx, arg1.ty(mir, tcx)),
         );
         // `Pointer<T>` is a newtype wrapper around a raw pointer in Triton DSL.
         // Preserve the wrapped pointer SSA value rather than materializing poison.
@@ -2879,7 +2879,7 @@ impl<'a> TritonCodegen<'a> {
             let ty = instance.instantiate_mir_and_normalize_erasing_regions(
                 tcx,
                 TypingEnv::fully_monomorphized(),
-                EarlyBinder::bind(raw_list[idx].expect_ty()),
+                EarlyBinder::bind(tcx, raw_list[idx].expect_ty()),
             );
             self.type_mapper.map_type(self.module.context(), &tcx, &ty)
         };
@@ -2926,12 +2926,12 @@ impl<'a> TritonCodegen<'a> {
         let lhs_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(lhs_op.ty(mir, tcx)),
+            EarlyBinder::bind(tcx, lhs_op.ty(mir, tcx)),
         );
         let rhs_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(rhs_op.ty(mir, tcx)),
+            EarlyBinder::bind(tcx, rhs_op.ty(mir, tcx)),
         );
         let lhs =
             self.codegen_operand(tcx, instance, lhs_op, lhs_ty, location, mlir_block, state)?;
@@ -3001,7 +3001,7 @@ impl<'a> TritonCodegen<'a> {
             let inner_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                 tcx,
                 TypingEnv::fully_monomorphized(),
-                EarlyBinder::bind(inner_op.ty(mir, tcx)),
+                EarlyBinder::bind(tcx, inner_op.ty(mir, tcx)),
             );
             let inner_value = self
                 .codegen_operand(tcx, instance, inner_op, inner_ty, location, mlir_block, state)?;
@@ -3024,7 +3024,7 @@ impl<'a> TritonCodegen<'a> {
         let norm_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(place_ty),
+            EarlyBinder::bind(tcx, place_ty),
         );
 
         if is_option_ty(tcx, norm_ty) {
@@ -3104,7 +3104,7 @@ impl<'a> TritonCodegen<'a> {
                 let normalized_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     TypingEnv::fully_monomorphized(),
-                    EarlyBinder::bind(*ty),
+                    EarlyBinder::bind(tcx, *ty),
                 );
                 let src_val = self.codegen_operand(
                     tcx,
@@ -3127,7 +3127,7 @@ impl<'a> TritonCodegen<'a> {
                 let normalized_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     TypingEnv::fully_monomorphized(),
-                    EarlyBinder::bind(*ty),
+                    EarlyBinder::bind(tcx, *ty),
                 );
                 let src_val = self.codegen_operand(
                     tcx,
@@ -3158,7 +3158,7 @@ impl<'a> TritonCodegen<'a> {
                 let normalized_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     TypingEnv::fully_monomorphized(),
-                    EarlyBinder::bind(*ty),
+                    EarlyBinder::bind(tcx, *ty),
                 );
                 let src_val = self.codegen_operand(
                     tcx,
@@ -3222,7 +3222,7 @@ impl<'a> TritonCodegen<'a> {
                 let normalized_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     typing_env,
-                    EarlyBinder::bind(*ty),
+                    EarlyBinder::bind(tcx, *ty),
                 );
                 let mlir_ty =
                     self.type_mapper.map_type(self.module.context(), &tcx, &normalized_ty);
@@ -3270,7 +3270,7 @@ impl<'a> TritonCodegen<'a> {
         let normalized_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             typing_env,
-            EarlyBinder::bind(*ty),
+            EarlyBinder::bind(tcx, *ty),
         );
 
         self.codegen_operand(tcx, instance, operand, normalized_ty, location, mlir_block, state)
@@ -3290,7 +3290,7 @@ impl<'a> TritonCodegen<'a> {
         let normalized_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             typing_env,
-            EarlyBinder::bind(*ty),
+            EarlyBinder::bind(tcx, *ty),
         );
 
         self.codegen_operand(tcx, instance, operand, normalized_ty, location, mlir_block, state)
@@ -3310,7 +3310,7 @@ impl<'a> TritonCodegen<'a> {
         let normalized_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             typing_env,
-            EarlyBinder::bind(*ty),
+            EarlyBinder::bind(tcx, *ty),
         );
         self.codegen_operand(tcx, instance, operand, normalized_ty, location, mlir_block, state)
     }
@@ -3358,7 +3358,7 @@ impl<'a> TritonCodegen<'a> {
         let ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(operand.ty(mir, tcx)),
+            EarlyBinder::bind(tcx, operand.ty(mir, tcx)),
         );
 
         if is_option_ty(tcx, ty) {
@@ -3421,7 +3421,7 @@ impl<'a> TritonCodegen<'a> {
             let normalized_field_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                 tcx,
                 TypingEnv::fully_monomorphized(),
-                EarlyBinder::bind(*field_ty),
+                EarlyBinder::bind(tcx, *field_ty),
             );
             let field_layout = tcx
                 .layout_of(TypingEnv::fully_monomorphized().as_query_input(normalized_field_ty))
@@ -3549,7 +3549,7 @@ impl<'a> TritonCodegen<'a> {
                 ConstKind::Infer(_infer_const) => todo!("ConstKind::Infer"),
                 ConstKind::Bound(_bound_var_index_kind, _) => todo!("ConstKind::Bound"),
                 ConstKind::Placeholder(_) => todo!("ConstKind::Placeholder"),
-                ConstKind::Unevaluated(_unevaluated_const) => todo!("ConstKind::Unevaluated"),
+                ConstKind::Alias(_, _alias_const) => todo!("ConstKind::Alias"),
                 ConstKind::Value(_) => todo!("ConstKind::Value"),
                 ConstKind::Error(_) => todo!("ConstKind::Error"),
                 ConstKind::Expr(_) => todo!("ConstKind::Expr"),

@@ -587,12 +587,15 @@ impl<'a> TritonCodegen<'a> {
         let fn_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            ty::EarlyBinder::bind(fn_ty),
+            ty::EarlyBinder::bind(tcx, fn_ty),
         );
         let ret_ty = match fn_ty.kind() {
             // Function definitions (e.g., closures and fn items).
             TyKind::FnDef(def_id, substs) => {
-                let sig = tcx.fn_sig(*def_id).instantiate(tcx, substs).skip_norm_wip();
+                let sig = tcx
+                    .fn_sig(*def_id)
+                    .instantiate(tcx, substs.no_bound_vars().unwrap())
+                    .skip_norm_wip();
                 sig.output().skip_binder()
             }
             // For function pointers, combine binder + header and get the output type.
@@ -612,13 +615,18 @@ impl<'a> TritonCodegen<'a> {
                 let ty = instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     TypingEnv::fully_monomorphized(),
-                    EarlyBinder::bind(ty),
+                    EarlyBinder::bind(tcx, ty),
                 );
                 match ty.kind() {
                     TyKind::FnDef(def_id, substs) => {
                         let typing_env = TypingEnv::post_analysis(tcx, *def_id);
                         if let Some(instance) =
-                            Instance::resolve_for_fn_ptr(tcx, typing_env, *def_id, substs)
+                            Instance::resolve_for_fn_ptr(
+                                tcx,
+                                typing_env,
+                                *def_id,
+                                substs.no_bound_vars().unwrap(),
+                            )
                         {
                             tcx.symbol_name(instance).name.to_string()
                         } else {
@@ -735,7 +743,7 @@ impl<'a> TritonCodegen<'a> {
         let discr_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(discr.ty(mir, tcx)),
+            EarlyBinder::bind(tcx, discr.ty(mir, tcx)),
         );
 
         let discr_value =

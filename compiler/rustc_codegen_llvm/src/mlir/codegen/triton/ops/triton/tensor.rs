@@ -282,7 +282,7 @@ impl<'a> TritonCodegen<'a> {
             let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                 tcx,
                 TypingEnv::fully_monomorphized(),
-                EarlyBinder::bind(dest_ty),
+                EarlyBinder::bind(tcx, dest_ty),
             );
             let dest_mlir_ty = self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty);
 
@@ -617,7 +617,7 @@ impl<'a> TritonCodegen<'a> {
         let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(dest_ty),
+            EarlyBinder::bind(tcx, dest_ty),
         );
 
         // Extract the element MLIR type:
@@ -893,7 +893,7 @@ impl<'a> TritonCodegen<'a> {
         let dest_rust_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(dest_rust_ty),
+            EarlyBinder::bind(tcx, dest_rust_ty),
         );
         let dest_mlir_ty = self.type_mapper.map_type(self.module.context(), &tcx, &dest_rust_ty);
 
@@ -2346,7 +2346,7 @@ impl<'a> TritonCodegen<'a> {
         let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(destination.ty(mir, tcx).ty),
+            EarlyBinder::bind(tcx, destination.ty(mir, tcx).ty),
         );
 
         // Void (unit) return — no value needed.
@@ -2423,7 +2423,7 @@ impl<'a> TritonCodegen<'a> {
         let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(dest_ty),
+            EarlyBinder::bind(tcx, dest_ty),
         );
         let result_ty = self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty);
 
@@ -2582,7 +2582,7 @@ impl<'a> TritonCodegen<'a> {
             let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                 tcx,
                 TypingEnv::fully_monomorphized(),
-                EarlyBinder::bind(dest_ty),
+                EarlyBinder::bind(tcx, dest_ty),
             );
             // Determine the scalar element type (e.g. f32).
             let elem_ty_str = match dest_ty.kind() {
@@ -2607,7 +2607,7 @@ impl<'a> TritonCodegen<'a> {
             let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                 tcx,
                 TypingEnv::fully_monomorphized(),
-                EarlyBinder::bind(dest_ty),
+                EarlyBinder::bind(tcx, dest_ty),
             );
             self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty)
         };
@@ -2686,7 +2686,7 @@ impl<'a> TritonCodegen<'a> {
         let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(dest_ty),
+            EarlyBinder::bind(tcx, dest_ty),
         );
 
         // Use the descriptor's block shape (set at make_tensor_descriptor time) for the result
@@ -3107,7 +3107,7 @@ impl<'a> TritonCodegen<'a> {
         let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(dest_ty),
+            EarlyBinder::bind(tcx, dest_ty),
         );
         let result_ty = self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty);
 
@@ -4460,7 +4460,7 @@ impl<'a> TritonCodegen<'a> {
         let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(dest_ty),
+            EarlyBinder::bind(tcx, dest_ty),
         );
         let result_ty = self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty);
 
@@ -5027,7 +5027,7 @@ impl<'a> TritonCodegen<'a> {
         let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(dest_ty),
+            EarlyBinder::bind(tcx, dest_ty),
         );
         let mapped_ty = self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty);
 
