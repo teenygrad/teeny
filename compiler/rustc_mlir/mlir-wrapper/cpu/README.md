@@ -33,29 +33,40 @@ Measured, not guessed: with `-DTRITON_CPU_ENABLE=ON`, all **17 TableGen outputs
 build clean** (the `.td` files have no LLVM 22.0 drift at all) and **33 of 40
 objects compile**. Seven fail, in four groups.
 
-### 1. Patched-LLVM dependencies (5 files) — the blocker
+### 1. Upstream LLVM version skew (5 files) — the blocker
 
-triton-cpu is built against a *patched* LLVM, and two of its patches are load-
-bearing here. Neither is a matter of `LLVM_TARGETS_TO_BUILD`: X86 is already in
-our target list (`X86;AMDGPU;NVPTX;RISCV`). These are MLIR **dialect/library**
-patches, a separate axis from LLVM codegen targets.
+triton-cpu builds against **stock upstream LLVM**, not a fork: its
+`scripts/build-llvm-project.sh` clones `github.com/llvm/llvm-project` and
+`reset --hard`s to the hash in `cmake/llvm-info.json`
+(`62b7cf9623fc310525f39ed69aaecc318a909731`, main @ 2026-06-01). No patches are
+applied anywhere in that script.
 
-- **`mlir/Dialect/X86/`** — does not exist in LLVM 22.0. The fork consolidates
-  AMX under an umbrella `x86::X86Dialect` at `mlir::x86::amx`; upstream has it
-  at `mlir/Dialect/AMX/AMXDialect.h` under plain `mlir::amx`, with no umbrella.
-  Breaks `TritonCPUToLLVM/TypeConverter.cpp`,
-  `TritonCPUTransforms/ConvertDotOp/ConvertDotTo{AMX,Nanokernel}.cpp`, and
-  `include/TritonCPU/Registration.h`. Shallow: header path, namespace prefix,
-  and the `x86::X86Dialect` registry entry.
-- **`populateVectorMultiReduction{Reorder,Flattening,Unrolling}Patterns`** —
-  fork additions to MLIR's vector dialect, absent upstream. Breaks
-  `TritonCPUToLLVM/LowerMultiReduction.cpp`. Upstream offers only
-  `populateVectorMultiReductionLoweringPatterns`, so this one needs real work,
-  not a rename.
+Our `src/llvm-project` is LLVM 22.1 on `chore/rustc-1.97.1-pin`, forked from
+upstream main at `e9f758a59b2f` (2026-01-13). Both changes below landed upstream
+in the ~4.5-month gap, so this is version skew, not a fork divergence — and it
+resolves itself whenever the rustc LLVM pin advances past them.
 
-Either port these to the upstream equivalents, or carry the triton-cpu LLVM
-patches into `src/llvm-project`. The first is likely cheaper for AMX, the
-second may be unavoidable for the vector patterns.
+Note this is not a `LLVM_TARGETS_TO_BUILD` question: X86 is already in our
+target list (`X86;AMDGPU;NVPTX;RISCV`). These are MLIR dialect/library changes,
+a separate axis from LLVM codegen targets.
+
+- **`67ac275fee18` (2026-02-26) "[mlir][x86] Rename x86vector to x86"** — renames
+  the `x86vector` dialect to `x86` and nests AMX beneath it, so
+  `mlir/Dialect/AMX/AMXDialect.h` + `mlir::amx` became
+  `mlir/Dialect/X86/X86Dialect.h` + `mlir::x86::amx`. Breaks
+  `TritonCPUToLLVM/TypeConverter.cpp`,
+  `TritonCPUTransforms/ConvertDotOp/ConvertDotTo{AMX,Nanokernel}.cpp` and
+  `include/TritonCPU/Registration.h`. Being a pure rename, adapting backwards to
+  our `mlir::amx` is mechanical.
+- **`613a5c555ebf` (2026-03-04) "[mlir][vector] Replace
+  OneDimMultiReductionToTwoDim with OneDimMultiReductionToReduction" (#184241)**
+  — added `populateVectorMultiReduction{Reorder,Flattening,Unrolling}Patterns`.
+  We have only `populateVectorMultiReductionLoweringPatterns`. Breaks
+  `TritonCPUToLLVM/LowerMultiReduction.cpp`. Not a rename; needs real work or a
+  backport.
+
+Three options per item: adapt the source backwards to our API, backport the
+upstream commit into `src/llvm-project`, or wait for the rustc LLVM pin to move.
 
 ### 2. Triton API drift (1 file)
 
