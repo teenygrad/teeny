@@ -1,8 +1,9 @@
-use rustc_middle::mir::{self, NonDivergingIntrinsic, StmtDebugInfo};
+use rustc_middle::mir::{self, NonDivergingIntrinsic};
 use rustc_middle::{bug, span_bug, ty};
 use tracing::instrument;
 
 use super::{FunctionCx, LocalRef};
+use crate::mir::retag;
 use crate::traits::*;
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
@@ -12,9 +13,17 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         self.set_debug_loc(bx, statement.source_info);
         match statement.kind {
             mir::StatementKind::Assign((ref place, ref rvalue)) => {
+                let needs_retag = bx.tcx().sess.opts.unstable_opts.codegen_emit_retag.is_some()
+                    && retag::rvalue_needs_retag(rvalue);
+
                 if let Some(index) = place.as_local() {
                     match self.locals[index] {
-                        LocalRef::Place(cg_dest) => self.codegen_rvalue(bx, cg_dest, rvalue),
+                        LocalRef::Place(cg_dest) => {
+                            self.codegen_rvalue(bx, cg_dest, rvalue);
+                            if needs_retag {
+                                self.codegen_retag_place(bx, cg_dest, false);
+                            }
+                        }
                         LocalRef::UnsizedPlace(cg_indirect_dest) => {
                             let ty = cg_indirect_dest.layout.ty;
                             span_bug!(
@@ -24,7 +33,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                             );
                         }
                         LocalRef::PendingOperand => {
-                            let operand = self.codegen_rvalue_operand(bx, rvalue);
+                            let mut operand = self.codegen_rvalue_operand(bx, rvalue);
+                            if needs_retag {
+                                operand = self.codegen_retag_operand(bx, operand, false);
+                            }
                             self.overwrite_local(index, LocalRef::Operand(operand));
                             self.debug_introduce_local(bx, index);
                         }
@@ -39,12 +51,19 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
                             // If the type is zero-sized, it's already been set here,
                             // but we still need to make sure we codegen the operand
-                            self.codegen_rvalue_operand(bx, rvalue);
+                            // and emit a retag.
+                            let operand = self.codegen_rvalue_operand(bx, rvalue);
+                            if needs_retag {
+                                self.codegen_retag_operand(bx, operand, false);
+                            }
                         }
                     }
                 } else {
                     let cg_dest = self.codegen_place(bx, place.as_ref());
                     self.codegen_rvalue(bx, cg_dest, rvalue);
+                    if needs_retag {
+                        self.codegen_retag_place(bx, cg_dest, false);
+                    }
                 }
             }
             mir::StatementKind::SetDiscriminant { ref place, variant_index } => {
@@ -86,7 +105,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     .layout_of(bx.typing_env().as_query_input(pointee))
                     .expect("expected pointee to have a layout");
                 let elem_size = pointee_layout.layout.size().bytes();
-                let bytes = bx.mul(count, bx.const_usize(elem_size));
+                let bytes = bx.unchecked_sumul(count, bx.const_usize(elem_size));
 
                 let align = pointee_layout.layout.align.abi;
                 let dst = dst_val.immediate();
@@ -100,51 +119,6 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             | mir::StatementKind::PlaceMention(..)
             | mir::StatementKind::BackwardIncompatibleDropHint { .. }
             | mir::StatementKind::Nop => {}
-        }
-    }
-
-    pub(crate) fn codegen_stmt_debuginfo(&mut self, bx: &mut Bx, debuginfo: &StmtDebugInfo<'tcx>) {
-        match debuginfo {
-            StmtDebugInfo::AssignRef(dest, place) => {
-                let local_ref = match self.locals[place.local] {
-                    // For an rvalue like `&(_1.1)`, when `BackendRepr` is `BackendRepr::Memory`, we allocate a block of memory to this place.
-                    // The place is an indirect pointer, we can refer to it directly.
-                    LocalRef::Place(place_ref) => Some((place_ref, place.projection.as_slice())),
-                    // For an rvalue like `&((*_1).1)`, we are calculating the address of `_1.1`.
-                    // The deref projection is no-op here.
-                    LocalRef::Operand(operand_ref) if place.is_indirect_first_projection() => {
-                        Some((operand_ref.deref(bx.cx()), &place.projection[1..]))
-                    }
-                    // For an rvalue like `&1`, when `BackendRepr` is `BackendRepr::Scalar`,
-                    // we cannot get the address.
-                    // N.B. `non_ssa_locals` returns that this is an SSA local.
-                    LocalRef::Operand(_) => None,
-                    LocalRef::UnsizedPlace(_) | LocalRef::PendingOperand => None,
-                }
-                .filter(|(_, projection)| {
-                    // Drop unsupported projections.
-                    projection.iter().all(|p| p.can_use_in_debuginfo())
-                });
-                if let Some((base, projection)) = local_ref {
-                    self.debug_new_val_to_local(bx, *dest, base, projection);
-                } else {
-                    // If the address cannot be calculated, use poison to indicate that the value has been optimized out.
-                    self.debug_poison_to_local(bx, *dest);
-                }
-            }
-            StmtDebugInfo::InvalidAssign(local) => {
-                self.debug_poison_to_local(bx, *local);
-            }
-        }
-    }
-
-    pub(crate) fn codegen_stmt_debuginfos(
-        &mut self,
-        bx: &mut Bx,
-        debuginfos: &[StmtDebugInfo<'tcx>],
-    ) {
-        for debuginfo in debuginfos {
-            self.codegen_stmt_debuginfo(bx, debuginfo);
         }
     }
 }

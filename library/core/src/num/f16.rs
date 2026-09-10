@@ -35,6 +35,7 @@ pub mod consts {
     pub const TAU: f16 = 6.28318530717958647692528676655900577_f16;
 
     /// The golden ratio (φ)
+    #[doc(alias = "phi")]
     #[unstable(feature = "f16", issue = "116909")]
     pub const GOLDEN_RATIO: f16 = 1.618033988749894848204586834365638118_f16;
 
@@ -1537,8 +1538,8 @@ impl f16 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[unstable(feature = "f16", issue = "116909")]
+    #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[inline]
     pub const fn algebraic_add(self, rhs: f16) -> f16 {
         intrinsics::fadd_algebraic(self, rhs)
@@ -1548,8 +1549,8 @@ impl f16 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[unstable(feature = "f16", issue = "116909")]
+    #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[inline]
     pub const fn algebraic_sub(self, rhs: f16) -> f16 {
         intrinsics::fsub_algebraic(self, rhs)
@@ -1559,8 +1560,8 @@ impl f16 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[unstable(feature = "f16", issue = "116909")]
+    #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[inline]
     pub const fn algebraic_mul(self, rhs: f16) -> f16 {
         intrinsics::fmul_algebraic(self, rhs)
@@ -1570,8 +1571,8 @@ impl f16 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[unstable(feature = "f16", issue = "116909")]
+    #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[inline]
     pub const fn algebraic_div(self, rhs: f16) -> f16 {
         intrinsics::fdiv_algebraic(self, rhs)
@@ -1581,8 +1582,8 @@ impl f16 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[unstable(feature = "f16", issue = "116909")]
+    #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[inline]
     pub const fn algebraic_rem(self, rhs: f16) -> f16 {
         intrinsics::frem_algebraic(self, rhs)

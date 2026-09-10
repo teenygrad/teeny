@@ -9,154 +9,157 @@
 
 use crate::{declare_lint, declare_lint_pass, fcw};
 
-declare_lint_pass! {
-    /// Does nothing as a lint pass, but registers some `Lint`s
-    /// that are used by other parts of the compiler.
-    HardwiredLints => [
-        // tidy-alphabetical-start
-        AARCH64_SOFTFLOAT_NEON,
-        ABSOLUTE_PATHS_NOT_STARTING_WITH_CRATE,
-        AMBIGUOUS_ASSOCIATED_ITEMS,
-        AMBIGUOUS_DERIVE_HELPERS,
-        AMBIGUOUS_GLOB_IMPORTED_TRAITS,
-        AMBIGUOUS_GLOB_IMPORTS,
-        AMBIGUOUS_GLOB_REEXPORTS,
-        AMBIGUOUS_IMPORT_VISIBILITIES,
-        AMBIGUOUS_PANIC_IMPORTS,
-        ARITHMETIC_OVERFLOW,
-        ASM_SUB_REGISTER,
-        BAD_ASM_STYLE,
-        BARE_TRAIT_OBJECTS,
-        BINDINGS_WITH_VARIANT_NAME,
-        BREAK_WITH_LABEL_AND_LOOP,
-        COHERENCE_LEAK_CHECK,
-        CONFLICTING_REPR_HINTS,
-        CONST_EVALUATABLE_UNCHECKED,
-        CONST_ITEM_MUTATION,
-        DEAD_CODE,
-        DEAD_CODE_PUB_IN_BINARY,
-        DEPENDENCY_ON_UNIT_NEVER_TYPE_FALLBACK,
-        DEPRECATED,
-        DEPRECATED_IN_FUTURE,
-        DEPRECATED_LLVM_INTRINSIC,
-        DEPRECATED_SAFE_2024,
-        DEPRECATED_WHERE_CLAUSE_LOCATION,
-        DUPLICATE_FEATURES,
-        DUPLICATE_MACRO_ATTRIBUTES,
-        ELIDED_LIFETIMES_IN_ASSOCIATED_CONSTANT,
-        ELIDED_LIFETIMES_IN_PATHS,
-        EXPLICIT_BUILTIN_CFGS_IN_FLAGS,
-        EXPORTED_PRIVATE_DEPENDENCIES,
-        FFI_UNWIND_CALLS,
-        FLOAT_LITERAL_F32_FALLBACK,
-        FORBIDDEN_LINT_GROUPS,
-        FUNCTION_ITEM_REFERENCES,
-        FUZZY_PROVENANCE_CASTS,
-        HIDDEN_GLOB_REEXPORTS,
-        ILL_FORMED_ATTRIBUTE_INPUT,
-        INCOMPLETE_INCLUDE,
-        INEFFECTIVE_UNSTABLE_TRAIT_IMPL,
-        INLINE_NO_SANITIZE,
-        INVALID_DOC_ATTRIBUTES,
-        INVALID_MACRO_EXPORT_ARGUMENTS,
-        INVALID_TYPE_PARAM_DEFAULT,
-        IRREFUTABLE_LET_PATTERNS,
-        LARGE_ASSIGNMENTS,
-        LATE_BOUND_LIFETIME_ARGUMENTS,
-        LEGACY_DERIVE_HELPERS,
-        LINKER_INFO,
-        LINKER_MESSAGES,
-        LONG_RUNNING_CONST_EVAL,
-        LOSSY_PROVENANCE_CASTS,
-        MACRO_EXPANDED_MACRO_EXPORTS_ACCESSED_BY_ABSOLUTE_PATHS,
-        MACRO_USE_EXTERN_CRATE,
-        MALFORMED_DIAGNOSTIC_ATTRIBUTES,
-        MALFORMED_DIAGNOSTIC_FORMAT_LITERALS,
-        META_VARIABLE_MISUSE,
-        MISPLACED_DIAGNOSTIC_ATTRIBUTES,
-        MISSING_ABI,
-        MISSING_UNSAFE_ON_EXTERN,
-        MUST_NOT_SUSPEND,
-        NAMED_ARGUMENTS_USED_POSITIONALLY,
-        NEVER_TYPE_FALLBACK_FLOWING_INTO_UNSAFE,
-        NON_CONTIGUOUS_RANGE_ENDPOINTS,
-        NON_EXHAUSTIVE_OMITTED_PATTERNS,
-        OUT_OF_SCOPE_MACRO_CALLS,
-        OVERLAPPING_RANGE_ENDPOINTS,
-        PATTERNS_IN_FNS_WITHOUT_BODY,
-        PRIVATE_BOUNDS,
-        PRIVATE_INTERFACES,
-        PROC_MACRO_DERIVE_RESOLUTION_FALLBACK,
-        PUB_USE_OF_PRIVATE_EXTERN_CRATE,
-        REDUNDANT_IMPORTS,
-        REDUNDANT_LIFETIMES,
-        REFINING_IMPL_TRAIT_INTERNAL,
-        REFINING_IMPL_TRAIT_REACHABLE,
-        RENAMED_AND_REMOVED_LINTS,
-        REPR_C_ENUMS_LARGER_THAN_INT,
-        REPR_TRANSPARENT_NON_ZST_FIELDS,
-        RESOLVING_TO_ITEMS_SHADOWING_SUPERTRAIT_ITEMS,
-        RTSAN_NONBLOCKING_ASYNC,
-        RUST_2021_INCOMPATIBLE_CLOSURE_CAPTURES,
-        RUST_2021_INCOMPATIBLE_OR_PATTERNS,
-        RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX,
-        RUST_2021_PRELUDE_COLLISIONS,
-        RUST_2024_GUARDED_STRING_INCOMPATIBLE_SYNTAX,
-        RUST_2024_INCOMPATIBLE_PAT,
-        RUST_2024_PRELUDE_COLLISIONS,
-        SELF_CONSTRUCTOR_FROM_OUTER_ITEM,
-        SEMICOLON_IN_EXPRESSIONS_FROM_MACROS,
-        SHADOWING_SUPERTRAIT_ITEMS,
-        SINGLE_USE_LIFETIMES,
-        STABLE_FEATURES,
-        TAIL_CALL_TRACK_CALLER,
-        TAIL_EXPR_DROP_ORDER,
-        TEST_UNSTABLE_LINT,
-        TEXT_DIRECTION_CODEPOINT_IN_COMMENT,
-        TEXT_DIRECTION_CODEPOINT_IN_LITERAL,
-        TRIVIAL_CASTS,
-        TRIVIAL_NUMERIC_CASTS,
-        TYVAR_BEHIND_RAW_POINTER,
-        UNCONDITIONAL_PANIC,
-        UNCONDITIONAL_RECURSION,
-        UNCOVERED_PARAM_IN_PROJECTION,
-        UNEXPECTED_CFGS,
-        UNFULFILLED_LINT_EXPECTATIONS,
-        UNINHABITED_STATIC,
-        UNKNOWN_CRATE_TYPES,
-        UNKNOWN_DIAGNOSTIC_ATTRIBUTES,
-        UNKNOWN_LINTS,
-        UNNAMEABLE_TEST_ITEMS,
-        UNNAMEABLE_TYPES,
-        UNREACHABLE_CFG_SELECT_PREDICATES,
-        UNREACHABLE_CODE,
-        UNREACHABLE_PATTERNS,
-        UNSAFE_ATTR_OUTSIDE_UNSAFE,
-        UNSAFE_OP_IN_UNSAFE_FN,
-        UNSTABLE_NAME_COLLISIONS,
-        UNSTABLE_SYNTAX_PRE_EXPANSION,
-        UNSUPPORTED_CALLING_CONVENTIONS,
-        UNUSED_ASSIGNMENTS,
-        UNUSED_ASSOCIATED_TYPE_BOUNDS,
-        UNUSED_ATTRIBUTES,
-        UNUSED_CRATE_DEPENDENCIES,
-        UNUSED_EXTERN_CRATES,
-        UNUSED_FEATURES,
-        UNUSED_IMPORTS,
-        UNUSED_LABELS,
-        UNUSED_LIFETIMES,
-        UNUSED_MACROS,
-        UNUSED_MACRO_RULES,
-        UNUSED_MUT,
-        UNUSED_QUALIFICATIONS,
-        UNUSED_UNSAFE,
-        UNUSED_VARIABLES,
-        UNUSED_VISIBILITIES,
-        USELESS_DEPRECATED,
-        VARARGS_WITHOUT_PATTERN,
-        WARNINGS,
-        // tidy-alphabetical-end
-    ]
+pub mod hardwired {
+    use super::*;
+
+    pub fn lint_vec() -> crate::LintVec {
+        vec![
+            // tidy-alphabetical-start
+            AARCH64_SOFTFLOAT_NEON,
+            ABSOLUTE_PATHS_NOT_STARTING_WITH_CRATE,
+            AMBIGUOUS_ASSOCIATED_ITEMS,
+            AMBIGUOUS_DERIVE_HELPERS,
+            AMBIGUOUS_GLOB_IMPORTED_TRAITS,
+            AMBIGUOUS_GLOB_IMPORTS,
+            AMBIGUOUS_GLOB_REEXPORTS,
+            AMBIGUOUS_IMPORT_VISIBILITIES,
+            AMBIGUOUS_PANIC_IMPORTS,
+            ARITHMETIC_OVERFLOW,
+            ASM_SUB_REGISTER,
+            BAD_ASM_STYLE,
+            BARE_TRAIT_OBJECTS,
+            BINDINGS_WITH_VARIANT_NAME,
+            BREAK_WITH_LABEL_AND_LOOP,
+            COHERENCE_LEAK_CHECK,
+            CONFLICTING_REPR_HINTS,
+            CONST_EVALUATABLE_UNCHECKED,
+            CONST_ITEM_MUTATION,
+            DEAD_CODE,
+            DEAD_CODE_PUB_IN_BINARY,
+            DEPENDENCY_ON_UNIT_NEVER_TYPE_FALLBACK,
+            DEPRECATED,
+            DEPRECATED_IN_FUTURE,
+            DEPRECATED_LLVM_INTRINSIC,
+            DEPRECATED_SAFE_2024,
+            DEPRECATED_WHERE_CLAUSE_LOCATION,
+            DUPLICATE_FEATURES,
+            DUPLICATE_MACRO_ATTRIBUTES,
+            DUPLICATE_TOOLS,
+            ELIDED_LIFETIMES_IN_PATHS,
+            EXPLICIT_BUILTIN_CFGS_IN_FLAGS,
+            EXPORTED_PRIVATE_DEPENDENCIES,
+            FFI_UNWIND_CALLS,
+            FLOAT_LITERAL_F32_FALLBACK,
+            FORBIDDEN_LINT_GROUPS,
+            FUNCTION_ITEM_REFERENCES,
+            HIDDEN_GLOB_REEXPORTS,
+            ILL_FORMED_ATTRIBUTE_INPUT,
+            INCOMPLETE_INCLUDE,
+            INEFFECTIVE_UNSTABLE_TRAIT_IMPL,
+            INLINE_NO_SANITIZE,
+            INVALID_DOC_ATTRIBUTES,
+            INVALID_MACRO_EXPORT_ARGUMENTS,
+            INVALID_TYPE_PARAM_DEFAULT,
+            IRREFUTABLE_LET_PATTERNS,
+            LARGE_ASSIGNMENTS,
+            LATE_BOUND_LIFETIME_ARGUMENTS,
+            LEGACY_DERIVE_HELPERS,
+            LINKER_INFO,
+            LINKER_MESSAGES,
+            LONG_RUNNING_CONST_EVAL,
+            MACRO_EXPANDED_MACRO_EXPORTS_ACCESSED_BY_ABSOLUTE_PATHS,
+            MACRO_USE_EXTERN_CRATE,
+            MALFORMED_DIAGNOSTIC_ATTRIBUTES,
+            MALFORMED_DIAGNOSTIC_FILTERS,
+            MALFORMED_DIAGNOSTIC_FORMAT_LITERALS,
+            META_VARIABLE_MISUSE,
+            METHOD_CALL_ON_DIVERGING_INFER_VAR,
+            MISPLACED_DIAGNOSTIC_ATTRIBUTES,
+            MISSING_ABI,
+            MISSING_UNSAFE_ON_EXTERN,
+            MUST_NOT_SUSPEND,
+            NAMED_ARGUMENTS_USED_POSITIONALLY,
+            NEVER_TYPE_FALLBACK_FLOWING_INTO_UNSAFE,
+            NON_CONTIGUOUS_RANGE_ENDPOINTS,
+            NON_EXHAUSTIVE_OMITTED_PATTERNS,
+            OUT_OF_SCOPE_MACRO_CALLS,
+            OVERLAPPING_RANGE_ENDPOINTS,
+            PATTERNS_IN_FNS_WITHOUT_BODY,
+            PRIVATE_BOUNDS,
+            PRIVATE_INTERFACES,
+            PROC_MACRO_DERIVE_RESOLUTION_FALLBACK,
+            PUB_USE_OF_PRIVATE_EXTERN_CRATE,
+            RECURSION_DEPTH_EXCEEDING_LIMIT,
+            REDUNDANT_IMPORTS,
+            REDUNDANT_LIFETIMES,
+            REFINING_IMPL_TRAIT_INTERNAL,
+            REFINING_IMPL_TRAIT_REACHABLE,
+            RENAMED_AND_REMOVED_LINTS,
+            REPR_C_ENUMS_LARGER_THAN_INT,
+            RESOLVING_TO_ITEMS_SHADOWING_SUPERTRAIT_ITEMS,
+            RTSAN_NONBLOCKING_ASYNC,
+            RUST_2021_INCOMPATIBLE_CLOSURE_CAPTURES,
+            RUST_2021_INCOMPATIBLE_OR_PATTERNS,
+            RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX,
+            RUST_2021_PRELUDE_COLLISIONS,
+            RUST_2024_GUARDED_STRING_INCOMPATIBLE_SYNTAX,
+            RUST_2024_INCOMPATIBLE_PAT,
+            RUST_2024_PRELUDE_COLLISIONS,
+            SELF_CONSTRUCTOR_FROM_OUTER_ITEM,
+            SEMICOLON_IN_EXPRESSIONS_FROM_MACROS,
+            SEMICOLON_IN_EXPRESSIONS_FROM_NON_LOCAL_MACROS,
+            SHADOWING_SUPERTRAIT_ITEMS,
+            SINGLE_USE_LIFETIMES,
+            STABLE_FEATURES,
+            TAIL_CALL_TRACK_CALLER,
+            TAIL_EXPR_DROP_ORDER,
+            TEST_UNSTABLE_LINT,
+            TEXT_DIRECTION_CODEPOINT_IN_COMMENT,
+            TEXT_DIRECTION_CODEPOINT_IN_LITERAL,
+            TRIVIAL_CASTS,
+            TRIVIAL_NUMERIC_CASTS,
+            TYVAR_BEHIND_RAW_POINTER,
+            UNCONDITIONAL_PANIC,
+            UNCONDITIONAL_RECURSION,
+            UNCOVERED_PARAM_IN_PROJECTION,
+            UNEXPECTED_CFGS,
+            UNFULFILLED_LINT_EXPECTATIONS,
+            UNINHABITED_STATIC,
+            UNKNOWN_CRATE_TYPES,
+            UNKNOWN_DIAGNOSTIC_ATTRIBUTES,
+            UNKNOWN_LINTS,
+            UNNAMEABLE_TEST_ITEMS,
+            UNNAMEABLE_TYPES,
+            UNREACHABLE_CFG_SELECT_PREDICATES,
+            UNREACHABLE_CODE,
+            UNREACHABLE_PATTERNS,
+            UNSAFE_ATTR_OUTSIDE_UNSAFE,
+            UNSAFE_OP_IN_UNSAFE_FN,
+            UNSTABLE_NAME_COLLISIONS,
+            UNSTABLE_SYNTAX_PRE_EXPANSION,
+            UNSUPPORTED_CALLING_CONVENTIONS,
+            UNUSED_ASSIGNMENTS,
+            UNUSED_ASSOCIATED_TYPE_BOUNDS,
+            UNUSED_ATTRIBUTES,
+            UNUSED_CRATE_DEPENDENCIES,
+            UNUSED_EXTERN_CRATES,
+            UNUSED_FEATURES,
+            UNUSED_IMPORTS,
+            UNUSED_LABELS,
+            UNUSED_LIFETIMES,
+            UNUSED_MACROS,
+            UNUSED_MACRO_RULES,
+            UNUSED_MUT,
+            UNUSED_QUALIFICATIONS,
+            UNUSED_UNSAFE,
+            UNUSED_VARIABLES,
+            UNUSED_VISIBILITIES,
+            USELESS_DEPRECATED,
+            VARARGS_WITHOUT_PATTERN,
+            WARNINGS,
+            // tidy-alphabetical-end
+        ]
+    }
 }
 
 declare_lint! {
@@ -2287,23 +2290,55 @@ declare_lint! {
     ///
     /// ### Explanation
     ///
-    /// If a `struct` contains a reference, such as `&'a T`, the compiler
-    /// requires that `T` outlives the lifetime `'a`. This historically
-    /// required writing an explicit lifetime bound to indicate this
-    /// requirement. However, this can be overly explicit, causing clutter and
-    /// unnecessary complexity. The language was changed to automatically
-    /// infer the bound if it is not specified. Specifically, if the struct
-    /// contains a reference, directly or indirectly, to `T` with lifetime
-    /// `'x`, then it will infer that `T: 'x` is a requirement.
-    ///
-    /// This lint is "allow" by default because it can be noisy for existing
-    /// code that already had these requirements. This is a stylistic choice,
-    /// as it is still valid to explicitly state the bound. It also has some
-    /// false positives that can cause confusion.
+    /// If a struct, enum or union contains a reference, such as `&'a T`,
+    /// the compiler requires that `T` outlives the lifetime `'a`.
+    /// This historically required writing an explicit lifetime bound to indicate this requirement.
+    /// However, this can be overly explicit, causing clutter and unnecessary complexity.
+    /// The language was changed to automatically infer some classes of lifetime bounds
+    /// if they are not specified.
+    /// Specifically, if a struct, enum or union contains a reference, directly or indirectly,
+    /// to `T` with lifetime `'x` and `'x` refers to a lifetime parameter,
+    /// then it will infer that `T: 'x` is a requirement.
     ///
     /// See [RFC 2093] for more details.
     ///
+    /// > [!NOTE]
+    /// > This lint intentionally doesn't get emitted for explicit outlives-bounds on type
+    /// > parameters that aren't bounded by `Sized` (unless they're higher-ranked) since unlike
+    /// > implicit outlives-bounds these may affect the implicit lifetime bound of trait object
+    /// > types that are passed as arguments to the overarching struct, enum or union.
+    /// >
+    /// > Rephrased, they participate in [trait object lifetime defaulting][TOLD].
+    /// >
+    /// > Consider the following piece of code where removing bound `T: 'a` would lead to a lifetime
+    /// > error in function `scope`:
+    /// >
+    /// > ```rust,no_run
+    /// > struct Ref<'a, T: ?Sized + 'a>(&'a T);
+    /// >
+    /// > fn scope() {
+    /// >     let buf = String::new();
+    /// >     let str = buf.as_str();
+    /// >     render(Ref(&str));
+    /// > }
+    /// >
+    /// > fn render(_: Ref<dyn std::fmt::Display>) {}
+    /// > ```
+    /// >
+    /// > Due to the explicit outlives-bound the function `render` above is equivalent to:
+    /// >
+    /// > ```rust,ignore (incomplete)
+    /// > fn render<'r>(_: Ref<'r, dyn std::fmt::Display + 'r>) {}
+    /// > ```
+    /// >
+    /// > If it wasn't for that explicit bound then the function would mean the following instead:
+    /// >
+    /// > ```rust,ignore (incomplete)
+    /// > fn render<'r>(_: Ref<'r, dyn std::fmt::Display + 'static>) {}
+    /// > ```
+    ///
     /// [RFC 2093]: https://github.com/rust-lang/rfcs/blob/master/text/2093-infer-outlives.md
+    /// [TOLD]: https://doc.rust-lang.org/reference/lifetime-elision.html#default-trait-object-lifetimes
     pub EXPLICIT_OUTLIVES_REQUIREMENTS,
     Allow,
     "outlives requirements can be inferred"
@@ -2594,96 +2629,6 @@ declare_lint! {
 }
 
 declare_lint! {
-    /// The `fuzzy_provenance_casts` lint detects an `as` cast between an integer
-    /// and a pointer.
-    ///
-    /// ### Example
-    ///
-    /// ```rust
-    /// #![feature(strict_provenance_lints)]
-    /// #![warn(fuzzy_provenance_casts)]
-    ///
-    /// fn main() {
-    ///     let _dangling = 16_usize as *const u8;
-    /// }
-    /// ```
-    ///
-    /// {{produces}}
-    ///
-    /// ### Explanation
-    ///
-    /// This lint is part of the strict provenance effort, see [issue #95228].
-    /// Casting an integer to a pointer is considered bad style, as a pointer
-    /// contains, besides the *address* also a *provenance*, indicating what
-    /// memory the pointer is allowed to read/write. Casting an integer, which
-    /// doesn't have provenance, to a pointer requires the compiler to assign
-    /// (guess) provenance. The compiler assigns "all exposed valid" (see the
-    /// docs of [`ptr::with_exposed_provenance`] for more information about this
-    /// "exposing"). This penalizes the optimiser and is not well suited for
-    /// dynamic analysis/dynamic program verification (e.g. Miri or CHERI
-    /// platforms).
-    ///
-    /// It is much better to use [`ptr::with_addr`] instead to specify the
-    /// provenance you want. If using this function is not possible because the
-    /// code relies on exposed provenance then there is as an escape hatch
-    /// [`ptr::with_exposed_provenance`].
-    ///
-    /// [issue #95228]: https://github.com/rust-lang/rust/issues/95228
-    /// [`ptr::with_addr`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.with_addr
-    /// [`ptr::with_exposed_provenance`]: https://doc.rust-lang.org/core/ptr/fn.with_exposed_provenance.html
-    pub FUZZY_PROVENANCE_CASTS,
-    Allow,
-    "a fuzzy integer to pointer cast is used",
-    @feature_gate = strict_provenance_lints;
-}
-
-declare_lint! {
-    /// The `lossy_provenance_casts` lint detects an `as` cast between a pointer
-    /// and an integer.
-    ///
-    /// ### Example
-    ///
-    /// ```rust
-    /// #![feature(strict_provenance_lints)]
-    /// #![warn(lossy_provenance_casts)]
-    ///
-    /// fn main() {
-    ///     let x: u8 = 37;
-    ///     let _addr: usize = &x as *const u8 as usize;
-    /// }
-    /// ```
-    ///
-    /// {{produces}}
-    ///
-    /// ### Explanation
-    ///
-    /// This lint is part of the strict provenance effort, see [issue #95228].
-    /// Casting a pointer to an integer is a lossy operation, because beyond
-    /// just an *address* a pointer may be associated with a particular
-    /// *provenance*. This information is used by the optimiser and for dynamic
-    /// analysis/dynamic program verification (e.g. Miri or CHERI platforms).
-    ///
-    /// Since this cast is lossy, it is considered good style to use the
-    /// [`ptr::addr`] method instead, which has a similar effect, but doesn't
-    /// "expose" the pointer provenance. This improves optimisation potential.
-    /// See the docs of [`ptr::addr`] and [`ptr::expose_provenance`] for more information
-    /// about exposing pointer provenance.
-    ///
-    /// If your code can't comply with strict provenance and needs to expose
-    /// the provenance, then there is [`ptr::expose_provenance`] as an escape hatch,
-    /// which preserves the behaviour of `as usize` casts while being explicit
-    /// about the semantics.
-    ///
-    /// [issue #95228]: https://github.com/rust-lang/rust/issues/95228
-    /// [`ptr::addr`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.addr
-    /// [`ptr::expose_provenance`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.expose_provenance
-    pub LOSSY_PROVENANCE_CASTS,
-    Allow,
-    "a lossy pointer to integer cast is used",
-    @feature_gate = strict_provenance_lints;
-}
-
-declare_lint! {
     /// The `const_evaluatable_unchecked` lint detects a generic constant used
     /// in a type.
     ///
@@ -2960,6 +2905,70 @@ declare_lint! {
 }
 
 declare_lint! {
+    /// The `semicolon_in_expressions_from_non_local_macros` lint detects trailing semicolons in
+    /// macro bodies when the macro is invoked in expression position. This was previously accepted,
+    /// but is being phased out. This is similar to the `semicolon_in_expressions_from_macros` lint,
+    /// but applies to macros expanded from a different crate.
+    ///
+    /// ### Example
+    ///
+    /// ```rust,ignore (needs separate file)
+    /// fn main() {
+    ///     let val = match true {
+    ///         true => false,
+    ///         _ => example_separate_crate::foo!()
+    ///     };
+    /// }
+    /// ```
+    ///
+    /// where the crate `example-separate-crate` contains:
+    ///
+    /// ```rust,ignore (must be compiled as separate crate)
+    /// #[macro_export]
+    /// macro_rules! foo {
+    ///     () => { true; }
+    /// }
+    /// ```
+    ///
+    /// produces:
+    ///
+    /// ```text
+    /// warning: trailing semicolon in macro used in expression position
+    ///  --> src/main.rs:4:14
+    ///   |
+    /// 4 |         _ => example_separate_crate::foo!()
+    ///   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ///   |
+    ///   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    ///   = note: for more information, see issue #79813 <https://github.com/rust-lang/rust/issues/79813>
+    ///   = note: `#[warn(semicolon_in_expressions_from_non_local_macros)]` (part of `#[warn(future_incompatible)]`) on by default
+    ///   = note: this warning originates in the macro `example_separate_crate::foo` (in Nightly builds, run with -Z macro-backtrace for more info)
+    /// ```
+    ///
+    /// ### Explanation
+    ///
+    /// Previous, Rust ignored trailing semicolon in a macro
+    /// body when a macro was invoked in expression position.
+    /// However, this makes the treatment of semicolons in the language
+    /// inconsistent, and could lead to unexpected runtime behavior
+    /// in some circumstances (e.g. if the macro author expects
+    /// a value to be dropped).
+    ///
+    /// This is a [future-incompatible] lint to transition this
+    /// to a hard error in the future. See [issue #79813] for more details.
+    ///
+    /// [issue #79813]: https://github.com/rust-lang/rust/issues/79813
+    /// [future-incompatible]: ../index.md#future-incompatible-lints
+    pub SEMICOLON_IN_EXPRESSIONS_FROM_NON_LOCAL_MACROS,
+    Warn,
+    "trailing semicolon in macro body used as expression",
+    @future_incompatible = FutureIncompatibleInfo {
+        reason: fcw!(FutureReleaseError #79813),
+        report_in_deps: true,
+    };
+}
+
+declare_lint! {
     /// The `legacy_derive_helpers` lint detects derive helper attributes
     /// that are used before they are introduced.
     ///
@@ -3116,77 +3125,6 @@ declare_lint! {
     pub EXPLICIT_BUILTIN_CFGS_IN_FLAGS,
     Deny,
     "detects builtin cfgs set via the `--cfg`"
-}
-
-declare_lint! {
-    /// The `repr_transparent_non_zst_fields` lint
-    /// detects types marked `#[repr(transparent)]` that (transitively)
-    /// contain a type that is not guaranteed to remain a ZST type under all configurations.
-    ///
-    /// ### Example
-    ///
-    /// ```rust,ignore (needs external crate)
-    /// #![deny(repr_transparent_external_private_fields)]
-    /// use foo::NonExhaustiveZst;
-    ///
-    /// #[repr(C)]
-    /// struct CZst([u8; 0]);
-    ///
-    /// #[repr(transparent)]
-    /// struct Bar(u32, ([u32; 0], NonExhaustiveZst));
-    /// #[repr(transparent)]
-    /// struct Baz(u32, CZst);
-    /// ```
-    ///
-    /// This will produce:
-    ///
-    /// ```text
-    /// error: zero-sized fields in repr(transparent) cannot contain external non-exhaustive types
-    ///  --> src/main.rs:5:28
-    ///   |
-    /// 5 | struct Bar(u32, ([u32; 0], NonExhaustiveZst));
-    ///   |                            ^^^^^^^^^^^^^^^^
-    ///   |
-    /// note: the lint level is defined here
-    ///  --> src/main.rs:1:9
-    ///   |
-    /// 1 | #![deny(repr_transparent_external_private_fields)]
-    ///   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ///   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-    ///   = note: for more information, see issue #78586 <https://github.com/rust-lang/rust/issues/78586>
-    ///   = note: this field contains `NonExhaustiveZst`, which is marked with `#[non_exhaustive]`, so it could become non-zero-sized in the future.
-    ///
-    /// error: zero-sized fields in repr(transparent) cannot contain `#[repr(C)]` types
-    ///  --> src/main.rs:5:28
-    ///   |
-    /// 5 | struct Baz(u32, CZst);
-    ///   |                 ^^^^
-    ///   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-    ///   = note: for more information, see issue #78586 <https://github.com/rust-lang/rust/issues/78586>
-    ///   = note: this field contains `CZst`, which is a `#[repr(C)]` type, so it is not guaranteed to be zero-sized on all targets.
-    /// ```
-    ///
-    /// ### Explanation
-    ///
-    /// Previous, Rust accepted fields that contain external private zero-sized types, even though
-    /// those types could gain a non-zero-sized field in a future, semver-compatible update.
-    ///
-    /// Rust also accepted fields that contain `repr(C)` zero-sized types, even though those types
-    /// are not guaranteed to be zero-sized on all targets, and even though those types can
-    /// make a difference for the ABI (and therefore cannot be ignored by `repr(transparent)`).
-    ///
-    /// This is a [future-incompatible] lint to transition this
-    /// to a hard error in the future. See [issue #78586] for more details.
-    ///
-    /// [issue #78586]: https://github.com/rust-lang/rust/issues/78586
-    /// [future-incompatible]: ../index.md#future-incompatible-lints
-    pub REPR_TRANSPARENT_NON_ZST_FIELDS,
-    Deny,
-    "transparent type contains an external ZST that is marked #[non_exhaustive] or contains private fields",
-    @future_incompatible = FutureIncompatibleInfo {
-        reason: fcw!(FutureReleaseError #78586),
-        report_in_deps: true,
-    };
 }
 
 declare_lint! {
@@ -4615,34 +4553,57 @@ declare_lint! {
     Warn,
     "detects diagnostic attribute with malformed diagnostic format literals",
 }
+
+declare_lint! {
+    /// The `malformed_diagnostic_filters` lint detects malformed filters in diagnostic
+    /// attributes.
+    ///
+    /// ### Example
+    ///
+    // FIXME(bootstrap): Use a regular Rust doc code block after stage 0 emits
+    // `malformed_diagnostic_filters` instead of E0232 for this example.
+    #[cfg_attr(bootstrap, doc = "```rust,ignore (stage 0 emits E0232)")]
+    #[cfg_attr(not(bootstrap), doc = "```rust")]
+    /// #![feature(rustc_attrs)]
+    /// #![allow(internal_features)]
+    ///
+    /// #[rustc_on_unimplemented(on(invalid, message = "unused"))]
+    /// trait Trait {}
+    #[doc = "```"]
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// A `rustc_on_unimplemented` filter must use a supported flag, a name-value predicate,
+    /// or the `all`, `any`, and `not` predicate operators. Invalid filters are ignored.
+    pub MALFORMED_DIAGNOSTIC_FILTERS,
+    Warn,
+    "detects malformed filters in diagnostic attributes",
+    @feature_gate = rustc_attrs;
+}
+
 declare_lint! {
     /// The `ambiguous_glob_imports` lint detects glob imports that should report ambiguity
     /// errors, but previously didn't do that due to rustc bugs.
     ///
     /// ### Example
     ///
-    /// ```rust,compile_fail
-    /// #![deny(ambiguous_glob_imports)]
-    /// pub fn foo() -> u32 {
-    ///     use sub::*;
-    ///     C
-    /// }
+    /// ```rust,ignore (needs extern crate)
+    /// // library crate `my_library`
+    /// mod mod1 { pub const C: u32 = 1; }
+    /// mod mod2 { pub const C: u32 = 2; }
+    /// pub use mod1::*;
+    /// pub use mod2::*;
     ///
-    /// mod sub {
-    ///     mod mod1 { pub const C: u32 = 1; }
-    ///     mod mod2 { pub const C: u32 = 2; }
-    ///
-    ///     pub use mod1::*;
-    ///     pub use mod2::*;
-    /// }
+    /// // another crate using `my_library`
+    /// let c = my_library::C; // `C` is ambiguous
     /// ```
-    ///
-    /// {{produces}}
     ///
     /// ### Explanation
     ///
-    /// Previous versions of Rust compile it successfully because it
-    /// had lost the ambiguity error when resolve `use sub::mod2::*`.
+    /// Previous versions of Rust compile it successfully because
+    /// ambiguous glob imports weren't preserved correctly over crate boundaries.
     ///
     /// This is a [future-incompatible] lint to transition this to a
     /// hard error in the future.
@@ -4706,7 +4667,7 @@ declare_lint! {
     Warn,
     "detects uses of ambiguously glob imported traits",
     @future_incompatible = FutureIncompatibleInfo {
-        reason: fcw!(FutureReleaseError #147992),
+        reason: fcw!(FutureReleaseError #152822),
         report_in_deps: false,
     };
 }
@@ -4906,48 +4867,6 @@ declare_lint! {
     pub REFINING_IMPL_TRAIT_INTERNAL,
     Warn,
     "impl trait in impl method signature does not match trait method signature",
-}
-
-declare_lint! {
-    /// The `elided_lifetimes_in_associated_constant` lint detects elided lifetimes
-    /// in associated constants when there are other lifetimes in scope. This was
-    /// accidentally supported, and this lint was later relaxed to allow eliding
-    /// lifetimes to `'static` when there are no lifetimes in scope.
-    ///
-    /// ### Example
-    ///
-    /// ```rust,compile_fail
-    /// #![deny(elided_lifetimes_in_associated_constant)]
-    ///
-    /// struct Foo<'a>(&'a ());
-    ///
-    /// impl<'a> Foo<'a> {
-    ///     const STR: &str = "hello, world";
-    /// }
-    /// ```
-    ///
-    /// {{produces}}
-    ///
-    /// ### Explanation
-    ///
-    /// Previous version of Rust
-    ///
-    /// Implicit static-in-const behavior was decided [against] for associated
-    /// constants because of ambiguity. This, however, regressed and the compiler
-    /// erroneously treats elided lifetimes in associated constants as lifetime
-    /// parameters on the impl.
-    ///
-    /// This is a [future-incompatible] lint to transition this to a
-    /// hard error in the future.
-    ///
-    /// [against]: https://github.com/rust-lang/rust/issues/38831
-    /// [future-incompatible]: ../index.md#future-incompatible-lints
-    pub ELIDED_LIFETIMES_IN_ASSOCIATED_CONSTANT,
-    Deny,
-    "elided lifetimes cannot be used in associated constants in impls",
-    @future_incompatible = FutureIncompatibleInfo {
-        reason: fcw!(FutureReleaseError #115010),
-    };
 }
 
 declare_lint! {
@@ -5545,8 +5464,7 @@ declare_lint! {
     ///
     /// ### Example
     ///
-    #[cfg_attr(bootstrap, doc = "```rust")]
-    #[cfg_attr(not(bootstrap), doc = "```rust,compile_fail")]
+    /// ```rust,compile_fail
     /// // Using `...` in non-foreign function definitions is unstable, however stability is
     /// // currently only checked after attributes are expanded, so using `#[cfg(false)]` here will
     /// // allow this to compile on stable Rust.
@@ -5554,7 +5472,7 @@ declare_lint! {
     /// fn foo(...) {
     ///
     /// }
-    #[doc = "```"]
+    /// ```
     ///
     /// {{produces}}
     ///
@@ -5684,4 +5602,170 @@ declare_lint! {
         reason: fcw!(FutureReleaseError #154024),
         report_in_deps: false,
     };
+}
+
+declare_lint! {
+    /// The `unsafe_code` lint catches usage of `unsafe` code and other
+    /// potentially unsound constructs like `no_mangle`, `export_name`,
+    /// and `link_section`.
+    ///
+    /// ### Example
+    ///
+    /// ```rust,compile_fail
+    /// #![deny(unsafe_code)]
+    /// fn main() {
+    ///     unsafe {
+    ///
+    ///     }
+    /// }
+    ///
+    /// #[no_mangle]
+    /// fn func_0() { }
+    ///
+    /// #[export_name = "exported_symbol_name"]
+    /// pub fn name_in_rust() { }
+    ///
+    /// #[no_mangle]
+    /// #[link_section = ".example_section"]
+    /// pub static VAR1: u32 = 1;
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// This lint is intended to restrict the usage of `unsafe` blocks and other
+    /// constructs (including, but not limited to `no_mangle`, `link_section`
+    /// and `export_name` attributes) wrong usage of which causes undefined
+    /// behavior.
+    pub UNSAFE_CODE,
+    Allow,
+    "usage of `unsafe` code and other potentially unsound constructs",
+    @eval_always = true
+}
+
+declare_lint! {
+    /// The `method_call_on_diverging_infer_var` lint detects situations in which a method is called on a value resulting from a never-to-any coercion,
+    /// without necessary information to infer a type for it.
+    ///
+    /// ### Example
+    ///
+    #[cfg_attr(bootstrap, doc = "```rust,compile_fail")]
+    #[cfg_attr(not(bootstrap), doc = "```rust,no_run")]
+    /// fn main() {
+    ///     let x = panic!();
+    ///     x.clone();
+    /// }
+    #[doc = "```"]
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// Rust does not generally allow calling methods on values which do not have a known type,
+    /// such a result of a never-to-any coercion with no type specified.
+    ///
+    /// To aid with transition of code calling methods on `Infallible` after changing `Infallible` to be an alias for `!`, rustc *temporarily* allows such calls.
+    /// This will (once again) become an error in the future.
+    ///
+    /// Thanks to never-to-any coercion you can replace method calls on `!` with the use of the `!` variable, or an `as` cast to an explicit type:
+    ///
+    /// ```diff
+    /// - x.clone()
+    /// + x
+    /// ```
+    /// ```diff
+    /// - result.map(|x| x.convert_error())?;
+    /// + result.map(|x| x as ErrorType)?;
+    /// ```
+    pub METHOD_CALL_ON_DIVERGING_INFER_VAR,
+    Warn,
+    "detects method calls on a result of never-to-any coercion",
+    @future_incompatible = FutureIncompatibleInfo {
+        reason: fcw!(FutureReleaseError #156047),
+        report_in_deps: true,
+    };
+}
+
+declare_lint! {
+    /// The `recursion_depth_exceeding_limit` lint detects cases where the compiler does not
+    /// correctly track the recursion depth in obligation evaluation.
+    ///
+    /// ### Example
+    /// ```text
+    /// rustc -Znext-solver example.rs
+    /// ```
+    ///
+    /// ```rust,ignore (requires next solver)
+    /// #![recursion_limit = "8"]
+    /// struct Foo<T> {
+    ///    t: T,
+    ///    opt_t: Option<T>,
+    /// }
+    /// fn require_sync<T: Sync>() {}
+    /// fn main() {
+    ///     require_sync::<Foo<Foo<Foo<Foo<Foo<Foo<()>>>>>>>();
+    /// }
+    /// ```
+    ///
+    /// This will produces:
+    /// ```text
+    /// error[E0275]: overflow evaluating the requirement `Foo<Foo<Foo<Foo<Foo<Foo<()>>>>>>: Sync`
+    ///  --> example.rs:12:20
+    ///   |
+    ///   |     require_sync::<Foo<Foo<Foo<Foo<Foo<Foo<()>>>>>>>();
+    ///   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ///   |
+    ///   = help: consider increasing the recursion limit by adding a `#![recursion_limit = "16"]` attribute to your crate
+    /// note: required by a bound in `require_sync`
+    ///  --> example.rs:9:20
+    ///   |
+    ///   | fn require_sync<T: Sync>() {}
+    ///   |                    ^^^^ required by this bound in `require_sync`
+    /// ```
+    ///
+    /// ### Explanation
+    ///
+    /// The compiler uses a recursion limit in obligation evaluation to avoid hangs.
+    ///
+    /// However, the old trait solver sometimes ignores the recursion depth, whereas
+    /// the new solver correctly tracks it. This reveals cases where overflow should
+    /// have occurred previously.
+    ///
+    /// This is a [future-incompatible] lint to transition this to a hard error in the future.
+    ///
+    /// [future-incompatible]: ../index.md#future-incompatible-lints
+    pub RECURSION_DEPTH_EXCEEDING_LIMIT,
+    Warn,
+    "detects trait solving overflow that only happens with the next solver",
+    @future_incompatible = FutureIncompatibleInfo {
+        reason: fcw!(FutureReleaseError #159228),
+        report_in_deps: false,
+    };
+}
+
+declare_lint! {
+    /// The `duplicate_tools` lint detects duplicate tools found in crate-level
+    /// [`register_tool` attributes] (including `register_attribute_tool` or `register_lint_tool`).
+    ///
+    /// [`register_tool` attributes]: https://doc.rust-lang.org/nightly/unstable-book/language-features/register-tool.html
+    ///
+    /// ### Example
+    ///
+    /// ```rust,compile_fail
+    /// #![feature(register_tool)]
+    /// #![register_tool(foo)]
+    /// #![register_tool(foo)]
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// Enabling a tool more than once is a no-op.
+    /// To avoid this warning, remove the second `register_tool()` attribute.
+    pub DUPLICATE_TOOLS,
+    Deny,
+    "duplicate tools found in crate-level `#[register_tools]` directives",
+    @feature_gate = register_tool;
 }

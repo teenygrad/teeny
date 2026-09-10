@@ -1,18 +1,14 @@
-use hir::next_solver::{DbInterner, TypingMode};
 use hir::{HasCrate, ModuleDef, Semantics};
 use ide_db::use_trivial_constructor::use_trivial_constructor_with_factory;
 use ide_db::{
     RootDatabase, famous_defs::FamousDefs, helpers::mod_path_to_ast_with_factory,
     imports::import_assets::item_for_path_search,
 };
-use syntax::syntax_editor::{Position, SyntaxEditor};
-use syntax::{
-    TokenText,
-    ast::{
-        self, AstNode, HasAttrs, HasGenericParams, HasName, edit::AstNodeEdit,
-        syntax_factory::SyntaxFactory,
-    },
+use syntax::ast::{
+    self, AstNode, HasAttrs, HasGenericParams, HasName, edit::AstNodeEdit,
+    syntax_factory::SyntaxFactory,
 };
+use syntax::syntax_editor::{Position, SyntaxEditor};
 
 use crate::{
     AssistId,
@@ -72,8 +68,7 @@ pub(crate) fn generate_single_field_struct_from(
         return None;
     }
 
-    let main_field_name =
-        names.as_ref().map_or(TokenText::borrowed("value"), |names| names[main_field_i].text());
+    let main_field_name = names.as_ref().map_or("value", |names| names[main_field_i].text());
     let main_field_ty = types[main_field_i].clone();
 
     acc.add(
@@ -93,10 +88,10 @@ pub(crate) fn generate_single_field_struct_from(
                 false,
             ));
 
-            let ty = make.ty(&strukt_name.text());
+            let ty = make.ty(strukt_name.text());
 
             let constructor =
-                make_adt_constructor(names.as_deref(), constructors, &main_field_name, make);
+                make_adt_constructor(names.as_deref(), constructors, main_field_name, make);
             let body = make.block_expr([], Some(constructor));
 
             let fn_ = make
@@ -109,7 +104,7 @@ pub(crate) fn generate_single_field_struct_from(
                     make.param_list(
                         None,
                         [make.param(
-                            make.path_pat(make.path_from_text(&main_field_name)),
+                            make.path_pat(make.path_from_text(main_field_name)),
                             main_field_ty,
                         )],
                     ),
@@ -162,12 +157,12 @@ pub(crate) fn generate_single_field_struct_from(
 fn make_adt_constructor(
     names: Option<&[ast::Name]>,
     constructors: Vec<Option<ast::Expr>>,
-    main_field_name: &TokenText<'_>,
+    main_field_name: &str,
     make: &SyntaxFactory,
 ) -> ast::Expr {
     if let Some(names) = names {
         let fields = make.record_expr_field_list(names.iter().zip(constructors).map(
-            |(name, initializer)| make.record_expr_field(make.name_ref(&name.text()), initializer),
+            |(name, initializer)| make.record_expr_field(make.name_ref(name.text()), initializer),
         ));
         make.record_expr(make.path_from_text("Self"), fields).into()
     } else {
@@ -233,15 +228,11 @@ fn from_impl_exists(
     let strukt = sema.to_def(strukt)?;
     let krate = strukt.krate(db);
     let from_trait = FamousDefs(sema, krate).core_convert_From()?;
-    let interner = DbInterner::new_with(db, krate.base());
-    use hir::next_solver::infer::DbInternerInferExt;
-    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
 
-    let strukt = strukt.instantiate_infer(&infcx);
     let field_ty = strukt.fields(db).get(main_field_i)?.ty(db);
     let struct_ty = strukt.ty(db);
     tracing::debug!(?strukt, ?field_ty, ?struct_ty);
-    struct_ty.impls_trait(infcx, from_trait, &[field_ty]).then_some(())
+    struct_ty.has_any_impl(db, from_trait, &[field_ty]).then_some(())
 }
 
 #[cfg(test)]

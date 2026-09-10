@@ -1,7 +1,7 @@
 use std::ops::ControlFlow;
 
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::res::MaybeDef;
+use clippy_utils::res::MaybeDef as _;
 use clippy_utils::visitors::for_each_expr;
 use clippy_utils::{SpanlessEq, higher, peel_hir_expr_while, sym};
 use rustc_hir::{Expr, ExprKind, UnOp};
@@ -127,7 +127,7 @@ fn find_insert_calls<'tcx>(
     contains_expr: &OpExpr<'tcx>,
     expr: &'tcx Expr<'_>,
 ) -> Option<OpExpr<'tcx>> {
-    for_each_expr(cx, expr, |e| {
+    for_each_expr(cx.tcx, expr, |e| {
         if let Some((insert_expr, _)) = try_parse_op_call(cx, e, sym::insert)
             && SpanlessEq::new(cx).eq_expr(SyntaxContext::root(), contains_expr.receiver, insert_expr.receiver)
             && SpanlessEq::new(cx).eq_expr(SyntaxContext::root(), contains_expr.value, insert_expr.value)

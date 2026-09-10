@@ -80,7 +80,7 @@ pub struct QueryResponse<'tcx, R> {
 #[derive(StableHash, TypeFoldable, TypeVisitable)]
 pub struct QueryRegionConstraints<'tcx> {
     pub constraints: Vec<QueryRegionConstraint<'tcx>>,
-    pub assumptions: Vec<ty::ArgOutlivesPredicate<'tcx>>,
+    pub assumptions: Vec<ty::ArgOutlivesClause<'tcx>>,
 }
 
 impl QueryRegionConstraints<'_> {
@@ -135,9 +135,12 @@ impl<'tcx, R> QueryResponse<'tcx, R> {
     }
 }
 
-// FIXME: Convert this into a struct
-pub type QueryRegionConstraint<'tcx> =
-    (ty::RegionConstraint<'tcx>, ConstraintCategory<'tcx>, ty::VisibleForLeakCheck);
+#[derive(Debug, StableHash, Hash, Eq, PartialEq, TypeVisitable, Clone, TypeFoldable, Copy)]
+pub struct QueryRegionConstraint<'tcx> {
+    pub constraint: ty::RegionConstraint<'tcx>,
+    pub category: ConstraintCategory<'tcx>,
+    pub visible_for_leak_check: ty::VisibleForLeakCheck,
+}
 
 #[derive(Default)]
 pub struct CanonicalParamEnvCache<'tcx> {

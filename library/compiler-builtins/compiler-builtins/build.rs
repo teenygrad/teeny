@@ -12,7 +12,10 @@ fn main() {
     // Work around building as part of `builtins-shim`: if only `build.rs` is used, Cargo always
     // considers the build dirty because `builtins-shim/build.rs` does not exist. If only
     // `../c-b/build.rs` is used, the same may happen if not built in the workspace.
-    if cfg.manifest_dir.file_name().unwrap() == "builtins-shim" {
+    // Note: this may be `None` if CARGO_MANIFEST_DIR doesn't end in a directory name (e.g. ".")
+    if let Some(dir) = cfg.manifest_dir.file_name()
+        && dir == "builtins-shim"
+    {
         println!("cargo::rerun-if-changed=../compiler-builtins/build.rs");
     } else {
         println!("cargo::rerun-if-changed=build.rs");
@@ -359,6 +362,10 @@ mod c {
                 ("__aeabi_div0", "arm/aeabi_div0.c"),
                 ("__aeabi_drsub", "arm/aeabi_drsub.c"),
                 ("__aeabi_frsub", "arm/aeabi_frsub.c"),
+                ("__aeabi_uread4", "arm/aeabi_uread4.S"),
+                ("__aeabi_uread8", "arm/aeabi_uread8.S"),
+                ("__aeabi_uwrite4", "arm/aeabi_uwrite4.S"),
+                ("__aeabi_uwrite8", "arm/aeabi_uwrite8.S"),
                 ("__bswapdi2", "arm/bswapdi2.S"),
                 ("__bswapsi2", "arm/bswapsi2.S"),
                 ("__divmodsi4", "arm/divmodsi4.S"),

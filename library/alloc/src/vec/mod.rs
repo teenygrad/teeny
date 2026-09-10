@@ -79,9 +79,7 @@ use core::cmp::Ordering;
 use core::hash::{Hash, Hasher};
 #[cfg(not(no_global_oom_handling))]
 use core::iter;
-#[cfg(not(no_global_oom_handling))]
-use core::marker::Destruct;
-use core::marker::{Freeze, PhantomData};
+use core::marker::{Destruct, Freeze, PhantomData};
 use core::mem::{self, Assume, ManuallyDrop, MaybeUninit, SizedTypeProperties, TransmuteFrom};
 use core::ops::{self, Index, IndexMut, Range, RangeBounds};
 use core::ptr::{self, NonNull};
@@ -697,8 +695,6 @@ impl<T> Vec<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(box_vec_non_null)]
-    ///
     /// let v = vec![1, 2, 3];
     ///
     /// // Deconstruct the vector into parts.
@@ -719,8 +715,6 @@ impl<T> Vec<T> {
     /// Using memory that was allocated elsewhere:
     ///
     /// ```rust
-    /// #![feature(box_vec_non_null)]
-    ///
     /// use std::alloc::{alloc, Layout};
     /// use std::ptr::NonNull;
     ///
@@ -742,8 +736,8 @@ impl<T> Vec<T> {
     /// }
     /// ```
     #[inline]
-    #[unstable(feature = "box_vec_non_null", issue = "130364")]
-    #[rustc_const_unstable(feature = "box_vec_non_null", issue = "130364")]
+    #[stable(feature = "box_vec_non_null", since = "1.99.0")]
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
     pub const unsafe fn from_parts(ptr: NonNull<T>, length: usize, capacity: usize) -> Self {
         unsafe { Self::from_parts_in(ptr, length, capacity, Global) }
     }
@@ -863,8 +857,6 @@ impl<T> Vec<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(box_vec_non_null)]
-    ///
     /// let v: Vec<i32> = vec![-1, 0, 1];
     ///
     /// let (ptr, len, cap) = v.into_parts();
@@ -879,8 +871,8 @@ impl<T> Vec<T> {
     /// assert_eq!(rebuilt, [4294967295, 0, 1]);
     /// ```
     #[must_use = "losing the pointer will leak memory"]
-    #[unstable(feature = "box_vec_non_null", issue = "130364")]
-    #[rustc_const_unstable(feature = "box_vec_non_null", issue = "130364")]
+    #[stable(feature = "box_vec_non_null", since = "1.99.0")]
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
     pub const fn into_parts(self) -> (NonNull<T>, usize, usize) {
         let (ptr, len, capacity) = self.into_raw_parts();
         // SAFETY: A `Vec` always has a non-null pointer.
@@ -1305,7 +1297,6 @@ impl<T, A: Allocator> Vec<T, A> {
     #[inline]
     #[unstable(feature = "allocator_api", issue = "32838")]
     #[rustc_const_unstable(feature = "allocator_api", issue = "32838")]
-    // #[unstable(feature = "box_vec_non_null", issue = "130364")]
     pub const unsafe fn from_parts_in(
         ptr: NonNull<T>,
         length: usize,
@@ -1410,7 +1401,6 @@ impl<T, A: Allocator> Vec<T, A> {
     #[must_use = "losing the pointer will leak memory"]
     #[unstable(feature = "allocator_api", issue = "32838")]
     #[rustc_const_unstable(feature = "allocator_api", issue = "32838")]
-    // #[unstable(feature = "box_vec_non_null", issue = "130364")]
     pub const fn into_parts_with_alloc(self) -> (NonNull<T>, usize, usize, A) {
         let (ptr, len, capacity, alloc) = self.into_raw_parts_with_alloc();
         // SAFETY: A `Vec` always has a non-null pointer.
@@ -1740,10 +1730,13 @@ impl<T, A: Allocator> Vec<T, A> {
         }
     }
 
-    /// Converts the Vec into a boxed array. This conversion will discard any spare capacity, if there is any, see [`Vec::shrink_to_fit`].
+    /// Converts the Vec into a boxed array. This conversion will discard any spare capacity,
+    /// if there is any, see [`Vec::shrink_to_fit`].
     /// If you merely wish for a reference to an array, use [`as_array`](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.as_array).
     ///
-    /// If `N` is not exactly equal to [`Vec::len`], then this method returns `None`.
+    /// # Errors
+    ///
+    /// Returns the original `Vec<T>` in the `Err` variant if [`Vec::len`] does not equal `N`.
     ///
     /// # Examples
     ///
@@ -1758,7 +1751,15 @@ impl<T, A: Allocator> Vec<T, A> {
     #[unstable(feature = "alloc_slice_into_array", issue = "148082")]
     #[must_use]
     pub fn into_array<const N: usize>(self) -> Result<Box<[T; N], A>, Self> {
-        if self.len() == N { Ok(self.into_boxed_slice().into_array().unwrap()) } else { Err(self) }
+        if self.len() == N {
+            // SAFETY: `Box::into_array` is guaranteed to return `Ok` if the
+            // length of the slice is equal to `N`.
+            // `self.into_boxed_slice().len()` is equal to `self.len()`,
+            // which we just checked.
+            Ok(unsafe { self.into_boxed_slice().into_array().unwrap_unchecked() })
+        } else {
+            Err(self)
+        }
     }
 
     /// Shortens the vector, keeping the first `len` elements and dropping
@@ -1823,7 +1824,7 @@ impl<T, A: Allocator> Vec<T, A> {
                 return;
             }
             let remaining_len = self.len - len;
-            let s = ptr::slice_from_raw_parts_mut(self.as_mut_ptr().add(len), remaining_len);
+            let s = self.as_mut_ptr().add(len).cast_slice(remaining_len);
             self.len = len;
             ptr::drop_in_place(s);
         }
@@ -2072,7 +2073,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(box_vec_non_null)]
+    /// #![feature(vec_as_non_null)]
     ///
     /// // Allocate vector big enough for 4 elements.
     /// let size = 4;
@@ -2092,7 +2093,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// Due to the aliasing guarantee, the following code is legal:
     ///
     /// ```rust
-    /// #![feature(box_vec_non_null)]
+    /// #![feature(vec_as_non_null)]
     ///
     /// unsafe {
     ///     let mut v = vec![0];
@@ -2108,8 +2109,9 @@ impl<T, A: Allocator> Vec<T, A> {
     /// [`as_mut_ptr`]: Vec::as_mut_ptr
     /// [`as_ptr`]: Vec::as_ptr
     /// [`as_non_null`]: Vec::as_non_null
-    #[unstable(feature = "box_vec_non_null", issue = "130364")]
-    #[rustc_const_unstable(feature = "box_vec_non_null", issue = "130364")]
+    #[unstable(feature = "vec_as_non_null", issue = "157843")]
+    #[rustc_const_unstable(feature = "vec_as_non_null", issue = "157843")]
+    #[rustc_as_ptr]
     #[inline]
     pub const fn as_non_null(&mut self) -> NonNull<T> {
         self.buf.non_null()
@@ -2211,7 +2213,8 @@ impl<T, A: Allocator> Vec<T, A> {
     /// [`spare_capacity_mut()`]: Vec::spare_capacity_mut
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub unsafe fn set_len(&mut self, new_len: usize) {
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+    pub const unsafe fn set_len(&mut self, new_len: usize) {
         ub_checks::assert_unsafe_precondition!(
             check_library_ub,
             "Vec::set_len requires that new_len <= capacity()",
@@ -2619,23 +2622,49 @@ impl<T, A: Allocator> Vec<T, A> {
         self.dedup_by(|a, b| key(a) == key(b))
     }
 
-    /// Removes all but the first of consecutive elements in the vector satisfying a given equality
-    /// relation.
+    /// Removes all but the first of consecutive elements in the vector that are
+    /// "equal" according to the given predicate function.
     ///
-    /// The `same_bucket` function is passed references to two elements from the vector and
-    /// must determine if the elements compare equal. The elements are passed in opposite order
-    /// from their order in the slice, so if `same_bucket(a, b)` returns `true`, `a` is removed.
+    /// The predicate `same_bucket(x, p)` is passed references to two elements.
+    /// If it returns `true`, the element `x` is removed from the vector.
     ///
-    /// If the vector is sorted, this removes all duplicates.
+    /// The element `p` occurs *before* `x` in the vector (`[.., p, .., x, ..]`),
+    /// so `same_bucket(x, p)` is receiving them in reversed order (unlike [`windows`]).
+    ///
+    /// If the vector is sorted, this removes all duplicates. For more complicated predicates
+    /// however, the order (ascending vs. descending) can matter.
+    ///
+    /// [`windows`]: slice::windows
     ///
     /// # Examples
     ///
     /// ```
     /// let mut vec = vec!["foo", "bar", "Bar", "baz", "bar"];
-    ///
-    /// vec.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-    ///
+    /// vec.dedup_by(|x, p| x.eq_ignore_ascii_case(p));
     /// assert_eq!(vec, ["foo", "bar", "baz", "bar"]);
+    /// ```
+    ///
+    /// Both references passed to `same_bucket` are mutable.
+    /// This allows merging elements by mutating `p` and returning `true`:
+    ///
+    /// ```
+    /// let mut ranges = vec![1..2, 2..4, 2..5, 8..9];
+    ///
+    /// // Sort ranges by start, and if equal, by end (lexicographically)
+    /// // Sorting in reverse instead (`x.start.cmp(&p.start)...`) would later fail
+    /// ranges.sort_unstable_by(|p, x| p.start.cmp(&x.start).then(p.end.cmp(&x.end)));
+    ///
+    /// // Merge touching (`1..2` and `2..4`) and then overlapping (`1..4` and `2..5`) ranges
+    /// ranges.dedup_by(|x, p| {
+    ///     if p.end >= x.start {
+    ///         p.end = p.end.max(x.end);
+    ///         true
+    ///     } else {
+    ///         false
+    ///     }
+    /// });
+    ///
+    /// assert_eq!(ranges, [1..5, 8..9]);
     /// ```
     #[stable(feature = "dedup_by", since = "1.16.0")]
     pub fn dedup_by<F>(&mut self, mut same_bucket: F)
@@ -2928,8 +2957,26 @@ impl<T, A: Allocator> Vec<T, A> {
     #[cfg(not(no_global_oom_handling))]
     #[inline]
     unsafe fn append_elements(&mut self, other: *const [T]) {
+        self.reserve(other.len());
+        unsafe {
+            self.append_elements_unreserved(other);
+        }
+    }
+
+    /// Appends elements to `self` from other buffer, returning [`TryReserveError`] on OOM.
+    #[inline]
+    unsafe fn try_append_elements(&mut self, other: *const [T]) -> Result<(), TryReserveError> {
+        self.try_reserve(other.len())?;
+        unsafe {
+            self.append_elements_unreserved(other);
+        }
+        Ok(())
+    }
+
+    /// Appends elements to `self` from other buffer without reserving additional capacity.
+    #[inline]
+    unsafe fn append_elements_unreserved(&mut self, other: *const [T]) {
         let count = other.len();
-        self.reserve(count);
         let len = self.len();
         if count > 0 {
             unsafe {
@@ -3248,8 +3295,9 @@ impl<T, A: Allocator> Vec<T, A> {
     /// assert_eq!(&v, &[0, 1, 2]);
     /// ```
     #[stable(feature = "vec_spare_capacity", since = "1.60.0")]
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
     #[inline]
-    pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
+    pub const fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
         // Note:
         // This method is not implemented in terms of `split_at_spare_mut`,
         // to prevent invalidation of pointers to the buffer.
@@ -3313,8 +3361,9 @@ impl<T, A: Allocator> Vec<T, A> {
     /// assert_eq!(&v, &[1, 1, 2, 4, 8, 12, 16]);
     /// ```
     #[unstable(feature = "vec_split_at_spare", issue = "81944")]
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
     #[inline]
-    pub fn split_at_spare_mut(&mut self) -> (&mut [T], &mut [MaybeUninit<T>]) {
+    pub const fn split_at_spare_mut(&mut self) -> (&mut [T], &mut [MaybeUninit<T>]) {
         // SAFETY:
         // - len is ignored and so never changed
         let (init, spare, _) = unsafe { self.split_at_spare_mut_with_len() };
@@ -3324,7 +3373,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// Safety: changing returned .2 (&mut usize) is considered the same as calling `.set_len(_)`.
     ///
     /// This method provides unique access to all vec parts at once in `extend_from_within`.
-    unsafe fn split_at_spare_mut_with_len(
+    const unsafe fn split_at_spare_mut_with_len(
         &mut self,
     ) -> (&mut [T], &mut [MaybeUninit<T>], &mut usize) {
         let ptr = self.as_mut_ptr();
@@ -3599,6 +3648,22 @@ impl<T: Clone, A: Allocator> Vec<T, A> {
     }
 }
 
+impl<A: Allocator> Vec<u8, A> {
+    #[cfg_attr(
+        not(no_global_oom_handling),
+        expect(
+            dead_code,
+            reason = "currently only used in IO module when global OOM handling is disabled"
+        )
+    )]
+    pub(crate) fn try_extend_from_slice_of_bytes(
+        &mut self,
+        other: &[u8],
+    ) -> Result<(), TryReserveError> {
+        unsafe { self.try_append_elements(other) }
+    }
+}
+
 impl<T, A: Allocator, const N: usize> Vec<[T; N], A> {
     /// Takes a `Vec<[T; N]>` and flattens it into a `Vec<T>`.
     ///
@@ -3779,7 +3844,7 @@ impl<T: TrivialClone, A: Allocator> ExtendFromWithinSpec for Vec<T, A> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl<T, A: Allocator> const ops::Deref for Vec<T, A> {
+const impl<T, A: Allocator> ops::Deref for Vec<T, A> {
     type Target = [T];
 
     #[inline]
@@ -3790,7 +3855,7 @@ impl<T, A: Allocator> const ops::Deref for Vec<T, A> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl<T, A: Allocator> const ops::DerefMut for Vec<T, A> {
+const impl<T, A: Allocator> ops::DerefMut for Vec<T, A> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
@@ -3803,6 +3868,11 @@ unsafe impl<T, A: Allocator> ops::DerefPure for Vec<T, A> {}
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Clone, A: Allocator + Clone> Clone for Vec<T, A> {
+    /// Creates a new `Vec` by deep-copying the contents of an existing `Vec`.
+    ///
+    /// This method will allocate a new `Vec` and `clone` all of `self`'s contents
+    /// into it. The capacity of the duplicate `Vec` is not forced to match the
+    /// capacity of the original.
     fn clone(&self) -> Self {
         let alloc = self.allocator().clone();
         <[T]>::to_vec_in(&**self, alloc)
@@ -3856,7 +3926,7 @@ impl<T: Hash, A: Allocator> Hash for Vec<T, A> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-impl<T, I: [const] SliceIndex<[T]>, A: Allocator> const Index<I> for Vec<T, A> {
+const impl<T, I: [const] SliceIndex<[T]>, A: Allocator> Index<I> for Vec<T, A> {
     type Output = I::Output;
 
     #[inline]
@@ -3867,7 +3937,7 @@ impl<T, I: [const] SliceIndex<[T]>, A: Allocator> const Index<I> for Vec<T, A> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-impl<T, I: [const] SliceIndex<[T]>, A: Allocator> const IndexMut<I> for Vec<T, A> {
+const impl<T, I: [const] SliceIndex<[T]>, A: Allocator> IndexMut<I> for Vec<T, A> {
     #[inline]
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
         IndexMut::index_mut(&mut **self, index)
@@ -4276,13 +4346,16 @@ impl<T: Ord, A: Allocator> Ord for Vec<T, A> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-unsafe impl<#[may_dangle] T, A: Allocator> Drop for Vec<T, A> {
+#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+const unsafe impl<#[may_dangle] T: [const] Destruct, A: [const] Allocator + [const] Destruct> Drop
+    for Vec<T, A>
+{
     fn drop(&mut self) {
         unsafe {
             // use drop for [T]
             // use a raw slice to refer to the elements of the vector as weakest necessary type;
             // could avoid questions of validity in certain cases
-            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.as_mut_ptr(), self.len))
+            self.as_mut_ptr().cast_slice(self.len).drop_in_place()
         }
         // RawVec handles deallocation
     }
@@ -4290,7 +4363,7 @@ unsafe impl<#[may_dangle] T, A: Allocator> Drop for Vec<T, A> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_default", issue = "143894")]
-impl<T> const Default for Vec<T> {
+const impl<T> Default for Vec<T> {
     /// Creates an empty `Vec<T>`.
     ///
     /// The vector will not allocate until elements are pushed onto it.
@@ -4495,7 +4568,10 @@ impl From<&str> for Vec<u8> {
 }
 
 #[stable(feature = "array_try_from_vec", since = "1.48.0")]
-impl<T, A: Allocator, const N: usize> TryFrom<Vec<T, A>> for [T; N] {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl<T: [const] Destruct, A: [const] Allocator + [const] Destruct, const N: usize>
+    TryFrom<Vec<T, A>> for [T; N]
+{
     type Error = Vec<T, A>;
 
     /// Gets the entire contents of the `Vec<T>` as an array,

@@ -31,7 +31,7 @@ use rustc_span::{Symbol, sym};
 use rustc_target::spec::{PanicStrategy, RelocModel, SanitizerSet, Target};
 
 use crate::config::{CrateType, FmtDebug};
-use crate::{Session, errors};
+use crate::{Session, diagnostics};
 
 /// The parsed `--cfg` options that define the compilation environment of the
 /// crate, used to drive conditional compilation.
@@ -105,7 +105,7 @@ pub(crate) fn disallow_cfgs(sess: &Session, user_cfgs: &Cfg) {
             EXPLICIT_BUILTIN_CFGS_IN_FLAGS,
             None,
             ast::CRATE_NODE_ID,
-            errors::UnexpectedBuiltinCfg { cfg, cfg_name, controlled_by }.into(),
+            diagnostics::UnexpectedBuiltinCfg { cfg, cfg_name, controlled_by }.into(),
         )
     };
 
@@ -149,6 +149,7 @@ pub(crate) fn disallow_cfgs(sess: &Session, user_cfgs: &Cfg) {
             | (sym::target_pointer_width, Some(_))
             | (sym::target_vendor, None | Some(_))
             | (sym::target_has_atomic, Some(_))
+            | (sym::target_has_threads, None | Some(_))
             | (sym::target_has_atomic_primitive_alignment, Some(_))
             | (sym::target_has_atomic_load_store, Some(_))
             | (sym::target_has_reliable_f16, None | Some(_))
@@ -157,7 +158,6 @@ pub(crate) fn disallow_cfgs(sess: &Session, user_cfgs: &Cfg) {
             | (sym::target_has_reliable_f128_math, None | Some(_))
             | (sym::target_thread_local, None) => disallow(cfg, "--target"),
             (sym::fmt_debug, None | Some(_)) => disallow(cfg, "-Z fmt-debug"),
-            (sym::emscripten_wasm_eh, None | Some(_)) => disallow(cfg, "-Z emscripten_wasm_eh"),
             _ => {}
         }
     }
@@ -304,6 +304,10 @@ pub(crate) fn default_configuration(sess: &Session) -> Cfg {
         }
     }
 
+    if !sess.target.singlethread(&sess.internal_target_features) {
+        ins_none!(sym::target_has_threads);
+    }
+
     ins_sym!(sym::target_os, sess.target.os.desc_symbol());
     ins_sym!(sym::target_pointer_width, sym::integer(sess.target.pointer_width));
 
@@ -320,11 +324,6 @@ pub(crate) fn default_configuration(sess: &Session) -> Cfg {
 
     if sess.ub_checks() {
         ins_none!(sym::ub_checks);
-    }
-
-    // Nightly-only implementation detail for the `panic_unwind` and `unwind` crates.
-    if sess.is_nightly_build() && sess.opts.unstable_opts.emscripten_wasm_eh {
-        ins_none!(sym::emscripten_wasm_eh);
     }
 
     if sess.contract_checks() {
@@ -392,6 +391,7 @@ impl CheckCfg {
         ins!(sym::doc, no_values);
         ins!(sym::doctest, no_values);
         ins!(sym::miri, no_values);
+        ins!(sym::rust_analyzer, no_values);
         ins!(sym::rustfmt, no_values);
 
         ins!(sym::overflow_checks, no_values);
@@ -491,6 +491,7 @@ impl CheckCfg {
         ins!(sym::target_has_atomic_primitive_alignment, empty_values).extend(atomic_values);
 
         ins!(sym::target_thread_local, no_values);
+        ins!(sym::target_has_threads, no_values);
 
         ins!(sym::ub_checks, no_values);
         ins!(sym::contract_checks, no_values);

@@ -25,6 +25,7 @@
 [submodule "src/llvm-project"]
 	path = src/llvm-project
 	url = git@github.com:teenygrad/llvm-project.git
+	branch = chore/rustc-1.99.0-pin
 	shallow = true
 [submodule "src/triton"]
 	path = src/triton

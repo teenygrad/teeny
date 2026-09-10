@@ -2,7 +2,7 @@ use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_index::bit_set::DenseBitSet;
 use rustc_index::interval::IntervalSet;
 use rustc_infer::infer::canonical::QueryRegionConstraints;
-use rustc_infer::infer::outlives::for_liveness;
+use rustc_infer::traits::TraitErrors;
 use rustc_middle::mir::{BasicBlock, Body, ConstraintCategory, HasLocalDecls, Local, Location};
 use rustc_middle::traits::query::DropckOutlivesResult;
 use rustc_middle::ty::relate::Relate;
@@ -14,8 +14,9 @@ use rustc_mir_dataflow::{Analysis, ResultsCursor};
 use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span};
 use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
 use rustc_trait_selection::traits::ObligationCtxt;
+use rustc_trait_selection::traits::outlives_for_liveness::FreeRegionsVisitor;
 use rustc_trait_selection::traits::query::dropck_outlives;
-use rustc_trait_selection::traits::query::type_op::{DropckOutlives, TypeOp, TypeOpOutput};
+use rustc_trait_selection::traits::query::type_op::{DropckOutlives, TypeOpOutput};
 use tracing::debug;
 
 use crate::polonius;
@@ -44,6 +45,8 @@ pub(super) fn trace<'tcx>(
     relevant_live_locals: Vec<Local>,
     boring_locals: Vec<Local>,
 ) {
+    let _timer = typeck.tcx().prof.generic_activity("borrowck_liveness_trace");
+
     let local_use_map = &LocalUseMap::build(&relevant_live_locals, location_map, typeck.body);
     let cx = LivenessContext {
         typeck,
@@ -484,6 +487,7 @@ impl<'a, 'typeck, 'tcx> LivenessContext<'a, 'typeck, 'tcx> {
             // a much, much smaller domain: in our benchmarks, when it's not zero (the most likely
             // case), there are a few dozens compared to e.g. thousands or tens of thousands of
             // locals and move paths.
+            let _timer = tcx.prof.generic_activity("borrowck_dataflow_maybe_inits");
             let flow_inits = MaybeInitializedPlaces::new(tcx, body, self.move_data)
                 .iterate_to_fixpoint(tcx, body, Some("borrowck"))
                 .into_results_cursor(body);
@@ -611,7 +615,7 @@ impl<'tcx> LivenessContext<'_, '_, 'tcx> {
             values::pretty_print_points(location_map, live_at.iter()),
         );
 
-        value.visit_with(&mut for_liveness::FreeRegionsVisitor {
+        value.visit_with(&mut FreeRegionsVisitor {
             tcx: typeck.tcx(),
             param_env: typeck.infcx.param_env,
             op: |r| {
@@ -638,9 +642,9 @@ impl<'tcx> LivenessContext<'_, '_, 'tcx> {
     ) -> DropData<'tcx> {
         debug!("compute_drop_data(dropped_ty={:?})", dropped_ty);
 
-        let op = typeck.infcx.param_env.and(DropckOutlives { dropped_ty });
+        let goal = DropckOutlives { dropped_ty };
 
-        match op.fully_perform(typeck.infcx, typeck.root_cx.root_def_id(), DUMMY_SP) {
+        match typeck.infcx.fully_perform(goal, DUMMY_SP) {
             Ok(TypeOpOutput { output, constraints, .. }) => {
                 DropData { dropck_result: output, region_constraint_data: constraints }
             }
@@ -655,15 +659,17 @@ impl<'tcx> LivenessContext<'_, '_, 'tcx> {
                 typeck.infcx.probe(|_| {
                     let ocx = ObligationCtxt::new_with_diagnostics(&typeck.infcx);
                     let errors = match dropck_outlives::compute_dropck_outlives_with_errors(
-                        &ocx, op, span,
+                        &ocx,
+                        typeck.infcx.param_env.and(goal),
+                        span,
                     ) {
                         Ok(_) => ocx.evaluate_obligations_error_on_ambiguity(),
-                        Err(e) => e,
+                        Err(e) => TraitErrors::HasErrors(e),
                     };
 
                     // Could have no errors if a type lowering error, say, caused the query
                     // to fail.
-                    if !errors.is_empty() {
+                    if let TraitErrors::HasErrors(errors) = errors {
                         typeck.infcx.err_ctxt().report_fulfillment_errors(errors);
                     }
                 });

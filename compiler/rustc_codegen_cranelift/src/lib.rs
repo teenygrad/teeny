@@ -18,9 +18,7 @@ extern crate rustc_codegen_ssa;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_errors;
-extern crate rustc_fs_util;
 extern crate rustc_hir;
-extern crate rustc_incremental;
 extern crate rustc_index;
 extern crate rustc_log;
 extern crate rustc_session;
@@ -40,11 +38,12 @@ use std::sync::Arc;
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use rustc_codegen_ssa::traits::CodegenBackend;
-use rustc_codegen_ssa::{CompiledModules, CrateInfo, TargetConfig};
+use rustc_codegen_ssa::{CompiledModules, CrateInfo, TargetConfig, back};
+use rustc_data_structures::unord::UnordSet;
 use rustc_log::tracing::info;
-use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
-use rustc_session::Session;
-use rustc_session::config::OutputFilenames;
+use rustc_middle::dep_graph::WorkProductMap;
+use rustc_session::config::{NATIVE_CPU, OutputFilenames};
+use rustc_session::{IncrCompSession, Session};
 use rustc_span::{Symbol, sym};
 use rustc_target::spec::{Arch, CfgAbi, Env, Os};
 
@@ -60,7 +59,6 @@ mod codegen_f16_f128;
 mod codegen_i128;
 mod common;
 mod compiler_builtins;
-mod concurrency_limiter;
 mod config;
 mod constant;
 mod debuginfo;
@@ -86,12 +84,12 @@ mod prelude {
     pub(crate) use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
     pub(crate) use cranelift_codegen::ir::function::Function;
     pub(crate) use cranelift_codegen::ir::{
-        AbiParam, Block, FuncRef, Inst, InstBuilder, MemFlags, Signature, SourceLoc, StackSlot,
+        AbiParam, Block, FuncRef, Inst, InstBuilder, MemFlagsData, Signature, SourceLoc, StackSlot,
         StackSlotData, StackSlotKind, TrapCode, Type, Value, types,
     };
     pub(crate) use cranelift_module::{self, DataDescription, FuncId, Linkage, Module};
     pub(crate) use rustc_abi::{BackendRepr, FIRST_VARIANT, FieldIdx, Scalar, Size, VariantIdx};
-    pub(crate) use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
+    pub(crate) use rustc_data_structures::fx::FxHashMap;
     pub(crate) use rustc_hir::def_id::{DefId, LOCAL_CRATE};
     pub(crate) use rustc_index::Idx;
     pub(crate) use rustc_middle::mir::{self, *};
@@ -133,7 +131,7 @@ impl CodegenBackend for CraneliftCodegenBackend {
         match sess.lto() {
             Lto::No | Lto::ThinLocal => {}
             Lto::Thin | Lto::Fat => {
-                sess.dcx().warn("LTO is not supported. You may get a linker error.")
+                sess.dcx().fatal("LTO is not supported by rustc_codegen_cranelift");
             }
         }
 
@@ -150,6 +148,10 @@ impl CodegenBackend for CraneliftCodegenBackend {
         if config.jit_mode && !sess.opts.output_types.should_codegen() {
             sess.dcx().fatal("JIT mode doesn't work with `cargo check`");
         }
+    }
+
+    fn thin_lto_supported(&self) -> bool {
+        false
     }
 
     fn target_config(&self, sess: &Session) -> TargetConfig {
@@ -169,8 +171,6 @@ impl CodegenBackend for CraneliftCodegenBackend {
             },
             _ => vec![],
         };
-        // FIXME do `unstable_target_features` properly
-        let unstable_target_features = target_features.clone();
 
         // FIXME(f16_f128): `rustc_codegen_llvm` currently disables support on Windows GNU
         // targets due to GCC using a different ABI than LLVM. Therefore `f16` and `f128`
@@ -185,8 +185,7 @@ impl CodegenBackend for CraneliftCodegenBackend {
         let has_reliable_f128_math = has_reliable_f16_f128 && sess.target.env == Env::Gnu;
 
         TargetConfig {
-            target_features,
-            unstable_target_features,
+            internal_target_features: UnordSet::from_iter(target_features),
             // `rustc_codegen_cranelift` polyfills functionality not yet
             // available in Cranelift.
             has_reliable_f16: has_reliable_f16_f128,
@@ -224,7 +223,7 @@ impl CodegenBackend for CraneliftCodegenBackend {
             #[cfg(not(feature = "jit"))]
             tcx.dcx().fatal("jit support was disabled when compiling rustc_codegen_cranelift");
         } else {
-            driver::aot::run_aot(tcx)
+            Box::new(rustc_codegen_ssa::base::codegen_crate(driver::aot::AotDriver, tcx))
         }
     }
 
@@ -232,10 +231,18 @@ impl CodegenBackend for CraneliftCodegenBackend {
         &self,
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
-        outputs: &OutputFilenames,
-        _crate_info: &CrateInfo,
-    ) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
-        ongoing_codegen.downcast::<driver::aot::OngoingCodegen>().unwrap().join(sess, outputs)
+        incr_comp_session: Option<&IncrCompSession>,
+        _outputs: &OutputFilenames,
+        crate_info: &CrateInfo,
+    ) -> (CompiledModules, WorkProductMap) {
+        ongoing_codegen
+            .downcast::<rustc_codegen_ssa::back::write::OngoingCodegen<driver::aot::AotDriver>>()
+            .unwrap()
+            .join(sess, incr_comp_session, crate_info)
+    }
+
+    fn fallback_intrinsics(&self) -> Vec<Symbol> {
+        vec![sym::type_id_eq]
     }
 }
 
@@ -250,7 +257,9 @@ fn enable_verifier(sess: &Session) -> bool {
 }
 
 fn target_triple(sess: &Session) -> target_lexicon::Triple {
-    match sess.target.llvm_target.parse() {
+    // Use versioned target triple to make `OperatingSystem::MacOSX(...)`
+    // contain a value, which we use when emitting `LC_BUILD_VERSION`.
+    match back::versioned_llvm_target(sess).parse() {
         Ok(triple) => triple,
         Err(err) => sess.dcx().fatal(format!("target not recognized: {}", err)),
     }
@@ -331,7 +340,7 @@ fn build_isa(sess: &Session, jit: bool) -> Arc<dyn TargetIsa + 'static> {
     let flags = settings::Flags::new(flags_builder);
 
     let isa_builder = match sess.opts.cg.target_cpu.as_deref() {
-        Some("native") => cranelift_native::builder_with_options(true).unwrap(),
+        Some(NATIVE_CPU) => cranelift_native::builder_with_options(true).unwrap(),
         Some(value) => {
             let mut builder =
                 cranelift_codegen::isa::lookup(target_triple.clone()).unwrap_or_else(|err| {

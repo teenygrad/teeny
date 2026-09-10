@@ -1,5 +1,5 @@
 //@ revisions: llvm-current llvm-next
-//@[llvm-current] ignore-llvm-version: 23-99
+//@[llvm-current] max-llvm-major-version: 22
 //@[llvm-next] min-llvm-version: 23
 //@ compile-flags: -Copt-level=3 -Z merge-functions=disabled
 //@ only-x86_64
@@ -9,8 +9,8 @@
 #[no_mangle]
 pub fn array_eq_value(a: [u16; 3], b: [u16; 3]) -> bool {
     // CHECK-NEXT: start:
-    // CHECK-NEXT: %2 = icmp eq i48 %0, %1
-    // CHECK-NEXT: ret i1 %2
+    // CHECK-NEXT: %_0 = icmp eq i48 %0, %1
+    // CHECK-NEXT: ret i1 %_0
     a == b
 }
 

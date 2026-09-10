@@ -21,7 +21,14 @@ impl TryFromIntError {
 #[stable(feature = "try_from", since = "1.34.0")]
 impl fmt::Display for TryFromIntError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        "out of range integral type conversion attempted".fmt(f)
+        match self.0 {
+            IntErrorKind::Empty | IntErrorKind::InvalidDigit => unreachable!(),
+            IntErrorKind::PosOverflow => "number too large to fit in target type",
+            IntErrorKind::NegOverflow => "number too small to fit in target type",
+            IntErrorKind::Zero => "number would be zero for non-zero type",
+            IntErrorKind::NotAPowerOfTwo => "number is not a power of two",
+        }
+        .fmt(f)
     }
 }
 
@@ -30,7 +37,7 @@ impl Error for TryFromIntError {}
 
 #[stable(feature = "try_from", since = "1.34.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl const From<Infallible> for TryFromIntError {
+const impl From<Infallible> for TryFromIntError {
     fn from(x: Infallible) -> TryFromIntError {
         match x {}
     }
@@ -38,7 +45,7 @@ impl const From<Infallible> for TryFromIntError {
 
 #[unstable(feature = "never_type", issue = "35121")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl const From<!> for TryFromIntError {
+const impl From<!> for TryFromIntError {
     #[inline]
     fn from(never: !) -> TryFromIntError {
         // Match rather than coerce to make sure that code like

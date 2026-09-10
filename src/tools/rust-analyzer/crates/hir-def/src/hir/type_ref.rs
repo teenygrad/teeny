@@ -9,7 +9,7 @@ use thin_vec::ThinVec;
 use crate::{
     LifetimeParamId, TypeParamId,
     expr_store::{ExpressionStore, path::Path},
-    hir::ExprId,
+    hir::{ExprId, PatId},
 };
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -94,6 +94,7 @@ pub struct TraitRef {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FnType {
+    pub binder: Option<Box<[Name]>>,
     pub params: Box<[(Option<Name>, TypeRefId)]>,
     pub is_varargs: bool,
     pub is_unsafe: bool,
@@ -139,6 +140,7 @@ pub enum TypeRef {
     ImplTrait(ThinVec<TypeBound>),
     DynTrait(ThinVec<TypeBound>),
     TypeParam(TypeParamId),
+    PatternType(TypeRefId, PatId),
     Error,
 }
 

@@ -18,7 +18,7 @@ use crate::{
     Adjust, Adjustment, AutoBorrow, IncorrectGenericsLenKind, InferenceDiagnostic,
     LifetimeElisionKind, PointerCast, Span,
     db::HirDatabase,
-    infer::{AllowTwoPhase, AutoBorrowMutability, InferenceContext},
+    infer::{AllowTwoPhase, AutoBorrowMutability, ExplicitDropMethodUseKind, InferenceContext},
     lower::{
         GenericPredicates,
         path::{GenericArgsLowerer, TypeLikeConst, substs_from_args_and_bindings},
@@ -36,8 +36,8 @@ use crate::{
     },
 };
 
-struct ConfirmContext<'a, 'b, 'db> {
-    ctx: &'a mut InferenceContext<'b, 'db>,
+struct ConfirmContext<'a, 'db> {
+    ctx: &'a mut InferenceContext<'db>,
     candidate: FunctionId,
     call_expr: ExprId,
 }
@@ -49,7 +49,7 @@ pub(crate) struct ConfirmResult<'db> {
     pub(crate) adjustments: Box<[Adjustment]>,
 }
 
-impl<'a, 'db> InferenceContext<'a, 'db> {
+impl<'db> InferenceContext<'db> {
     pub(crate) fn confirm_method(
         &mut self,
         pick: &probe::Pick<'db>,
@@ -70,12 +70,12 @@ impl<'a, 'db> InferenceContext<'a, 'db> {
     }
 }
 
-impl<'a, 'b, 'db> ConfirmContext<'a, 'b, 'db> {
+impl<'a, 'db> ConfirmContext<'a, 'db> {
     fn new(
-        ctx: &'a mut InferenceContext<'b, 'db>,
+        ctx: &'a mut InferenceContext<'db>,
         candidate: FunctionId,
         call_expr: ExprId,
-    ) -> ConfirmContext<'a, 'b, 'db> {
+    ) -> ConfirmContext<'a, 'db> {
         ConfirmContext { ctx, candidate, call_expr }
     }
 
@@ -312,7 +312,7 @@ impl<'a, 'b, 'db> ConfirmContext<'a, 'b, 'db> {
 
     fn extract_existential_trait_ref<R, F>(&self, self_ty: Ty<'db>, mut closure: F) -> R
     where
-        F: FnMut(&ConfirmContext<'a, 'b, 'db>, Ty<'db>, PolyExistentialTraitRef<'db>) -> R,
+        F: FnMut(&ConfirmContext<'a, 'db>, Ty<'db>, PolyExistentialTraitRef<'db>) -> R,
     {
         // If we specified that this is an object method, then the
         // self-type ought to be something that can be dereferenced to
@@ -348,13 +348,13 @@ impl<'a, 'b, 'db> ConfirmContext<'a, 'b, 'db> {
         generic_args: Option<&HirGenericArgs>,
         parent_args: GenericArgs<'db>,
     ) -> GenericArgs<'db> {
-        struct LowererCtx<'a, 'b, 'db> {
-            ctx: &'a mut InferenceContext<'b, 'db>,
+        struct LowererCtx<'a, 'db> {
+            ctx: &'a mut InferenceContext<'db>,
             expr: ExprId,
             parent_args: &'a [GenericArg<'db>],
         }
 
-        impl<'db> GenericArgsLowerer<'db> for LowererCtx<'_, '_, 'db> {
+        impl<'db> GenericArgsLowerer<'db> for LowererCtx<'_, 'db> {
             fn report_len_mismatch(
                 &mut self,
                 def: GenericDefId,
@@ -582,7 +582,9 @@ impl<'a, 'b, 'db> ConfirmContext<'a, 'b, 'db> {
     fn check_for_illegal_method_calls(&self) {
         // Disallow calls to the method `drop` defined in the `Drop` trait.
         if self.ctx.lang_items.Drop_drop.is_some_and(|drop_fn| drop_fn == self.candidate) {
-            // FIXME: Report an error.
+            self.ctx.push_diagnostic(InferenceDiagnostic::ExplicitDropMethodUse {
+                kind: ExplicitDropMethodUseKind::MethodCall(self.call_expr),
+            });
         }
     }
 

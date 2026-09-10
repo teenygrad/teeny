@@ -5,12 +5,11 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_errors::msg;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
-use rustc_session::errors::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_span::{Span, sym};
 use rustc_target::asm;
 
-use super::LoweringContext;
-use super::errors::{
+use crate::diagnostics::{
     AbiSpecifiedMultipleTimes, AttSyntaxOnlyX86, ClobberAbiNotSupported,
     InlineAsmUnsupportedTarget, InvalidAbiClobberAbi, InvalidAsmTemplateModifierConst,
     InvalidAsmTemplateModifierLabel, InvalidAsmTemplateModifierRegClass,
@@ -18,7 +17,9 @@ use super::errors::{
     InvalidRegisterClass, RegisterClassOnlyClobber, RegisterClassOnlyClobberStable,
     RegisterConflict,
 };
-use crate::{AllowReturnTypeNotation, ImplTraitContext, ImplTraitPosition, ParamMode};
+use crate::{
+    AllowReturnTypeNotation, ImplTraitContext, ImplTraitPosition, LoweringContext, ParamMode,
+};
 
 impl<'hir> LoweringContext<'_, 'hir> {
     pub(crate) fn lower_inline_asm(
@@ -92,7 +93,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 match asm::InlineAsmClobberAbi::parse(
                     asm_arch,
                     &self.tcx.sess.target,
-                    &self.tcx.sess.unstable_target_features,
+                    &self.tcx.sess.internal_target_features,
                     *abi_name,
                 ) {
                     Ok(abi) => {

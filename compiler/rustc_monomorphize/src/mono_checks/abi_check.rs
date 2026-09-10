@@ -8,7 +8,7 @@ use rustc_span::def_id::DefId;
 use rustc_span::{DUMMY_SP, Span, Symbol, sym};
 use rustc_target::callconv::{FnAbi, PassMode};
 
-use crate::errors;
+use crate::diagnostics;
 
 /// Are vector registers used?
 enum UsesVectorRegisters {
@@ -25,10 +25,7 @@ fn passes_vectors_by_value(mode: &PassMode, repr: &BackendRepr) -> UsesVectorReg
     match mode {
         PassMode::Ignore | PassMode::Indirect { .. } => UsesVectorRegisters::No,
         PassMode::Cast { pad_i32: _, cast }
-            if cast
-                .prefix
-                .iter()
-                .any(|r| r.is_some_and(|x| matches!(x.kind, RegKind::Vector { .. })))
+            if cast.prefix.iter().any(|x| matches!(x.kind, RegKind::Vector { .. }))
                 || matches!(cast.rest.unit.kind, RegKind::Vector { .. }) =>
         {
             UsesVectorRegisters::FixedVector
@@ -60,7 +57,7 @@ fn do_check_simd_vector_abi<'tcx>(
 ) {
     let codegen_attrs = tcx.codegen_fn_attrs(def_id);
     let have_feature = |feat: Symbol| {
-        let target_feats = tcx.sess.unstable_target_features.contains(&feat);
+        let target_feats = tcx.sess.internal_target_features.contains(&feat);
         let fn_feats = codegen_attrs.target_features.iter().any(|x| x.name == feat);
         target_feats || fn_feats
     };
@@ -74,7 +71,7 @@ fn do_check_simd_vector_abi<'tcx>(
                     Some((_, feature)) => feature,
                     None => {
                         let (span, _hir_id) = loc();
-                        tcx.dcx().emit_err(errors::AbiErrorUnsupportedVectorType {
+                        tcx.dcx().emit_err(diagnostics::AbiErrorUnsupportedVectorType {
                             span,
                             ty: arg_abi.layout.ty,
                             is_call,
@@ -84,7 +81,7 @@ fn do_check_simd_vector_abi<'tcx>(
                 };
                 if !feature.is_empty() && !have_feature(Symbol::intern(feature)) {
                     let (span, _hir_id) = loc();
-                    tcx.dcx().emit_err(errors::AbiErrorDisabledVectorType {
+                    tcx.dcx().emit_err(diagnostics::AbiErrorDisabledVectorType {
                         span,
                         required_feature: feature,
                         ty: arg_abi.layout.ty,
@@ -101,7 +98,7 @@ fn do_check_simd_vector_abi<'tcx>(
                 };
                 if !required_feature.is_empty() && !have_feature(Symbol::intern(required_feature)) {
                     let (span, _) = loc();
-                    tcx.dcx().emit_err(errors::AbiErrorDisabledVectorType {
+                    tcx.dcx().emit_err(diagnostics::AbiErrorDisabledVectorType {
                         span,
                         required_feature,
                         ty: arg_abi.layout.ty,
@@ -118,7 +115,7 @@ fn do_check_simd_vector_abi<'tcx>(
     // The `vectorcall` ABI is special in that it requires SSE2 no matter which types are being passed.
     if abi.conv == CanonAbi::X86(X86Call::Vectorcall) && !have_feature(sym::sse2) {
         let (span, _hir_id) = loc();
-        tcx.dcx().emit_err(errors::AbiRequiredTargetFeature {
+        tcx.dcx().emit_err(diagnostics::AbiRequiredTargetFeature {
             span,
             required_feature: "sse2",
             abi: "vectorcall",
@@ -145,7 +142,7 @@ fn do_check_unsized_params<'tcx>(
     for arg_abi in fn_abi.args.iter() {
         if !arg_abi.layout.layout.is_sized() {
             let (span, _hir_id) = loc();
-            tcx.dcx().emit_err(errors::AbiErrorUnsupportedUnsizedParameter {
+            tcx.dcx().emit_err(diagnostics::AbiErrorUnsupportedUnsizedParameter {
                 span,
                 ty: arg_abi.layout.ty,
                 is_call,
@@ -218,7 +215,17 @@ fn check_call_site_abi<'tcx>(
             if tcx.intrinsic(def_id).is_some() {
                 return;
             }
-            let instance = ty::Instance::expect_resolve(tcx, typing_env, def_id, args, DUMMY_SP);
+            let instance = ty::Instance::expect_resolve(
+                tcx,
+                typing_env,
+                def_id,
+                args.no_bound_vars().unwrap(),
+                DUMMY_SP,
+            );
+            if let InstanceKind::LlvmIntrinsic(..) = instance.def {
+                // LLVM intrinsics don't have an ABI, so there is nothing to check.
+                return;
+            }
             tcx.fn_abi_of_instance(typing_env.as_query_input((instance, ty::List::empty())))
         }
         _ => {
@@ -245,7 +252,7 @@ fn check_callees_abi<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, body: &m
                 let callee_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     ty::TypingEnv::fully_monomorphized(),
-                    ty::EarlyBinder::bind(callee_ty),
+                    ty::EarlyBinder::bind(tcx, callee_ty),
                 );
                 check_call_site_abi(tcx, callee_ty, body.source.instance, || {
                     let loc = Location {

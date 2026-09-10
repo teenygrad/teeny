@@ -6,7 +6,7 @@
 // having basically only two use-cases that act in different ways.
 
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, AdtDef, Ty, TypingMode};
@@ -102,7 +102,7 @@ impl Qualif for HasMutInterior {
         let freeze_def_id = cx.tcx.require_lang_item(LangItem::Freeze, cx.body.span);
         let did = cx.body.source.def_id().expect_local();
 
-        let typing_env = if cx.tcx.use_typing_mode_borrowck() {
+        let typing_env = if cx.tcx.use_typing_mode_post_typeck_until_borrowck() {
             cx.typing_env
         } else {
             ty::TypingEnv::new(cx.typing_env.param_env, TypingMode::analysis_in_body(cx.tcx, did))
@@ -118,7 +118,7 @@ impl Qualif for HasMutInterior {
         );
         ocx.register_obligation(obligation);
         let errors = ocx.evaluate_obligations_error_on_ambiguity();
-        !errors.is_empty()
+        !errors.no_errors()
     }
 
     fn is_structural_in_adt_value<'tcx>(_cx: &ConstCx<'_, 'tcx>, adt: AdtDef<'tcx>) -> bool {
@@ -195,7 +195,7 @@ impl Qualif for NeedsNonConstDrop {
                     },
                 ),
         ));
-        !ocx.evaluate_obligations_error_on_ambiguity().is_empty()
+        !ocx.evaluate_obligations_error_on_ambiguity().no_errors()
     }
 
     fn is_structural_in_adt_value<'tcx>(cx: &ConstCx<'_, 'tcx>, adt: AdtDef<'tcx>) -> bool {
@@ -344,13 +344,13 @@ where
     let uneval = match constant.const_ {
         Const::Ty(_, ct) => match ct.kind() {
             ty::ConstKind::Param(_) | ty::ConstKind::Error(_) => None,
-            // Unevaluated consts in MIR bodies don't have associated MIR (e.g. `type const`).
-            ty::ConstKind::Unevaluated(_) => None,
+            // Alias consts in MIR bodies don't have associated MIR (e.g. `type const`).
+            ty::ConstKind::Alias(_, _) => None,
             // FIXME(mgca): Investigate whether using `None` for `ConstKind::Value` is overly
             // strict, and if instead we should be doing some kind of value-based analysis.
             ty::ConstKind::Value(_) => None,
             _ => bug!(
-                "expected ConstKind::Param, ConstKind::Value, ConstKind::Unevaluated, or ConstKind::Error here, found {:?}",
+                "expected ConstKind::Param, ConstKind::Value, ConstKind::Alias, or ConstKind::Error here, found {:?}",
                 ct
             ),
         },

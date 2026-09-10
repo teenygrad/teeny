@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 
 use crate::internal_paths::MAYBE_DEF;
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
+use clippy_utils::res::{MaybeDef as _, MaybeTypeckRes as _};
 use clippy_utils::source::{snippet_indent, snippet_with_applicability};
 use clippy_utils::visitors::for_each_expr;
 use clippy_utils::{eq_expr_value, if_sequence, sym};
@@ -541,7 +541,7 @@ fn extract_nested_is_diag_item<'tcx>(
     cx: &LateContext<'tcx>,
     cond: &'tcx Expr<'_>,
 ) -> Option<(Span, (&'tcx Expr<'tcx>, &'tcx Expr<'tcx>, &'tcx Expr<'tcx>))> {
-    for_each_expr(cx, cond, |cond_part| {
+    for_each_expr(cx.tcx, cond, |cond_part| {
         if let Some(res) = extract_is_diag_item(cx, cond_part) {
             ControlFlow::Break((cond_part.span, res))
         } else {
@@ -554,7 +554,7 @@ fn extract_nested_is_diagnostic_item<'tcx>(
     cx: &LateContext<'tcx>,
     cond: &'tcx Expr<'_>,
 ) -> Option<(Span, (&'tcx Expr<'tcx>, &'tcx Expr<'tcx>, &'tcx Expr<'tcx>))> {
-    for_each_expr(cx, cond, |cond_part| {
+    for_each_expr(cx.tcx, cond, |cond_part| {
         if let Some(res) = extract_is_diagnostic_item(cx, cond_part) {
             ControlFlow::Break((cond_part.span, res))
         } else {

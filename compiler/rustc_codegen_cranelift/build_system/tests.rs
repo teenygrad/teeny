@@ -2,12 +2,13 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::build_sysroot::SysrootConfig;
 use crate::path::{Dirs, RelPath};
 use crate::prepare::{GitRepo, apply_patches};
 use crate::rustc_info::get_default_sysroot;
 use crate::shared_utils::rustflags_from_env;
 use crate::utils::{CargoProject, Compiler, LogGroup, ensure_empty_dir, spawn_and_wait};
-use crate::{CodegenBackend, SysrootKind, build_sysroot, config};
+use crate::{CodegenBackend, build_sysroot, config};
 
 static BUILD_EXAMPLE_OUT_DIR: RelPath = RelPath::build("example");
 
@@ -125,6 +126,7 @@ pub(crate) static RAND_REPO: GitRepo = GitRepo::github(
     "rust-random",
     "rand",
     "1f4507a8e1cf8050e4ceef95eeda8f64645b6719",
+    &[],
     "981f8bf489338978",
     "rand",
 );
@@ -135,11 +137,23 @@ pub(crate) static REGEX_REPO: GitRepo = GitRepo::github(
     "rust-lang",
     "regex",
     "061ee815ef2c44101dba7b0b124600fcb03c1912",
+    &[],
     "dc26aefbeeac03ca",
     "regex",
 );
 
 static REGEX: CargoProject = CargoProject::new(REGEX_REPO.source_dir(), "regex_target");
+
+pub(crate) static GRAVIOLA_REPO: GitRepo = GitRepo::github(
+    "ctz",
+    "graviola",
+    "7763d0cc617d6f5f66c3bc0fe9b3d8581d781b6a", // v0.4.1
+    &["thirdparty/cavp", "thirdparty/wycheproof"],
+    "7fa5a75b9fb1ac40",
+    "graviola",
+);
+
+static GRAVIOLA: CargoProject = CargoProject::new(GRAVIOLA_REPO.source_dir(), "graviola_target");
 
 static PORTABLE_SIMD_SRC: RelPath = RelPath::build("portable-simd");
 
@@ -199,6 +213,34 @@ const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
             spawn_and_wait(build_cmd);
         }
     }),
+    TestCase::custom("test.graviola", &|runner| {
+        let (arch, _) = runner.target_compiler.triple.split_once('-').unwrap();
+
+        if !["aarch64", "x86_64"].contains(&arch) {
+            eprintln!("Skipping `graviola` tests: unsupported target");
+            return;
+        }
+
+        GRAVIOLA_REPO.patch(&runner.dirs);
+        GRAVIOLA.clean(&runner.dirs);
+
+        if runner.is_native {
+            let mut test_cmd = GRAVIOLA.test(&runner.target_compiler, &runner.dirs);
+
+            // FIXME: Disable AVX-512 until intrinsics are supported.
+            test_cmd.env("GRAVIOLA_CPU_DISABLE_avx512f", "1");
+            test_cmd.env("GRAVIOLA_CPU_DISABLE_avx512bw", "1");
+            test_cmd.env("GRAVIOLA_CPU_DISABLE_avx512vl", "1");
+
+            test_cmd.args(["-p", "graviola", "--lib", "--", "-q"]);
+            spawn_and_wait(test_cmd);
+        } else {
+            eprintln!("Cross-Compiling: Not running tests");
+            let mut build_cmd = GRAVIOLA.build(&runner.target_compiler, &runner.dirs);
+            build_cmd.args(["-p", "graviola", "--lib"]);
+            spawn_and_wait(build_cmd);
+        }
+    }),
     TestCase::custom("test.portable-simd", &|runner| {
         apply_patches(
             &runner.dirs,
@@ -225,9 +267,8 @@ const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
 
 pub(crate) fn run_tests(
     dirs: &Dirs,
-    sysroot_kind: SysrootKind,
+    sysroot_config: &SysrootConfig,
     use_unstable_features: bool,
-    panic_unwind_support: bool,
     skip_tests: &[&str],
     cg_clif_dylib: &CodegenBackend,
     bootstrap_host_compiler: &Compiler,
@@ -241,19 +282,18 @@ pub(crate) fn run_tests(
     if config::get_bool("testsuite.no_sysroot") && !skip_tests.contains(&"testsuite.no_sysroot") {
         let target_compiler = build_sysroot::build_sysroot(
             dirs,
-            SysrootKind::None,
+            sysroot_config,
             cg_clif_dylib,
             bootstrap_host_compiler,
             rustup_toolchain_name,
             target_triple.clone(),
-            panic_unwind_support,
         );
 
         let runner = TestRunner::new(
             dirs.clone(),
             target_compiler,
             use_unstable_features,
-            panic_unwind_support,
+            sysroot_config.panic_unwind_support,
             skip_tests,
             bootstrap_host_compiler.triple == target_triple,
             stdlib_source.clone(),
@@ -275,19 +315,18 @@ pub(crate) fn run_tests(
     if run_base_sysroot || run_extended_sysroot {
         let target_compiler = build_sysroot::build_sysroot(
             dirs,
-            sysroot_kind,
+            sysroot_config,
             cg_clif_dylib,
             bootstrap_host_compiler,
             rustup_toolchain_name,
             target_triple.clone(),
-            panic_unwind_support,
         );
 
         let mut runner = TestRunner::new(
             dirs.clone(),
             target_compiler,
             use_unstable_features,
-            panic_unwind_support,
+            sysroot_config.panic_unwind_support,
             skip_tests,
             bootstrap_host_compiler.triple == target_triple,
             stdlib_source,

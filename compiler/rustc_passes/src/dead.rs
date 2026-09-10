@@ -5,13 +5,14 @@
 
 use std::mem;
 use std::ops::ControlFlow;
+use std::sync::atomic::Ordering;
 
 use hir::def_id::{LocalDefIdMap, LocalDefIdSet};
 use rustc_abi::FieldIdx;
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_errors::{ErrorGuaranteed, MultiSpan};
 use rustc_hir::def::{CtorOf, DefKind, Res};
-use rustc_hir::def_id::{DefId, LocalDefId, LocalModDefId};
+use rustc_hir::def_id::{DefId, LocalDefId, LocalModId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{self as hir, ForeignItemId, ItemId, Node, PatKind, QPath, find_attr};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
@@ -25,7 +26,7 @@ use rustc_session::lint::builtin::{DEAD_CODE, DEAD_CODE_PUB_IN_BINARY};
 use rustc_session::lint::{self, Lint, StableLintExpectationId};
 use rustc_span::{Symbol, kw};
 
-use crate::errors::{
+use crate::diagnostics::{
     ChangeFields, DeadCodePubInBinaryNote, IgnoredDerivedImpls, MultipleDeadCodes, ParentInfo,
     UselessAssignment,
 };
@@ -55,7 +56,6 @@ fn should_explore(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
         | DefKind::Impl { .. }
         | DefKind::OpaqueTy
         | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::ExternCrate
         | DefKind::Use
         | DefKind::Ctor(..)
@@ -184,15 +184,6 @@ impl<'tcx> MarkSymbolVisitor<'tcx> {
 
     fn handle_res(&mut self, res: Res) {
         match res {
-            Res::Def(
-                DefKind::Const { .. }
-                | DefKind::AssocConst { .. }
-                | DefKind::AssocTy
-                | DefKind::TyAlias,
-                def_id,
-            ) => {
-                self.check_def_id(def_id);
-            }
             Res::PrimTy(..) | Res::SelfCtor(..) | Res::Local(..) => {}
             Res::Def(DefKind::Ctor(CtorOf::Variant, ..), ctor_def_id) => {
                 // Using a variant in patterns should not make the variant live,
@@ -797,7 +788,9 @@ fn has_allow_dead_code_or_lang_attr(
 
     if has_allow_expect_dead_code(tcx, def_id) {
         Some(ComesFromAllowExpect::Yes)
-    } else if has_used_like_attr(tcx, def_id) || find_attr!(tcx, def_id, Lang(..)) {
+    } else if has_used_like_attr(tcx, def_id)
+        || find_attr!(tcx, def_id, Lang(..) | RustcCanonicalSymbol)
+    {
         Some(ComesFromAllowExpect::No)
     } else {
         None
@@ -930,6 +923,21 @@ fn create_and_seed_worklist(tcx: TyCtxt<'_>) -> SeedWorklists {
     let mut worklist = Vec::new();
 
     if let Some((def_id, _)) = tcx.entry_fn(())
+        && let Some(local_def_id) = def_id.as_local()
+    {
+        worklist.push(WorkItem {
+            id: local_def_id,
+            propagated: ComesFromAllowExpect::No,
+            own: ComesFromAllowExpect::No,
+        });
+    }
+
+    // Under `--test`, what `main` resolves to is the would-be entry point of a normal build,
+    // so keep it live, unless a stripped user `#[rustc_main]` would have been the entry instead.
+    if tcx.sess.is_test_crate()
+        && !tcx.sess.removed_rustc_main_attr.load(Ordering::Relaxed)
+        && let Some(main_def) = tcx.resolutions(()).main_def
+        && let Some(def_id) = main_def.opt_fn_def_id()
         && let Some(local_def_id) = def_id.as_local()
     {
         worklist.push(WorkItem {
@@ -1226,7 +1234,7 @@ impl<'tcx> DeadVisitor<'tcx> {
                             && let Some(variant) =
                                 maybe_enum.variants().iter().find(|i| i.name == dead_item.name)
                         {
-                            Some(crate::errors::EnumVariantSameName {
+                            Some(crate::diagnostics::EnumVariantSameName {
                                 dead_descr: tcx.def_descr(dead_item.def_id.to_def_id()),
                                 dead_name: dead_item.name,
                                 variant_span: tcx.def_span(variant.def_id),
@@ -1319,7 +1327,7 @@ impl<'tcx> DeadVisitor<'tcx> {
     }
 }
 
-fn check_mod_deathness(tcx: TyCtxt<'_>, module: LocalModDefId) {
+fn check_mod_deathness(tcx: TyCtxt<'_>, module: LocalModId) {
     let Ok(DeadCodeLivenessSummary { pre_deferred_seeding, final_result }) =
         tcx.live_symbols_and_ignored_derived_traits(()).as_ref()
     else {
@@ -1361,7 +1369,7 @@ fn check_mod_deathness(tcx: TyCtxt<'_>, module: LocalModDefId) {
 fn lint_dead_codes<'tcx>(
     tcx: TyCtxt<'tcx>,
     target_lint: &'static Lint,
-    module: LocalModDefId,
+    module: LocalModId,
     live_symbols: &'tcx LocalDefIdSet,
     ignored_derived_traits: &'tcx LocalDefIdMap<FxIndexSet<DefId>>,
     free_items: impl Iterator<Item = ItemId>,

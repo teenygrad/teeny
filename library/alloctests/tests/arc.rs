@@ -107,7 +107,7 @@ fn eq_unsized() {
 fn eq_unsized_slice() {
     let a: Arc<[()]> = Arc::new([(); 3]);
     let ptr: *const () = Arc::into_raw(a.clone()).cast();
-    let b: Arc<[()]> = unsafe { Arc::from_raw(core::ptr::slice_from_raw_parts(ptr, 42)) };
+    let b: Arc<[()]> = unsafe { Arc::from_raw(ptr.cast_slice(42)) };
     assert!(a == a);
     assert!(!(a != a));
     assert!(a != b);
@@ -327,4 +327,27 @@ mod pin_coerce_unsized {
     pub fn pin_unique_arc(arg: Pin<UniqueArc<String>>) -> Pin<UniqueArc<dyn MyTrait>> {
         arg
     }
+}
+
+/// Test that `Arc::make_mut` does not forget an allocator when it steals the data.
+#[test]
+fn issue_158875_make_mut_dont_leak_allocator() {
+    use std::alloc::Global;
+
+    let alloc = Rc::new(Global);
+
+    {
+        let mut arc = Arc::new_in(123, alloc.clone());
+        let weak = Arc::downgrade(&arc); // create a weak so make_mut steals the data
+        _ = Arc::make_mut(&mut arc);
+        assert_eq!(weak.upgrade(), None);
+    }
+
+    assert_eq!(Rc::strong_count(&alloc), 1); // if this is >1, we have a memory leak!
+}
+
+#[test]
+#[should_panic = "capacity overflow"]
+fn new_uninit_slice_capacity_overflow() {
+    let _ = Arc::<[u8]>::new_uninit_slice(isize::MAX as usize);
 }

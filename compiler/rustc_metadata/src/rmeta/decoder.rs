@@ -8,6 +8,7 @@ use std::{io, mem};
 
 pub(super) use cstore_impl::provide;
 use rustc_ast as ast;
+use rustc_crate_store::{CrateSource, ExternCrate};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::owned_slice::OwnedSlice;
@@ -16,22 +17,23 @@ use rustc_data_structures::unhash::UnhashMap;
 use rustc_expand::base::{SyntaxExtension, SyntaxExtensionKind};
 use rustc_expand::proc_macro::{AttrProcMacro, BangProcMacro, DeriveProcMacro};
 use rustc_hir::Safety;
+use rustc_hir::attrs::CanonicalSymbols;
+use rustc_hir::attrs::diagnostic_items::DiagnosticItems;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::{CRATE_DEF_INDEX, LOCAL_CRATE};
 use rustc_hir::definitions::{DefPath, DefPathData};
-use rustc_hir::diagnostic_items::DiagnosticItems;
 use rustc_index::Idx;
 use rustc_middle::middle::lib_features::LibFeatures;
 use rustc_middle::mir::interpret::{AllocDecodingSession, AllocDecodingState};
-use rustc_middle::ty::Visibility;
 use rustc_middle::ty::codec::TyDecoder;
+use rustc_middle::ty::{RestrictionKind, Visibility};
 use rustc_middle::{bug, implement_ty_decoder};
-use rustc_proc_macro::bridge::client::ProcMacro;
+use rustc_proc_macro::bridge::client::Client as ProcMacroClient;
 use rustc_serialize::opaque::MemDecoder;
 use rustc_serialize::{Decodable, Decoder};
 use rustc_session::config::TargetModifier;
 use rustc_session::config::mitigation_coverage::DeniedPartialMitigation;
-use rustc_session::cstore::{CrateSource, ExternCrate};
+use rustc_span::def_id::ModId;
 use rustc_span::hygiene::HygieneDecodeContext;
 use rustc_span::{
     BlobDecoder, BytePos, ByteSymbol, DUMMY_SP, Pos, RemapPathScopeComponents, SpanData,
@@ -104,8 +106,8 @@ pub(crate) struct CrateMetadata {
     /// These can be introduced using either `#![rustc_coherence_is_core]`
     /// or `#[rustc_allow_incoherent_impl]`.
     incoherent_impls: FxIndexMap<SimplifiedType, LazyArray<DefIndex>>,
-    /// Proc macro descriptions for this crate, if it's a proc macro crate.
-    raw_proc_macros: Option<&'static [ProcMacro]>,
+    /// Proc macro function pointers for this crate, if it's a proc macro crate.
+    raw_proc_macros: Option<&'static [ProcMacroClient]>,
     /// Source maps for code from the crate.
     source_map_import_info: Lock<Vec<Option<ImportedSourceFile>>>,
     /// For every definition in this crate, maps its `DefPathHash` to its `DefIndex`.
@@ -401,11 +403,6 @@ impl<'a> BlobDecodeContext<'a> {
 impl<'a, 'tcx> TyDecoder<'tcx> for MetadataDecodeContext<'a, 'tcx> {
     const CLEAR_CROSS_CRATE: bool = true;
 
-    #[inline]
-    fn interner(&self) -> TyCtxt<'tcx> {
-        self.tcx
-    }
-
     fn cached_ty_for_shorthand<F>(&mut self, shorthand: usize, or_insert_with: F) -> Ty<'tcx>
     where
         F: FnOnce(&mut Self) -> Ty<'tcx>,
@@ -439,6 +436,15 @@ impl<'a, 'tcx> TyDecoder<'tcx> for MetadataDecodeContext<'a, 'tcx> {
     fn decode_alloc_id(&mut self) -> rustc_middle::mir::interpret::AllocId {
         let ads = self.alloc_decoding_session;
         ads.decode_alloc_id(self)
+    }
+}
+
+impl<'a, 'tcx> rustc_middle::ty::InternerDecoder for MetadataDecodeContext<'a, 'tcx> {
+    type Interner = TyCtxt<'tcx>;
+
+    #[inline]
+    fn interner(&self) -> TyCtxt<'tcx> {
+        self.tcx
     }
 }
 
@@ -749,6 +755,7 @@ impl MetadataBlob {
             "lang_items".to_owned(),
             "features".to_owned(),
             "items".to_owned(),
+            "target_modifiers".to_owned(),
         ];
         let ls_kinds = if ls_kinds.contains(&"all".to_owned()) { &all_ls_kinds } else { ls_kinds };
 
@@ -918,17 +925,44 @@ impl MetadataBlob {
 
                     write!(out, "\n")?;
                 }
+                "target_modifiers" => {
+                    writeln!(out, "=Target modifiers=")?;
+
+                    for modifier in root.decode_target_modifiers(self) {
+                        let extended = modifier.extend();
+
+                        writeln!(
+                            out,
+                            "-{}{}={} [{}]",
+                            extended.prefix,
+                            extended.name,
+                            modifier.value_name,
+                            extended.tech_value,
+                        )?;
+                    }
+                }
 
                 _ => {
                     writeln!(
                         out,
-                        "unknown -Zls kind. allowed values are: all, root, lang_items, features, items"
+                        "unknown -Zls kind. allowed values are: all, root, lang_items, features, items, \
+                            target_modifiers"
                     )?;
                 }
             }
         }
 
         Ok(())
+    }
+
+    pub(crate) fn get_proc_macro_info(&self) -> Vec<ProcMacroKind> {
+        self.get_root()
+            .proc_macro_data
+            .unwrap()
+            .macros
+            .decode(self)
+            .map(|(_id, kind)| kind.decode(self))
+            .collect::<Vec<_>>()
     }
 }
 
@@ -976,19 +1010,20 @@ impl CrateMetadata {
         bug!("missing `{descr}` for {:?}", self.local_def_id(id))
     }
 
-    fn raw_proc_macro(&self, tcx: TyCtxt<'_>, id: DefIndex) -> &ProcMacro {
+    fn raw_proc_macro(&self, tcx: TyCtxt<'_>, id: DefIndex) -> (ProcMacroClient, ProcMacroKind) {
         // DefIndex's in root.proc_macro_data have a one-to-one correspondence
         // with items in 'raw_proc_macros'.
-        let pos = self
+        let (pos, (_id, kind)) = self
             .root
             .proc_macro_data
             .as_ref()
             .unwrap()
             .macros
             .decode((self, tcx))
-            .position(|i| i == id)
+            .enumerate()
+            .find(|(_pos, (i, _))| *i == id)
             .unwrap();
-        &self.raw_proc_macros.unwrap()[pos]
+        (self.raw_proc_macros.unwrap()[pos], kind.decode((self, tcx)))
     }
 
     fn opt_item_name(&self, item_index: DefIndex) -> Option<Symbol> {
@@ -1046,20 +1081,20 @@ impl CrateMetadata {
     }
 
     fn load_proc_macro<'tcx>(&self, tcx: TyCtxt<'tcx>, id: DefIndex) -> SyntaxExtension {
-        let (name, kind, helper_attrs) = match *self.raw_proc_macro(tcx, id) {
-            ProcMacro::CustomDerive { trait_name, attributes, client } => {
+        let (name, kind, helper_attrs) = match self.raw_proc_macro(tcx, id) {
+            (client, ProcMacroKind::CustomDerive { trait_name, attributes }) => {
                 let helper_attrs =
-                    attributes.iter().cloned().map(Symbol::intern).collect::<Vec<_>>();
+                    attributes.into_iter().map(|attr| Symbol::intern(&attr)).collect();
                 (
                     trait_name,
                     SyntaxExtensionKind::Derive(Arc::new(DeriveProcMacro { client })),
                     helper_attrs,
                 )
             }
-            ProcMacro::Attr { name, client } => {
+            (client, ProcMacroKind::Attr { name }) => {
                 (name, SyntaxExtensionKind::Attr(Arc::new(AttrProcMacro { client })), Vec::new())
             }
-            ProcMacro::Bang { name, client } => {
+            (client, ProcMacroKind::Bang { name }) => {
                 (name, SyntaxExtensionKind::Bang(Arc::new(BangProcMacro { client })), Vec::new())
             }
         };
@@ -1072,7 +1107,7 @@ impl CrateMetadata {
             self.get_span(tcx, id),
             helper_attrs,
             self.root.edition,
-            Symbol::intern(name),
+            Symbol::intern(&name),
             &attrs,
             false,
         )
@@ -1110,6 +1145,7 @@ impl CrateMetadata {
                         did,
                         name: self.item_name(did.index),
                         vis: self.get_visibility(tcx, did.index),
+                        mut_restriction: self.get_mut_restriction(tcx, did.index),
                         safety: self.get_safety(did.index),
                         value: self.get_default_field(tcx, did.index),
                     })
@@ -1162,14 +1198,23 @@ impl CrateMetadata {
         )
     }
 
-    fn get_visibility(&self, tcx: TyCtxt<'_>, id: DefIndex) -> Visibility<DefId> {
+    fn get_visibility(&self, tcx: TyCtxt<'_>, id: DefIndex) -> Visibility<ModId> {
         self.root
             .tables
             .visibility
             .get(self, id)
             .unwrap_or_else(|| self.missing("visibility", id))
             .decode((self, tcx))
-            .map_id(|index| self.local_def_id(index))
+            .map_id(|index| ModId::new_unchecked(self.local_def_id(index)))
+    }
+
+    fn get_mut_restriction(&self, tcx: TyCtxt<'_>, id: DefIndex) -> RestrictionKind {
+        self.root
+            .tables
+            .mut_restriction
+            .get(self, id)
+            .unwrap_or_else(|| self.missing("mut_restriction", id))
+            .decode((self, tcx))
     }
 
     fn get_safety(&self, id: DefIndex) -> Safety {
@@ -1251,6 +1296,18 @@ impl CrateMetadata {
         DiagnosticItems { id_to_name, name_to_id }
     }
 
+    /// Iterates over the canonical_symbols in the given crate.
+    fn get_canonical_symbols(&self, tcx: TyCtxt<'_>) -> CanonicalSymbols {
+        let mut canonical_symbols = CanonicalSymbols::new();
+
+        for (name, def_index) in self.root.canonical_symbols.decode((self, tcx)) {
+            let id = self.local_def_id(def_index);
+            let _ = canonical_symbols.set(name, id);
+        }
+
+        canonical_symbols
+    }
+
     fn get_mod_child(&self, tcx: TyCtxt<'_>, id: DefIndex) -> ModChild {
         let ident = self.item_ident(tcx, id);
         let res = Res::Def(self.def_kind(id), self.local_def_id(id));
@@ -1263,20 +1320,26 @@ impl CrateMetadata {
     /// including both proper items and reexports.
     /// Module here is understood in name resolution sense - it can be a `mod` item,
     /// or a crate root, or an enum, or a trait.
+    ///
+    /// # Panics
+    ///
+    /// May panic if the provided `id` does not refer to a module.
     fn get_module_children(&self, tcx: TyCtxt<'_>, id: DefIndex) -> impl Iterator<Item = ModChild> {
         gen move {
             if let Some(data) = &self.root.proc_macro_data {
                 // If we are loading as a proc macro, we want to return
                 // the view of this crate as a proc macro crate.
                 if id == CRATE_DEF_INDEX {
-                    for child_index in data.macros.decode((self, tcx)) {
+                    for (child_index, _) in data.macros.decode((self, tcx)) {
                         yield self.get_mod_child(tcx, child_index);
                     }
                 }
             } else {
                 // Iterate over all children.
                 let non_reexports = self.root.tables.module_children_non_reexports.get(self, id);
-                for child_index in non_reexports.unwrap().decode((self, tcx)) {
+                let non_reexports =
+                    non_reexports.expect("provided `DefIndex` must refer to a module-like item");
+                for child_index in non_reexports.decode((self, tcx)) {
                     yield self.get_mod_child(tcx, child_index);
                 }
 
@@ -1380,17 +1443,26 @@ impl CrateMetadata {
             .attributes
             .get(self, id)
             .unwrap_or_else(|| {
-                // Structure and variant constructors don't have any attributes encoded for them,
-                // but we assume that someone passing a constructor ID actually wants to look at
-                // the attributes on the corresponding struct or variant.
                 let def_key = self.def_key(id);
-                assert_eq!(def_key.disambiguated_data.data, DefPathData::Ctor);
-                let parent_id = def_key.parent.expect("no parent for a constructor");
-                self.root
-                    .tables
-                    .attributes
-                    .get(self, parent_id)
-                    .expect("no encoded attributes for a structure or variant")
+                match def_key.disambiguated_data.data {
+                    DefPathData::Ctor => {
+                        // Structure and variant constructors don't have any attributes encoded for them,
+                        // but we assume that someone passing a constructor ID actually wants to look at
+                        // the attributes on the corresponding struct or variant.
+                        assert_eq!(def_key.disambiguated_data.data, DefPathData::Ctor);
+                        let parent_id = def_key.parent.expect("no parent for a constructor");
+                        self.root
+                            .tables
+                            .attributes
+                            .get(self, parent_id)
+                            .expect("no encoded attributes for a structure or variant")
+                    }
+                    DefPathData::SyntheticCoroutineBody => {
+                        // SyntheticCoroutineBodies cannot have attributes
+                        LazyArray::default()
+                    }
+                    _ => panic!("Definition key {def_key:?} of type `{:?}` did not have any attributes stored", def_key.disambiguated_data.data)
+                }
             })
             .decode((self, tcx))
     }
@@ -1872,7 +1944,7 @@ impl CrateMetadata {
         tcx: TyCtxt<'_>,
         blob: MetadataBlob,
         root: CrateRoot,
-        raw_proc_macros: Option<&'static [ProcMacro]>,
+        raw_proc_macros: Option<&'static [ProcMacroClient]>,
         cnum: CrateNum,
         cnum_map: CrateNumMap,
         dep_kind: CrateDepKind,
@@ -2021,10 +2093,12 @@ impl CrateMetadata {
         krate: CrateNum,
     ) -> impl Iterator<Item = DefId> {
         gen move {
-            for def_id in self.root.proc_macro_data.as_ref().into_iter().flat_map(move |data| {
-                data.macros.decode((self, tcx)).map(move |index| DefId { index, krate })
-            }) {
-                yield def_id;
+            if let Some(data) = &self.root.proc_macro_data {
+                for def_id in
+                    data.macros.decode((self, tcx)).map(move |(index, _)| DefId { index, krate })
+                {
+                    yield def_id;
+                }
             }
         }
     }

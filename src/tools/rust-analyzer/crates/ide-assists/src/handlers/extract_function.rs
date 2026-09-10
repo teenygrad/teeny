@@ -21,7 +21,7 @@ use itertools::Itertools;
 use syntax::{
     Edition, SyntaxElement,
     SyntaxKind::{self, COMMENT},
-    SyntaxNode, SyntaxToken, T, TextRange, TextSize, TokenAtOffset, WalkEvent,
+    SyntaxNode, T, TextRange, WalkEvent,
     ast::{
         self, AstNode, AstToken, HasAttrs, HasGenericParams, HasName,
         edit::{AstNodeEdit, IndentLevel},
@@ -103,7 +103,7 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -
 
     let ret_ty = body.return_ty(ctx)?;
     let control_flow = body.external_control_flow(ctx, &container_info)?;
-    let ret_values = body.ret_values(ctx, node.parent().as_ref().unwrap_or(&node));
+    let ret_values = body.ret_values(ctx);
 
     let target_range = body.text_range();
 
@@ -324,7 +324,7 @@ struct Function<'db> {
     control_flow: ControlFlow<'db>,
     ret_ty: RetType<'db>,
     body: FunctionBody,
-    outliving_locals: Vec<OutlivedLocal>,
+    outliving_locals: Vec<OutlivedLocal<'db>>,
     /// Whether at least one of the container's tail expr is contained in the range we're extracting.
     contains_tail_expr: bool,
     mods: ContainerInfo<'db>,
@@ -332,7 +332,7 @@ struct Function<'db> {
 
 #[derive(Debug)]
 struct Param<'db> {
-    var: Local,
+    var: Local<'db>,
     ty: hir::Type<'db>,
     move_local: bool,
     requires_mut: bool,
@@ -441,8 +441,8 @@ enum FunctionBody {
 }
 
 #[derive(Debug)]
-struct OutlivedLocal {
-    local: Local,
+struct OutlivedLocal<'db> {
+    local: Local<'db>,
     mut_usage_outside_body: bool,
 }
 
@@ -452,7 +452,7 @@ struct OutlivedLocal {
 struct LocalUsages(ide_db::search::UsageSearchResult);
 
 impl LocalUsages {
-    fn find_local_usages(ctx: &AssistContext<'_, '_>, var: Local) -> Self {
+    fn find_local_usages<'db>(ctx: &AssistContext<'_, 'db>, var: Local<'db>) -> Self {
         Self(
             Definition::Local(var)
                 .usages(&ctx.sema)
@@ -807,10 +807,10 @@ impl FunctionBody {
 impl FunctionBody {
     /// Analyzes a function body, returning the used local variables that are referenced in it as well as
     /// whether it contains an await expression.
-    fn analyze(
+    fn analyze<'db>(
         &self,
-        sema: &Semantics<'_, RootDatabase>,
-    ) -> (FxIndexSet<Local>, Option<ast::SelfParam>) {
+        sema: &Semantics<'db, RootDatabase>,
+    ) -> (FxIndexSet<Local<'db>>, Option<ast::SelfParam>) {
         let mut self_param = None;
         let mut res = FxIndexSet::default();
 
@@ -819,7 +819,7 @@ impl FunctionBody {
             FunctionBody::Span { parent, text_range, .. } => (*text_range, Either::Right(parent)),
         };
 
-        let mut add_name_if_local = |local_ref: Local| {
+        let mut add_name_if_local = |local_ref: Local<'db>| {
             // locals defined inside macros are not relevant to us
             let InFile { file_id, value } = local_ref.primary_source(sema.db).source;
             if !file_id.is_macro() {
@@ -934,7 +934,7 @@ impl FunctionBody {
         };
 
         // FIXME: make trait arguments
-        let trait_name = trait_name.map(|name| make.ty_path(make.ident_path(&name.text())).into());
+        let trait_name = trait_name.map(|name| make.ty_path(make.ident_path(name.text())).into());
 
         let parent = self.parent()?;
         let parents = generic_parents(&parent);
@@ -965,16 +965,14 @@ impl FunctionBody {
     }
 
     /// Local variables defined inside `body` that are accessed outside of it
-    fn ret_values<'a>(
+    fn ret_values<'a, 'db>(
         &self,
-        ctx: &'a AssistContext<'_, '_>,
-        parent: &SyntaxNode,
-    ) -> impl Iterator<Item = OutlivedLocal> + 'a {
-        let parent = parent.clone();
+        ctx: &'a AssistContext<'_, 'db>,
+    ) -> impl Iterator<Item = OutlivedLocal<'db>> + 'a {
         let range = self.text_range();
         locals_defined_in_body(&ctx.sema, self)
             .into_iter()
-            .filter_map(move |local| local_outlives_body(ctx, range, local, &parent))
+            .filter_map(move |local| local_outlives_body(ctx, range, local))
     }
 
     /// Analyses the function body for external control flow.
@@ -1072,7 +1070,7 @@ impl FunctionBody {
         &self,
         ctx: &AssistContext<'_, 'db>,
         container_info: &ContainerInfo<'db>,
-        locals: FxIndexSet<Local>,
+        locals: FxIndexSet<Local<'db>>,
     ) -> Vec<Param<'db>> {
         locals
             .into_iter()
@@ -1174,15 +1172,11 @@ fn has_exclusive_usages(
     usages
         .iter()
         .filter(|reference| body.contains_range(reference.range))
-        .any(|reference| reference_is_exclusive(reference, body, ctx))
+        .any(|reference| reference_is_exclusive(reference, ctx))
 }
 
 /// checks if this reference requires `&mut` access inside node
-fn reference_is_exclusive(
-    reference: &FileReference,
-    node: &dyn HasTokenAtOffset,
-    ctx: &AssistContext<'_, '_>,
-) -> bool {
+fn reference_is_exclusive(reference: &FileReference, ctx: &AssistContext<'_, '_>) -> bool {
     // FIXME: this quite an incorrect way to go about doing this :-)
     // `FileReference` is an IDE-type --- it encapsulates data communicated to the human,
     // but doesn't necessary fully reflect all the intricacies of the underlying language semantics
@@ -1195,7 +1189,7 @@ fn reference_is_exclusive(
     }
 
     // we take `&mut` reference to variable: `&mut v`
-    let path = match path_element_of_reference(node, reference.range) {
+    let path = match path_element_of(reference) {
         Some(path) => path,
         None => return false,
     };
@@ -1203,13 +1197,8 @@ fn reference_is_exclusive(
     expr_require_exclusive_access(ctx, &path).unwrap_or(false)
 }
 
-/// checks if this expr requires `&mut` access, recurses on field access
+/// checks if this expr requires `&mut` access, recurses on field/index access
 fn expr_require_exclusive_access(ctx: &AssistContext<'_, '_>, expr: &ast::Expr) -> Option<bool> {
-    if let ast::Expr::MacroExpr(_) = expr {
-        // FIXME: expand macro and check output for mutable usages of the variable?
-        return None;
-    }
-
     let parent = expr.syntax().parent()?;
 
     if let Some(bin_expr) = ast::BinExpr::cast(parent.clone()) {
@@ -1231,52 +1220,18 @@ fn expr_require_exclusive_access(ctx: &AssistContext<'_, '_>, expr: &ast::Expr) 
         return Some(matches!(access, hir::Access::Exclusive));
     }
 
-    if let Some(field) = ast::FieldExpr::cast(parent) {
+    if let Some(field) = ast::FieldExpr::cast(parent.clone()) {
         return expr_require_exclusive_access(ctx, &field.into());
     }
 
+    // `container[i].mut_method()` needs `&mut container` but WRITE is not set (no direct assignment).
+    if let Some(index_expr) = ast::IndexExpr::cast(parent)
+        && index_expr.base().is_some_and(|base| base.syntax() == expr.syntax())
+    {
+        return expr_require_exclusive_access(ctx, &index_expr.into());
+    }
+
     Some(false)
-}
-
-trait HasTokenAtOffset {
-    fn token_at_offset(&self, offset: TextSize) -> TokenAtOffset<SyntaxToken>;
-}
-
-impl HasTokenAtOffset for SyntaxNode {
-    fn token_at_offset(&self, offset: TextSize) -> TokenAtOffset<SyntaxToken> {
-        SyntaxNode::token_at_offset(self, offset)
-    }
-}
-
-impl HasTokenAtOffset for FunctionBody {
-    fn token_at_offset(&self, offset: TextSize) -> TokenAtOffset<SyntaxToken> {
-        match self {
-            FunctionBody::Expr(expr) => expr.syntax().token_at_offset(offset),
-            FunctionBody::Span { parent, text_range, .. } => {
-                match parent.syntax().token_at_offset(offset) {
-                    TokenAtOffset::None => TokenAtOffset::None,
-                    TokenAtOffset::Single(t) => {
-                        if text_range.contains_range(t.text_range()) {
-                            TokenAtOffset::Single(t)
-                        } else {
-                            TokenAtOffset::None
-                        }
-                    }
-                    TokenAtOffset::Between(a, b) => {
-                        match (
-                            text_range.contains_range(a.text_range()),
-                            text_range.contains_range(b.text_range()),
-                        ) {
-                            (true, true) => TokenAtOffset::Between(a, b),
-                            (true, false) => TokenAtOffset::Single(a),
-                            (false, true) => TokenAtOffset::Single(b),
-                            (false, false) => TokenAtOffset::None,
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// find relevant `ast::Expr` for reference
@@ -1284,20 +1239,14 @@ impl HasTokenAtOffset for FunctionBody {
 /// # Preconditions
 ///
 /// `node` must cover `reference`, that is `node.text_range().contains_range(reference.range)`
-fn path_element_of_reference(
-    node: &dyn HasTokenAtOffset,
-    reference_range: TextRange,
-) -> Option<ast::Expr> {
-    let token = node.token_at_offset(reference_range.start()).right_biased().or_else(|| {
-        stdx::never!(false, "cannot find token at variable usage: {:?}", reference_range);
-        None
-    })?;
-    let path = token.parent_ancestors().find_map(ast::Expr::cast).or_else(|| {
-        stdx::never!(false, "cannot find path parent of variable usage: {:?}", token);
+fn path_element_of(reference: &FileReference) -> Option<ast::Expr> {
+    let path = reference.name.syntax().ancestors().find_map(ast::Expr::cast).or_else(|| {
+        stdx::never!(false, "cannot find path parent of variable usage: {:?}", reference.name);
         None
     })?;
     stdx::always!(
-        matches!(path, ast::Expr::PathExpr(_) | ast::Expr::MacroExpr(_)),
+        matches!(path, ast::Expr::PathExpr(_))
+            || path.syntax().parent().and_then(ast::FormatArgsExpr::cast).is_some(),
         "unexpected expression type for variable usage: {:?}",
         path
     );
@@ -1305,10 +1254,10 @@ fn path_element_of_reference(
 }
 
 /// list local variables defined inside `body`
-fn locals_defined_in_body(
-    sema: &Semantics<'_, RootDatabase>,
+fn locals_defined_in_body<'db>(
+    sema: &Semantics<'db, RootDatabase>,
     body: &FunctionBody,
-) -> FxIndexSet<Local> {
+) -> FxIndexSet<Local<'db>> {
     // FIXME: this doesn't work well with macros
     //        see https://github.com/rust-lang/rust-analyzer/pull/7535#discussion_r570048550
     let mut res = FxIndexSet::default();
@@ -1323,18 +1272,17 @@ fn locals_defined_in_body(
 }
 
 /// Returns usage details if local variable is used after(outside of) body
-fn local_outlives_body(
-    ctx: &AssistContext<'_, '_>,
+fn local_outlives_body<'db>(
+    ctx: &AssistContext<'_, 'db>,
     body_range: TextRange,
-    local: Local,
-    parent: &SyntaxNode,
-) -> Option<OutlivedLocal> {
+    local: Local<'db>,
+) -> Option<OutlivedLocal<'db>> {
     let usages = LocalUsages::find_local_usages(ctx, local);
     let mut has_mut_usages = false;
     let mut any_outlives = false;
     for usage in usages.iter() {
         if body_range.end() <= usage.range.start() {
-            has_mut_usages |= reference_is_exclusive(usage, parent, ctx);
+            has_mut_usages |= reference_is_exclusive(usage, ctx);
             any_outlives |= true;
             if has_mut_usages {
                 break; // no need to check more elements we have all the info we wanted
@@ -1351,7 +1299,7 @@ fn local_outlives_body(
 fn is_defined_outside_of_body(
     ctx: &AssistContext<'_, '_>,
     body: &FunctionBody,
-    src: &LocalSource,
+    src: &LocalSource<'_>,
 ) -> bool {
     src.original_file(ctx.db()) == ctx.file_id() && !body.contains_node(src.syntax())
 }
@@ -1599,7 +1547,7 @@ impl<'db> FlowHandler<'db> {
 fn path_expr_from_local(
     make: &SyntaxFactory,
     ctx: &AssistContext<'_, '_>,
-    var: Local,
+    var: Local<'_>,
     edition: Edition,
 ) -> ast::Expr {
     let name = var.name(ctx.db()).display(ctx.db(), edition).to_string();
@@ -1613,7 +1561,7 @@ fn format_function<'db>(
     old_indent: IndentLevel,
     make: &SyntaxFactory,
 ) -> ast::Fn {
-    let fun_name = make.name(&fun.name.text());
+    let fun_name = make.name(fun.name.text());
     let params = fun.make_param_list(make, ctx, module, fun.mods.edition);
     let ret_ty = fun.make_ret_ty(make, ctx, module);
     let body = make_body(make, ctx, old_indent, fun);
@@ -2064,10 +2012,10 @@ fn make_ty(
     make.ty(&ty_str)
 }
 
-fn rewrite_body_segment(
-    ctx: &AssistContext<'_, '_>,
+fn rewrite_body_segment<'db>(
+    ctx: &AssistContext<'_, 'db>,
     to_this_param: Option<ast::SelfParam>,
-    params: &[Param<'_>],
+    params: &[Param<'db>],
     handler: &FlowHandler<'_>,
     syntax: &SyntaxNode,
 ) -> SyntaxNode {
@@ -2082,23 +2030,22 @@ fn rewrite_body_segment(
 }
 
 /// change all usages to account for added `&`/`&mut` for some params
-fn fix_param_usages(
+fn fix_param_usages<'db>(
     editor: &SyntaxEditor,
     source_syntax: &SyntaxNode,
     syntax: &SyntaxNode,
-    ctx: &AssistContext<'_, '_>,
-    to_this_param: Option<Local>,
-    params: &[Param<'_>],
+    ctx: &AssistContext<'_, 'db>,
+    to_this_param: Option<Local<'db>>,
+    params: &[Param<'db>],
 ) {
-    let mut usages_for_param: Vec<(&Param<'_>, Vec<ast::Expr>)> = Vec::new();
+    let mut usages_for_param: Vec<(&Param<'db>, Vec<ast::Expr>)> = Vec::new();
     let mut usages_for_self_param: Vec<ast::Expr> = Vec::new();
     let source_range = source_syntax.text_range();
-    let source_start = source_range.start();
+    let syntax_offset = source_range.start() - syntax.text_range().start();
 
     let reference_filter = |reference: &FileReference| {
         source_range.contains_range(reference.range).then_some(())?;
-        let local_range = reference.range - source_start;
-        path_element_of_reference(syntax, local_range)
+        path_element_of(reference)
     };
 
     if let Some(self_param) = to_this_param {
@@ -2119,10 +2066,20 @@ fn fix_param_usages(
     }
 
     let make = editor.make();
+    let to_original = |old: &SyntaxNode| {
+        ctx.sema
+            .original_range_opt(old)
+            .map(|orig| crate::utils::cover_edit_range(syntax, orig.range - syntax_offset))
+    };
+    let replace = |range, new: &SyntaxNode| {
+        editor.replace_all(range, vec![new.clone().into()]);
+    };
 
     for self_usage in usages_for_self_param {
-        let this_expr = make.expr_path(make.ident_path("this"));
-        editor.replace(self_usage.syntax(), this_expr.syntax());
+        if let Some(original) = to_original(self_usage.syntax()) {
+            let this_expr = make.expr_path(make.ident_path("this"));
+            replace(original, this_expr.syntax())
+        }
     }
     for (param, usages) in usages_for_param {
         for usage in usages {
@@ -2135,24 +2092,33 @@ fn fix_param_usages(
                     // do nothing
                 }
                 Some(ast::Expr::RefExpr(node))
-                    if param.kind() == ParamKind::MutRef && node.mut_token().is_some() =>
+                    if param.kind() == ParamKind::MutRef
+                        && node.mut_token().is_some()
+                        && let Some(original) = to_original(node.syntax()) =>
                 {
-                    editor.replace(
-                        node.syntax(),
+                    replace(
+                        original,
                         node.expr().expect("RefExpr::expr() cannot be None").syntax(),
                     );
                 }
                 Some(ast::Expr::RefExpr(node))
-                    if param.kind() == ParamKind::SharedRef && node.mut_token().is_none() =>
+                    if param.kind() == ParamKind::SharedRef
+                        && node.mut_token().is_none()
+                        && let Some(original) = to_original(node.syntax()) =>
                 {
-                    editor.replace(
-                        node.syntax(),
+                    replace(
+                        original,
                         node.expr().expect("RefExpr::expr() cannot be None").syntax(),
                     );
                 }
                 Some(_) | None => {
-                    let p = make.expr_prefix(T![*], usage.clone());
-                    editor.replace(usage.syntax(), p.syntax())
+                    if let Some(original) = to_original(usage.syntax())
+                        // ignore variable in format string
+                        && !matches!(usage, ast::Expr::Literal(_))
+                    {
+                        let p = make.expr_prefix(T![*], usage.clone());
+                        replace(original, p.syntax())
+                    }
                 }
             }
         }
@@ -3292,6 +3258,54 @@ fn $0fun_name(arr: &mut [i32; 1]) {
     }
 
     #[test]
+    fn mut_index_element_method_call() {
+        check_assist(
+            extract_function,
+            r#"
+//- minicore: index
+use core::ops::{Index, IndexMut};
+struct Container([S; 2]);
+struct S;
+impl S { fn mutate(&mut self) {} }
+impl Index<usize> for Container {
+    type Output = S;
+    fn index(&self, i: usize) -> &S { &self.0[i] }
+}
+impl IndexMut<usize> for Container {
+    fn index_mut(&mut self, i: usize) -> &mut S { &mut self.0[i] }
+}
+fn foo() {
+    let mut c = Container([S, S]);
+    $0c[0].mutate();$0
+    let _ = c;
+}
+"#,
+            r#"
+use core::ops::{Index, IndexMut};
+struct Container([S; 2]);
+struct S;
+impl S { fn mutate(&mut self) {} }
+impl Index<usize> for Container {
+    type Output = S;
+    fn index(&self, i: usize) -> &S { &self.0[i] }
+}
+impl IndexMut<usize> for Container {
+    fn index_mut(&mut self, i: usize) -> &mut S { &mut self.0[i] }
+}
+fn foo() {
+    let mut c = Container([S, S]);
+    fun_name(&mut c);
+    let _ = c;
+}
+
+fn $0fun_name(c: &mut Container) {
+    c[0].mutate();
+}
+"#,
+        );
+    }
+
+    #[test]
     fn mut_field_from_outer_scope() {
         check_assist(
             extract_function,
@@ -3513,6 +3527,61 @@ fn foo() {
 
 fn $0fun_name(n: &mut i32) {
     let v = n;
+    *v += 1;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn mut_param_because_of_mut_ref_in_macro() {
+        check_assist(
+            extract_function,
+            r#"
+macro_rules! refmut { ($e:expr) => { &mut $e }; }
+fn foo() {
+    let mut n = 1;
+    $0let v = refmut!(n);
+    *v += 1;$0
+    let k = n;
+}
+"#,
+            r#"
+macro_rules! refmut { ($e:expr) => { &mut $e }; }
+fn foo() {
+    let mut n = 1;
+    fun_name(&mut n);
+    let k = n;
+}
+
+fn $0fun_name(n: &mut i32) {
+    let v = refmut!(*n);
+    *v += 1;
+}
+"#,
+        );
+
+        check_assist(
+            extract_function,
+            r#"
+macro_rules! id { ($e:expr) => { $e }; }
+fn foo() {
+    let mut n = 1;
+    $0let v = id!(&mut n);
+    *v += 1;$0
+    let k = n;
+}
+"#,
+            r#"
+macro_rules! id { ($e:expr) => { $e }; }
+fn foo() {
+    let mut n = 1;
+    fun_name(&mut n);
+    let k = n;
+}
+
+fn $0fun_name(n: &mut i32) {
+    let v = id!(n);
     *v += 1;
 }
 "#,
@@ -6396,7 +6465,42 @@ fn main() {
 }
 
 fn $0fun_name(s: &Foo) {
-    *print!("{}{}", s, s);
+    print!("{}{}", *s, *s);
+}"#,
+        );
+
+        check_assist(
+            extract_function,
+            r#"
+//- minicore: fmt
+#[derive(Debug)]
+struct Foo(&'static str);
+
+impl Foo {
+    fn text(&self) -> &str { self.0 }
+}
+
+fn main() {
+    let s = Foo("");
+    $0print!("{s}{s}");$0
+    let _ = s.text() == "";
+}"#,
+            r#"
+#[derive(Debug)]
+struct Foo(&'static str);
+
+impl Foo {
+    fn text(&self) -> &str { self.0 }
+}
+
+fn main() {
+    let s = Foo("");
+    fun_name(&s);
+    let _ = s.text() == "";
+}
+
+fn $0fun_name(s: &Foo) {
+    print!("{s}{s}");
 }"#,
         );
     }

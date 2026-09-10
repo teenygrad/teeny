@@ -93,6 +93,7 @@ pkg_type! {
         "x86_64-unknown-linux-gnu"
     ],
     Enzyme = "enzyme"; preview = true,
+    Offload = "offload"; preview = true,
 }
 
 impl PkgType {
@@ -132,6 +133,7 @@ impl PkgType {
             PkgType::RustAnalysis => true,
             PkgType::LlvmBitcodeLinker => true,
             PkgType::Enzyme => true,
+            PkgType::Offload => true,
         }
     }
 
@@ -169,6 +171,7 @@ impl PkgType {
             LlvmTools => TARGETS,
             LlvmBitcodeLinker => HOSTS,
             Enzyme => HOSTS,
+            Offload => HOSTS,
         }
     }
 

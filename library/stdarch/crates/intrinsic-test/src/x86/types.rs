@@ -3,10 +3,10 @@ use std::str::FromStr;
 use itertools::Itertools;
 
 use super::intrinsic::X86IntrinsicType;
-use crate::common::intrinsic_helpers::{IntrinsicType, IntrinsicTypeDefinition, Sign, TypeKind};
+use crate::common::intrinsic_helpers::{IntrinsicType, Sign, SimdLen, TypeDefinition, TypeKind};
 use crate::x86::xml_parser::Parameter;
 
-impl IntrinsicTypeDefinition for X86IntrinsicType {
+impl TypeDefinition for X86IntrinsicType {
     /// Gets a string containing the type in C format.
     /// This function assumes that this value is present in the metadata hashmap.
     fn c_type(&self) -> String {
@@ -48,7 +48,7 @@ impl IntrinsicTypeDefinition for X86IntrinsicType {
     }
 
     /// Determines the load function for this type.
-    fn get_load_function(&self) -> String {
+    fn load_function(&self) -> String {
         let type_value = self.param.type_data.clone();
         if type_value.len() == 0 {
             unimplemented!("the value for key 'type' is not present!");
@@ -187,7 +187,7 @@ impl X86IntrinsicType {
                 Ok(num_bits) => self
                     .data
                     .bit_len
-                    .and_then(|bit_len| Some(num_bits / bit_len)),
+                    .and_then(|bit_len| Some(SimdLen::Fixed(num_bits / bit_len))),
                 Err(_) => None,
             };
         }
@@ -297,7 +297,7 @@ impl X86IntrinsicType {
                 // - _mm512_conj_pch
                 if param.type_data == "__m512h" && param.etype == "FP32" {
                     data.bit_len = Some(16);
-                    data.simd_len = Some(32);
+                    data.simd_len = Some(SimdLen::Fixed(32));
                 }
 
                 let mut result = X86IntrinsicType {

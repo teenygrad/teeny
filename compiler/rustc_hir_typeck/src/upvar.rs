@@ -36,6 +36,7 @@ use rustc_abi::FIRST_VARIANT;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::unord::{ExtendUnord, UnordSet};
 use rustc_errors::{Applicability, Diag, DiagCtxtHandle, Diagnostic, Level, MultiSpan};
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{self as hir, HirId, find_attr};
@@ -395,92 +396,108 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // For coroutine-closures, we additionally must compute the
         // `coroutine_captures_by_ref_ty` type, which is used to generate the by-ref
         // version of the coroutine-closure's output coroutine.
-        if let UpvarArgs::CoroutineClosure(args) = args
-            && !args.references_error()
-        {
-            let closure_env_region: ty::Region<'_> = ty::Region::new_bound(
-                self.tcx,
-                ty::INNERMOST,
-                ty::BoundRegion { var: ty::BoundVar::ZERO, kind: ty::BoundRegionKind::ClosureEnv },
-            );
-
-            let num_args = args
-                .as_coroutine_closure()
-                .coroutine_closure_sig()
-                .skip_binder()
-                .tupled_inputs_ty
-                .tuple_fields()
-                .len();
-            let typeck_results = self.typeck_results.borrow();
-
-            let tupled_upvars_ty_for_borrow = Ty::new_tup_from_iter(
-                self.tcx,
-                ty::analyze_coroutine_closure_captures(
-                    typeck_results.closure_min_captures_flattened(closure_def_id),
-                    typeck_results
-                        .closure_min_captures_flattened(
-                            self.tcx.coroutine_for_closure(closure_def_id).expect_local(),
-                        )
-                        // Skip the captures that are just moving the closure's args
-                        // into the coroutine. These are always by move, and we append
-                        // those later in the `CoroutineClosureSignature` helper functions.
-                        .skip(num_args),
-                    |(_, parent_capture), (_, child_capture)| {
-                        // This is subtle. See documentation on function.
-                        let needs_ref = should_reborrow_from_env_of_parent_coroutine_closure(
-                            parent_capture,
-                            child_capture,
-                        );
-
-                        let upvar_ty = child_capture.place.ty();
-                        let capture = child_capture.info.capture_kind;
-                        // Not all upvars are captured by ref, so use
-                        // `apply_capture_kind_on_capture_ty` to ensure that we
-                        // compute the right captured type.
-                        apply_capture_kind_on_capture_ty(
-                            self.tcx,
-                            upvar_ty,
-                            capture,
-                            if needs_ref {
-                                closure_env_region
-                            } else {
-                                self.tcx.lifetimes.re_erased
-                            },
-                        )
-                    },
-                ),
-            );
-            let coroutine_captures_by_ref_ty = Ty::new_fn_ptr(
-                self.tcx,
-                ty::Binder::bind_with_vars(
-                    self.tcx.mk_fn_sig_safe_rust_abi([], tupled_upvars_ty_for_borrow),
-                    self.tcx.mk_bound_variable_kinds(&[ty::BoundVariableKind::Region(
-                        ty::BoundRegionKind::ClosureEnv,
-                    )]),
-                ),
-            );
-            self.demand_eqtype(
-                span,
-                args.as_coroutine_closure().coroutine_captures_by_ref_ty(),
-                coroutine_captures_by_ref_ty,
-            );
-
-            // Additionally, we can now constrain the coroutine's kind type.
-            //
-            // We only do this if `infer_kind`, because if we have constrained
-            // the kind from closure signature inference, the kind inferred
-            // for the inner coroutine may actually be more restrictive.
-            if infer_kind {
-                let ty::Coroutine(_, coroutine_args) =
-                    *self.typeck_results.borrow().expr_ty(body.value).kind()
-                else {
-                    bug!();
-                };
+        //
+        // If the args already reference an error, computing the by-ref upvar
+        // tuple may itself reach malformed types. We still equate the
+        // `coroutine_captures_by_ref_ty` inference variable to an error type
+        // so downstream consumers (e.g. `has_self_borrows`) can rely on it
+        // being resolved to either an `FnPtr` or `Error` rather than remaining
+        // an unconstrained inference variable.
+        if let UpvarArgs::CoroutineClosure(args) = args {
+            if let Some(guar) = args.error_reported().err() {
                 self.demand_eqtype(
                     span,
-                    coroutine_args.as_coroutine().kind_ty(),
-                    Ty::from_coroutine_closure_kind(self.tcx, closure_kind),
+                    args.as_coroutine_closure().coroutine_captures_by_ref_ty(),
+                    Ty::new_error(self.tcx, guar),
                 );
+            } else {
+                let closure_env_region: ty::Region<'_> = ty::Region::new_bound(
+                    self.tcx,
+                    ty::INNERMOST,
+                    ty::BoundRegion {
+                        var: ty::BoundVar::ZERO,
+                        kind: ty::BoundRegionKind::ClosureEnv,
+                    },
+                );
+
+                let num_args = args
+                    .as_coroutine_closure()
+                    .coroutine_closure_sig()
+                    .skip_binder()
+                    .tupled_inputs_ty
+                    .tuple_fields()
+                    .len();
+                let typeck_results = self.typeck_results.borrow();
+
+                let tupled_upvars_ty_for_borrow = Ty::new_tup_from_iter(
+                    self.tcx,
+                    ty::analyze_coroutine_closure_captures(
+                        typeck_results.closure_min_captures_flattened(closure_def_id),
+                        typeck_results
+                            .closure_min_captures_flattened(
+                                self.tcx.coroutine_for_closure(closure_def_id).expect_local(),
+                            )
+                            // Skip the captures that are just moving the closure's args
+                            // into the coroutine. These are always by move, and we append
+                            // those later in the `CoroutineClosureSignature` helper functions.
+                            .skip(num_args),
+                        |(_, parent_capture), (_, child_capture)| {
+                            // This is subtle. See documentation on function.
+                            let needs_ref = should_reborrow_from_env_of_parent_coroutine_closure(
+                                parent_capture,
+                                child_capture,
+                            );
+
+                            let upvar_ty = child_capture.place.ty();
+                            let capture = child_capture.info.capture_kind;
+                            // Not all upvars are captured by ref, so use
+                            // `apply_capture_kind_on_capture_ty` to ensure that we
+                            // compute the right captured type.
+                            apply_capture_kind_on_capture_ty(
+                                self.tcx,
+                                upvar_ty,
+                                capture,
+                                if needs_ref {
+                                    closure_env_region
+                                } else {
+                                    self.tcx.lifetimes.re_erased
+                                },
+                            )
+                        },
+                    ),
+                );
+                let coroutine_captures_by_ref_ty = Ty::new_fn_ptr(
+                    self.tcx,
+                    ty::Binder::bind_with_vars(
+                        self.tcx.mk_fn_sig_safe_rust_abi([], tupled_upvars_ty_for_borrow),
+                        self.tcx.mk_bound_variable_kinds(&[ty::BoundVariableKind::Region(
+                            ty::BoundRegionKind::ClosureEnv,
+                        )]),
+                    ),
+                );
+                self.demand_eqtype(
+                    span,
+                    args.as_coroutine_closure().coroutine_captures_by_ref_ty(),
+                    coroutine_captures_by_ref_ty,
+                );
+
+                // Additionally, we can now constrain the coroutine's kind type.
+                //
+                // We only do this if `infer_kind`, because if we have constrained
+                // the kind from closure signature inference, the kind inferred
+                // for the inner coroutine may actually be more restrictive.
+                if infer_kind {
+                    let ty::Coroutine(_, coroutine_args) =
+                        *self.typeck_results.borrow().expr_ty(body.value).kind()
+                    else {
+                        bug!();
+                    };
+                    self.demand_eqtype(
+                        span,
+                        coroutine_args.as_coroutine().kind_ty(),
+                        Ty::from_coroutine_closure_kind(self.tcx, closure_kind),
+                    );
+                }
             }
         }
 
@@ -1621,7 +1638,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         };
 
         let is_drop_defined_for_ty = |ty: Ty<'tcx>| {
-            let drop_trait = self.tcx.require_lang_item(hir::LangItem::Drop, closure_span);
+            let drop_trait = self.tcx.require_lang_item(LangItem::Drop, closure_span);
             self.infcx
                 .type_implements_trait(drop_trait, [ty], self.tcx.param_env(closure_def_id))
                 .must_apply_modulo_regions()
@@ -2328,10 +2345,20 @@ fn adjust_for_non_move_closure(
         place.projections.iter().position(|proj| proj.kind == ProjectionKind::Deref);
 
     match kind {
-        ty::UpvarCapture::ByValue | ty::UpvarCapture::ByUse => {
+        ty::UpvarCapture::ByValue => {
             if let Some(idx) = contains_deref {
                 truncate_place_to_len_and_update_capture_kind(&mut place, &mut kind, idx);
             }
+        }
+
+        // A non-`move`/`use` closure that only `.use`s an upvar does not need to
+        // own (and thus clone-on-capture) the value. The `ByUse` kind here can only
+        // come from a `x.use` in the body (a `use ||` capture clause goes through
+        // `adjust_for_use_closure` instead). Capturing such a place by immutable
+        // borrow lets the `.use` expression clone per evaluation, rather than also
+        // cloning the value into the closure at construction time. See #157141.
+        ty::UpvarCapture::ByUse => {
+            kind = ty::UpvarCapture::ByRef(ty::BorrowKind::Immutable);
         }
 
         ty::UpvarCapture::ByRef(..) => {}

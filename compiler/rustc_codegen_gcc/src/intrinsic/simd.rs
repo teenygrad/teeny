@@ -7,8 +7,8 @@ use rustc_abi::{Align, Size};
 use rustc_codegen_ssa::base::compare_simd_types;
 use rustc_codegen_ssa::common::{IntPredicate, TypeKind};
 #[cfg(feature = "master")]
-use rustc_codegen_ssa::errors::ExpectedPointerMutability;
-use rustc_codegen_ssa::errors::InvalidMonomorphization;
+use rustc_codegen_ssa::diagnostics::ExpectedPointerMutability;
+use rustc_codegen_ssa::diagnostics::InvalidMonomorphization;
 use rustc_codegen_ssa::mir::operand::OperandRef;
 use rustc_codegen_ssa::mir::place::PlaceRef;
 use rustc_codegen_ssa::traits::{BaseTypeCodegenMethods, BuilderMethods};
@@ -17,7 +17,7 @@ use rustc_hir as hir;
 use rustc_middle::mir::BinOp;
 use rustc_middle::ty::layout::HasTyCtxt;
 use rustc_middle::ty::{self, Ty};
-use rustc_span::{Span, Symbol, sym};
+use rustc_span::{ErrorGuaranteed, Span, Symbol, sym};
 
 use crate::builder::Builder;
 #[cfg(not(feature = "master"))]
@@ -32,12 +32,12 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
     ret_ty: Ty<'tcx>,
     llret_ty: Type<'gcc>,
     span: Span,
-) -> Result<RValue<'gcc>, ()> {
+) -> Result<RValue<'gcc>, ErrorGuaranteed> {
     // macros for error handling:
     macro_rules! return_error {
         ($err:expr) => {{
-            bx.tcx.dcx().emit_err($err);
-            return Err(());
+            let err = bx.tcx.dcx().emit_err($err);
+            return Err(err);
         }};
     }
     macro_rules! require {
@@ -803,11 +803,11 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         bx: &mut Builder<'_, 'gcc, 'tcx>,
         span: Span,
         args: &[OperandRef<'tcx, RValue<'gcc>>],
-    ) -> Result<RValue<'gcc>, ()> {
+    ) -> Result<RValue<'gcc>, ErrorGuaranteed> {
         macro_rules! return_error {
             ($err:expr) => {{
-                bx.tcx.dcx().emit_err($err);
-                return Err(());
+                let err = bx.tcx.dcx().emit_err($err);
+                return Err(err);
             }};
         }
         let ty::Float(ref f) = *in_elem.kind() else {

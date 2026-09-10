@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fmt::Display;
 
+use rustc_ast::attr::version::RustcVersion;
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_data_structures::stable_hash::{StableCompare, StableHash, StableHashCtxt, StableHasher};
 use rustc_error_messages::{DiagArgValue, IntoDiagArg};
@@ -109,7 +110,7 @@ pub enum LintExpectationId {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Encodable, Decodable)]
 pub struct UnstableLintExpectationId {
     pub attr_id: AttrId,
-    pub lint_index: Option<u16>,
+    pub lint_index: u16,
 }
 
 impl From<UnstableLintExpectationId> for LintExpectationId {
@@ -125,7 +126,7 @@ impl From<UnstableLintExpectationId> for LintExpectationId {
 pub struct StableLintExpectationId {
     pub hir_id: HirId,
     pub attr_index: u16,
-    pub lint_index: Option<u16>,
+    pub lint_index: u16,
 }
 
 impl StableHash for StableLintExpectationId {
@@ -135,7 +136,7 @@ impl StableHash for StableLintExpectationId {
 
         hir_id.stable_hash(hcx, hasher);
         attr_index.stable_hash(hcx, hasher);
-        lint_index.expect("must be filled to call `stable_hash`").stable_hash(hcx, hasher);
+        lint_index.stable_hash(hcx, hasher);
     }
 }
 
@@ -148,9 +149,8 @@ impl From<StableLintExpectationId> for LintExpectationId {
 /// Setting for how to handle a lint.
 ///
 /// See: <https://doc.rust-lang.org/rustc/lints/levels.html>
-#[derive(
-    Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Debug, Hash, Encodable, Decodable, StableHash
-)]
+#[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Debug, Hash)]
+#[derive(Encodable, Decodable, StableHash)]
 pub enum Level {
     /// The `allow` level will not issue any message.
     Allow,
@@ -305,6 +305,9 @@ pub struct Lint {
 
     /// `true` if this lint is unaffected by `-D warnings`
     pub ignore_deny_warnings: bool,
+
+    /// Used to avoid lints which would affect MSRV
+    pub rust_version: Option<RustcVersion>,
 }
 
 /// Extra information for a future incompatibility lint.
@@ -521,7 +524,40 @@ impl Lint {
             crate_level_only: false,
             eval_always: false,
             ignore_deny_warnings: false,
+            rust_version: None,
         }
+    }
+
+    // FIXME(const-hack): This is used so that `declare_lint` can declare an MSRV statically.
+    // `RustcVersion::parse_str_strict` should ideally be used instead.
+    pub const fn parse_rust_version(version: &str) -> RustcVersion {
+        const fn parse_part(input: &mut &[u8]) -> u16 {
+            let mut val = 0;
+            let mut idx = 0;
+            while idx < input.len() {
+                let v = input[idx];
+                match v {
+                    b'0'..=b'9' => {
+                        val = val * 10 + (v - b'0') as u16;
+                    }
+                    b'.' => {
+                        idx += 1;
+                        break;
+                    }
+                    _ => panic!("invalid character in version"),
+                }
+                idx += 1;
+            }
+            *input = input.split_at(idx).1;
+            val
+        }
+
+        let mut bytes = version.as_bytes();
+        let major = parse_part(&mut bytes);
+        let minor = parse_part(&mut bytes);
+        let patch = parse_part(&mut bytes);
+        assert!(bytes.is_empty());
+        RustcVersion { major, minor, patch }
     }
 
     /// Gets the lint's name, with ASCII letters converted to lowercase.
@@ -671,6 +707,7 @@ macro_rules! declare_lint {
         $($field:ident : $val:expr),* $(,)*
      }; )?
      $(@edition $lint_edition:ident => $edition_level:ident;)?
+     $(@msrv = $msrv:literal;)?
      $($v:ident),*) => (
         $(#[$attr])*
         $vis static $NAME: &$crate::Lint = &$crate::Lint {
@@ -687,6 +724,7 @@ macro_rules! declare_lint {
             }),)?
             $(edition_lint_opts: Some(($crate::Edition::$lint_edition, $crate::$edition_level)),)?
             $(eval_always: $eval_always,)?
+            $(rust_version: Some($crate::Lint::parse_rust_version($msrv)),)?
             ..$crate::Lint::default_fields_for_macro()
         };
     );

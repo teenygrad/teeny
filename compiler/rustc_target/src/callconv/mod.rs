@@ -1,5 +1,6 @@
 use std::{fmt, iter};
 
+use arrayvec::ArrayVec;
 use rustc_abi::{
     AddressSpace, Align, BackendRepr, CanonAbi, ExternAbi, FieldsShape, HasDataLayout, Primitive,
     Reg, RegKind, Scalar, Size, TyAbiInterface, TyAndLayout, Variants,
@@ -122,6 +123,11 @@ mod attr_impl {
             const InReg    = 1 << 6;
             const NoUndef  = 1 << 7;
             const Writable = 1 << 8;
+            /// It is UB for this pointer or any pointer derived from it to be used for
+            /// deallocation (except for zero-sized deallocation) while the function is
+            /// executing. Only valid on arguments (including return values that are passed
+            /// indirectly as arguments).
+            const NoFree   = 1 << 9;
         }
     }
     rustc_data_structures::external_bitflags_debug! { ArgAttribute }
@@ -143,9 +149,8 @@ pub enum ArgExtension {
 pub struct ArgAttributes {
     pub regular: ArgAttribute,
     pub arg_ext: ArgExtension,
-    /// The minimum size of the pointee, guaranteed to be valid for the duration of the whole call
-    /// (corresponding to LLVM's dereferenceable_or_null attributes, i.e., it is okay for this to be
-    /// set on a null pointer, but all non-null pointers must be dereferenceable).
+    /// If the pointer is not null, the minimum dereferenceable size of the pointee, at the time of
+    /// function entry (for arguments) or function return (for return values).
     pub pointee_size: Size,
     /// The minimum alignment of the pointee, if any.
     pub pointee_align: Option<Align>,
@@ -264,7 +269,11 @@ impl Uniform {
 /// (and all data in the padding between the registers is dropped).
 #[derive(Clone, PartialEq, Eq, Hash, Debug, StableHash)]
 pub struct CastTarget {
-    pub prefix: [Option<Reg>; 8],
+    // Note that this is fixed to 8 elements for now as ABIs currently don't
+    // need anything further beyond that, and when this code was originally
+    // refactored to use `ArrayVec` it was already using 8, so that stuck
+    // around.
+    pub prefix: ArrayVec<Reg, 8>,
     /// The offset of `rest` from the start of the value. Currently only implemented for a `Reg`
     /// pair created by the `offset_pair` method.
     pub rest_offset: Option<Size>,
@@ -280,18 +289,20 @@ impl From<Reg> for CastTarget {
 
 impl From<Uniform> for CastTarget {
     fn from(uniform: Uniform) -> CastTarget {
-        Self::prefixed([None; 8], uniform)
+        Self::prefixed(Default::default(), uniform)
     }
 }
 
 impl CastTarget {
-    pub fn prefixed(prefix: [Option<Reg>; 8], rest: Uniform) -> Self {
+    pub fn prefixed(prefix: ArrayVec<Reg, 8>, rest: Uniform) -> Self {
         Self { prefix, rest_offset: None, rest, attrs: ArgAttributes::new() }
     }
 
     pub fn offset_pair(a: Reg, offset_from_start: Size, b: Reg) -> Self {
+        let mut prefix = ArrayVec::new();
+        prefix.push(a);
         Self {
-            prefix: [Some(a), None, None, None, None, None, None, None],
+            prefix,
             rest_offset: Some(offset_from_start),
             rest: b.into(),
             attrs: ArgAttributes::new(),
@@ -304,7 +315,9 @@ impl CastTarget {
     }
 
     pub fn pair(a: Reg, b: Reg) -> CastTarget {
-        Self::prefixed([Some(a), None, None, None, None, None, None, None], Uniform::from(b))
+        let mut prefix = ArrayVec::new();
+        prefix.push(a);
+        Self::prefixed(prefix, Uniform::from(b))
     }
 
     /// When you only access the range containing valid data, you can use this unaligned size;
@@ -314,10 +327,7 @@ impl CastTarget {
         let prefix_size = if let Some(offset_from_start) = self.rest_offset {
             offset_from_start
         } else {
-            self.prefix
-                .iter()
-                .filter_map(|x| x.map(|reg| reg.size))
-                .fold(Size::ZERO, |acc, size| acc + size)
+            self.prefix.iter().map(|reg| reg.size).fold(Size::ZERO, |acc, size| acc + size)
         };
         // Remaining arguments are passed in chunks of the unit size
         let rest_size =
@@ -333,7 +343,7 @@ impl CastTarget {
     pub fn align<C: HasDataLayout>(&self, cx: &C) -> Align {
         self.prefix
             .iter()
-            .filter_map(|x| x.map(|reg| reg.align(cx)))
+            .map(|reg| reg.align(cx))
             .fold(cx.data_layout().aggregate_align.max(self.rest.align(cx)), |acc, align| {
                 acc.max(align)
             })
@@ -380,17 +390,15 @@ impl<'a, Ty: fmt::Display> fmt::Debug for ArgAbi<'a, Ty> {
 impl<'a, Ty> ArgAbi<'a, Ty> {
     /// This defines the "default ABI" for that type, that is then later adjusted in `fn_abi_adjust_for_abi`.
     pub fn new(
-        cx: &impl HasDataLayout,
         layout: TyAndLayout<'a, Ty>,
         scalar_attrs: impl Fn(Scalar, Size) -> ArgAttributes,
     ) -> Self {
         let mode = match layout.backend_repr {
             _ if layout.is_zst() => PassMode::Ignore,
             BackendRepr::Scalar(scalar) => PassMode::Direct(scalar_attrs(scalar, Size::ZERO)),
-            BackendRepr::ScalarPair(a, b) => PassMode::Pair(
-                scalar_attrs(a, Size::ZERO),
-                scalar_attrs(b, a.size(cx).align_to(b.align(cx).abi)),
-            ),
+            BackendRepr::ScalarPair { a, b, b_offset } => {
+                PassMode::Pair(scalar_attrs(a, Size::ZERO), scalar_attrs(b, b_offset))
+            }
             BackendRepr::SimdVector { .. } => PassMode::Direct(ArgAttributes::new()),
             BackendRepr::Memory { .. } => Self::indirect_pass_mode(&layout),
             BackendRepr::SimdScalableVector { .. } => PassMode::Direct(ArgAttributes::new()),
@@ -408,27 +416,14 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
             .set(ArgAttribute::NoAlias)
             .set(ArgAttribute::CapturesAddress)
             .set(ArgAttribute::NonNull)
-            .set(ArgAttribute::NoUndef);
+            .set(ArgAttribute::NoUndef)
+            .set(ArgAttribute::NoFree);
         attrs.pointee_size = layout.size;
         attrs.pointee_align = Some(layout.align.abi);
 
         let meta_attrs = layout.is_unsized().then_some(ArgAttributes::new());
 
         PassMode::Indirect { attrs, meta_attrs, on_stack: false }
-    }
-
-    /// Pass this argument directly instead. Should NOT be used!
-    /// Only exists because of past ABI mistakes that will take time to fix
-    /// (see <https://github.com/rust-lang/rust/issues/115666>).
-    #[track_caller]
-    pub fn make_direct_deprecated(&mut self) {
-        match self.mode {
-            PassMode::Indirect { .. } => {
-                self.mode = PassMode::Direct(ArgAttributes::new());
-            }
-            PassMode::Ignore | PassMode::Direct(_) | PassMode::Pair(_, _) => {} // already direct
-            _ => panic!("Tried to make {:?} direct", self.mode),
-        }
     }
 
     /// Pass this argument indirectly, by passing a (thin or wide) pointer to the argument instead.
@@ -518,6 +513,26 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
     pub fn cast_to_with_attrs<T: Into<CastTarget>>(&mut self, target: T, attrs: ArgAttributes) {
         self.mode =
             PassMode::Cast { cast: Box::new(target.into().with_attrs(attrs)), pad_i32: false };
+    }
+
+    /// Cast to `target`, forwarding `NoUndef` only when the layout provably has no uninit
+    /// bytes *and* the cast exactly covers the layout (`target.size(cx) == self.layout.size`).
+    /// A wider cast (e.g. `Uniform::new` rounding a 3-byte aggregate up to an `i32`) covers
+    /// undef padding bytes that must not be marked `noundef`; a narrower cast does not occur,
+    /// since a `PassMode::Cast` target always covers the whole value.
+    pub fn cast_to_maybe_noundef<T, C>(&mut self, target: T, cx: &C)
+    where
+        T: Into<CastTarget>,
+        Ty: TyAbiInterface<'a, C> + Copy,
+        C: HasDataLayout,
+    {
+        let target = target.into();
+        let attr = if layout_is_noundef(self.layout, cx) && target.size(cx) == self.layout.size {
+            ArgAttribute::NoUndef
+        } else {
+            ArgAttribute::default()
+        };
+        self.cast_to_with_attrs(target, attr.into());
     }
 
     pub fn cast_to_and_pad_i32<T: Into<CastTarget>>(&mut self, target: T, pad_i32: bool) {
@@ -742,9 +757,30 @@ impl<'a, Ty> FnAbi<'a, Ty> {
                 continue;
             }
 
+            // Always extend `bool` in the Rust ABI
+            let extend_bool = |attrs: &mut ArgAttributes, scalar: Scalar| {
+                if scalar.is_bool() {
+                    attrs.ext(ArgExtension::Zext);
+                }
+            };
+
+            if let PassMode::Direct(attrs) = &mut arg.mode
+                && let BackendRepr::Scalar(scalar) = arg.layout.backend_repr
+            {
+                extend_bool(attrs, scalar);
+            } else if let PassMode::Pair(a_attrs, b_attrs) = &mut arg.mode
+                && let BackendRepr::ScalarPair { a, b, b_offset: _ } = arg.layout.backend_repr
+            {
+                extend_bool(a_attrs, a);
+                extend_bool(b_attrs, b);
+            }
+
             if arg_idx.is_none()
                 && arg.layout.size > Primitive::Pointer(AddressSpace::ZERO).size(cx) * 2
-                && !matches!(arg.layout.backend_repr, BackendRepr::SimdVector { .. })
+                && !matches!(
+                    arg.layout.backend_repr,
+                    BackendRepr::SimdVector { .. } | BackendRepr::SimdScalableVector { .. }
+                )
             {
                 // Return values larger than 2 registers using a return area
                 // pointer. LLVM and Cranelift disagree about how to return
@@ -807,12 +843,10 @@ impl<'a, Ty> FnAbi<'a, Ty> {
                         // We want to pass small aggregates as immediates, but using
                         // an LLVM aggregate type for this leads to bad optimizations,
                         // so we pick an appropriately sized integer type instead.
-                        let attr = if layout_is_noundef(arg.layout, cx) {
-                            ArgAttribute::NoUndef
-                        } else {
-                            ArgAttribute::default()
-                        };
-                        arg.cast_to_with_attrs(Reg { kind: RegKind::Integer, size }, attr.into());
+                        arg.cast_to_maybe_noundef(Reg { kind: RegKind::Integer, size }, cx);
+                    } else if self.conv == CanonAbi::RustTail {
+                        assert!(arg.layout.is_sized(), "extern \"tail\" arguments must be sized");
+                        arg.pass_by_stack_offset(None);
                     }
                 }
 
@@ -860,7 +894,7 @@ where
 {
     match layout.backend_repr {
         BackendRepr::Scalar(scalar) => !scalar.is_uninit_valid(),
-        BackendRepr::ScalarPair(s1, s2) => {
+        BackendRepr::ScalarPair { a: s1, b: s2, b_offset: _ } => {
             !s1.is_uninit_valid()
                 && !s2.is_uninit_valid()
                 // Ensure there is no padding.

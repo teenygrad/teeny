@@ -25,7 +25,7 @@ pub(crate) fn synthesize_blanket_impls(
     let mut blanket_impls = Vec::new();
     for trait_def_id in tcx.visible_traits() {
         if !cx.cache.effective_visibilities.is_reachable(tcx, trait_def_id)
-            || cx.generated_synthetics.contains(&(ty.skip_binder(), trait_def_id))
+            || cx.synthetic_blanket_impls.contains(&(ty.skip_binder(), trait_def_id))
         {
             continue;
         }
@@ -59,19 +59,19 @@ pub(crate) fn synthesize_blanket_impls(
             // FIXME(eddyb) ignoring `obligations` might cause false positives.
             drop(obligations);
 
-            let predicates = tcx
-                .predicates_of(impl_def_id)
+            let clauses = tcx
+                .clauses_of(impl_def_id)
                 .instantiate(tcx, impl_args)
-                .predicates
+                .clauses
                 .into_iter()
                 .map(Unnormalized::skip_norm_wip)
                 .chain(Some(impl_trait_ref.upcast(tcx)));
-            for predicate in predicates {
+            for clause in clauses {
                 let obligation = traits::Obligation::new(
                     tcx,
                     traits::ObligationCause::dummy(),
                     param_env,
-                    predicate,
+                    clause,
                 );
                 match infcx.evaluate_obligation(&obligation) {
                     Ok(eval_result) if eval_result.may_apply() => {}
@@ -81,7 +81,7 @@ pub(crate) fn synthesize_blanket_impls(
             }
             debug!("found applicable impl for trait ref {trait_ref:?}");
 
-            cx.generated_synthetics.insert((ty.skip_binder(), trait_def_id));
+            cx.synthetic_blanket_impls.insert((ty.skip_binder(), trait_def_id));
 
             blanket_impls.push(clean::Item {
                 inner: Box::new(clean::ItemInner {

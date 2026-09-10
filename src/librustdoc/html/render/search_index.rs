@@ -1771,13 +1771,15 @@ pub(crate) fn build_index(
                 assert!(ty.generics.is_some());
                 return;
             };
-            ty.id = convert_render_type_id(
-                id,
-                cache,
-                serialized_index,
-                used_in_function_signature,
-                tcx,
-            );
+            ty.id = if let RenderTypeId::DefId(def_id) = id
+                && matches!(tcx.def_kind(def_id), rustc_hir::def::DefKind::OpaqueTy)
+            {
+                // We exclude opaque types as they cannot have attributes, so no need to call
+                // `convert_render_type_id`.
+                None
+            } else {
+                convert_render_type_id(id, cache, serialized_index, used_in_function_signature, tcx)
+            };
             use crate::clean::PrimitiveType;
             // These cases are added to the inverted index, but not actually included
             // in the signature. There's a matching set of cases in the
@@ -1787,7 +1789,7 @@ pub(crate) fn build_index(
                 RenderTypeId::Primitive(PrimitiveType::Array | PrimitiveType::Slice) => {
                     insert_into_map(
                         ItemType::Primitive,
-                        &[Symbol::intern("[]")],
+                        &[sym::empty_brackets],
                         None,
                         false,
                         serialized_index,
@@ -1798,7 +1800,7 @@ pub(crate) fn build_index(
                     // typeNameIdOfArrayOrSlice
                     insert_into_map(
                         ItemType::Primitive,
-                        &[Symbol::intern("()")],
+                        &[sym::empty_parens],
                         None,
                         false,
                         serialized_index,
@@ -1809,7 +1811,7 @@ pub(crate) fn build_index(
                 RenderTypeId::Primitive(PrimitiveType::Fn) => {
                     insert_into_map(
                         ItemType::Primitive,
-                        &[Symbol::intern("->")],
+                        &[sym::right_arrow],
                         None,
                         false,
                         serialized_index,
@@ -1823,7 +1825,7 @@ pub(crate) fn build_index(
                 {
                     insert_into_map(
                         ItemType::Primitive,
-                        &[Symbol::intern("->")],
+                        &[sym::right_arrow],
                         None,
                         false,
                         serialized_index,

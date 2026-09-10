@@ -74,7 +74,7 @@ fn check_(
         "{}",
         syntax_bridge::prettify_macro_expansion::prettify_macro_expansion(
             node.syntax_node(),
-            &mut |_| None,
+            &mut |_, _| None,
             |_| ()
         )
     );
@@ -468,9 +468,8 @@ fn minus_belongs_to_literal() {
             }
 
             SUBTREE $$ 1:Root[0000, 0]@0..6#ROOT2024 1:Root[0000, 0]@0..6#ROOT2024
-              PUNCH   - [joint] 1:Root[0000, 0]@1..2#ROOT2024
-              PUNCH   - [alone] 1:Root[0000, 0]@2..3#ROOT2024
+              IDENT   missing 0:Root[0000, 0]@72..75#ROOT2024
 
-            --"#]],
+            missing"#]],
     );
 }

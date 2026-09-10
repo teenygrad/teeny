@@ -41,6 +41,7 @@ mod matching_brace;
 mod moniker;
 mod move_item;
 mod parent_module;
+mod predicate_eval;
 mod references;
 mod rename;
 mod runnables;
@@ -59,21 +60,21 @@ mod view_mir;
 mod view_syntax_tree;
 
 use std::panic::{AssertUnwindSafe, UnwindSafe};
+use std::time::Duration;
 
 use cfg::CfgOptions;
 use fetch_crates::CrateInfo;
 use hir::{ChangeWithProcMacros, EditionedFileId, crate_def_map, sym};
-use ide_db::base_db::relevant_crates;
-use ide_db::base_db::salsa::Durability;
-use ide_db::line_index;
-use ide_db::ra_fixture::RaFixtureAnalysis;
 use ide_db::{
     FxHashMap, FxIndexSet,
     base_db::{
         AbsPathBuf, CrateOrigin, CrateWorkspaceData, Env, FileSet, SourceDatabase, VfsPath,
-        salsa::{Cancelled, Database},
+        relevant_crates,
+        salsa::{Cancelled, Database, Durability},
     },
-    prime_caches, symbol_index,
+    line_index, prime_caches,
+    ra_fixture::RaFixtureAnalysis,
+    symbol_index,
 };
 use macros::UpmapFromRaFixture;
 use syntax::{AstNode, SourceFile, ast};
@@ -122,7 +123,7 @@ pub use crate::{
     },
     test_explorer::{TestItem, TestItemKind},
 };
-pub use hir::Semantics;
+pub use hir::{PredicateEvaluationResult, PredicateEvaluationStatus, Semantics};
 pub use ide_assists::{
     Assist, AssistConfig, AssistId, AssistKind, AssistResolveStrategy, SingleResolve,
 };
@@ -196,8 +197,8 @@ impl AnalysisHost {
 
     /// Applies changes to the current state of the world. If there are
     /// outstanding snapshots, they will be canceled.
-    pub fn apply_change(&mut self, change: ChangeWithProcMacros) {
-        self.db.apply_change(change);
+    pub fn apply_change(&mut self, change: ChangeWithProcMacros) -> Duration {
+        self.db.apply_change(change)
     }
 
     /// NB: this clears the database
@@ -331,11 +332,21 @@ impl Analysis {
         })
     }
 
-    pub fn parallel_prime_caches<F>(&self, num_worker_threads: usize, cb: F) -> Cancellable<()>
+    /// Warm caches for the given `scope`. `scope` must be closed under
+    /// transitive dependencies; callers that want to prime everything pass
+    /// `&base_db::all_crates(db)`.
+    pub fn parallel_prime_caches<F>(
+        &self,
+        scope: &[Crate],
+        num_worker_threads: usize,
+        cb: F,
+    ) -> Cancellable<()>
     where
         F: Fn(ParallelPrimeCachesProgress) + Sync + std::panic::UnwindSafe,
     {
-        self.with_db(move |db| prime_caches::parallel_prime_caches(db, num_worker_threads, &cb))
+        self.with_db(move |db| {
+            prime_caches::parallel_prime_caches(db, scope, num_worker_threads, &cb)
+        })
     }
 
     /// Gets the text of the source file.
@@ -389,6 +400,14 @@ impl Analysis {
 
     pub fn view_hir(&self, position: FilePosition) -> Cancellable<String> {
         self.with_db(|db| view_hir::view_hir(db, position))
+    }
+
+    pub fn evaluate_predicate(
+        &self,
+        text: String,
+        position: FilePosition,
+    ) -> Cancellable<PredicateEvaluationResult> {
+        self.with_db(|db| predicate_eval::evaluate_predicate(db, text, position))
     }
 
     pub fn view_mir(&self, position: FilePosition) -> Cancellable<String> {

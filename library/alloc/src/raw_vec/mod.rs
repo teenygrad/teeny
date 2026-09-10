@@ -244,7 +244,7 @@ impl<T, A: Allocator> RawVec<T, A> {
 
         let me = ManuallyDrop::new(self);
         unsafe {
-            let slice = ptr::slice_from_raw_parts_mut(me.ptr() as *mut MaybeUninit<T>, len);
+            let slice = me.ptr().cast::<MaybeUninit<T>>().cast_slice(len);
             Box::from_raw_in(slice, ptr::read(&me.inner.alloc))
         }
     }
@@ -417,7 +417,8 @@ impl<T, A: Allocator> RawVec<T, A> {
     }
 }
 
-unsafe impl<#[may_dangle] T, A: Allocator> Drop for RawVec<T, A> {
+#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+const unsafe impl<#[may_dangle] T, A: [const] Allocator + [const] Destruct> Drop for RawVec<T, A> {
     /// Frees the memory owned by the `RawVec` *without* trying to drop its contents.
     fn drop(&mut self) {
         // SAFETY: We are in a Drop impl, self.inner will not be used again.
@@ -559,11 +560,7 @@ const impl<A: [const] Allocator + [const] Destruct> RawVecInner<A> {
             self.alloc.allocate(new_layout)
         };
 
-        // FIXME(const-hack): switch back to `map_err`
-        match memory {
-            Ok(memory) => Ok(memory),
-            Err(_) => Err(AllocError { layout: new_layout, non_exhaustive: () }.into()),
-        }
+        memory.map_err(const |_| AllocError { layout: new_layout, non_exhaustive: () }.into())
     }
 }
 
@@ -861,7 +858,10 @@ impl<A: Allocator> RawVecInner<A> {
         }
         Ok(())
     }
+}
 
+#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+const impl<A: [const] Allocator> RawVecInner<A> {
     /// # Safety
     ///
     /// This function deallocates the owned allocation, but does not update `ptr` or `cap` to

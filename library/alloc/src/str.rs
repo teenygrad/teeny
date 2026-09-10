@@ -461,7 +461,7 @@ impl str {
                 }
             }
         }
-        return s;
+        s
     }
 
     /// Returns the titlecase equivalent of this string slice,
@@ -552,11 +552,10 @@ impl str {
                   without modifying the original"]
     #[unstable(feature = "titlecase", issue = "153892")]
     pub fn word_to_titlecase(&self) -> String {
-        // FIXME: add ASCII fast path
-
         let mut s = String::with_capacity(self.len());
         let mut chars = self.char_indices();
 
+        // The first cased character is title-cased; leading uncased characters pass through.
         'until_first_cased_char: for (_, c) in chars.by_ref() {
             if c.is_cased() {
                 s.extend(c.to_titlecase());
@@ -566,14 +565,23 @@ impl str {
             }
         }
 
-        for (i, c) in chars {
+        // Everything after the first cased character is lower-cased. Use the ASCII fast
+        // path (auto-vectorized) for its ASCII prefix, mirroring `to_lowercase`.
+        let remainder = chars.as_str();
+        let rest_start = self.len() - remainder.len();
+        // SAFETY: `to_ascii_lowercase` preserves ASCII bytes, so the prefix stays valid UTF-8.
+        let (ascii, rest) = unsafe { convert_while_ascii(remainder, u8::to_ascii_lowercase) };
+        s.push_str(&ascii);
+        let prefix_len = rest_start + ascii.len();
+
+        for (i, c) in rest.char_indices() {
             if c == 'Σ' {
                 // Σ maps to σ, except at the end of a word where it maps to ς.
                 // This is the only conditional (contextual) but language-independent mapping
                 // in `SpecialCasing.txt`,
                 // so hard-code it rather than have a generic "condition" mechanism.
                 // See https://github.com/rust-lang/rust/issues/26035
-                let sigma_lowercase = map_uppercase_sigma(self, i);
+                let sigma_lowercase = map_uppercase_sigma(self, prefix_len + i);
                 s.push(sigma_lowercase);
             } else {
                 match conversions::to_lower(c) {
@@ -644,6 +652,108 @@ impl str {
 
         for c in rest.chars() {
             match conversions::to_upper(c) {
+                [a, '\0', _] => s.push(a),
+                [a, b, '\0'] => {
+                    s.push(a);
+                    s.push(b);
+                }
+                [a, b, c] => {
+                    s.push(a);
+                    s.push(b);
+                    s.push(c);
+                }
+            }
+        }
+        s
+    }
+
+    /// Returns the case-folded equivalent of this string slice, as a new [`String`].
+    ///
+    /// Case folding is a transformation, mostly matching lowercase, that is meant to be used
+    /// for case-insensitive string comparisons. Case-folded strings should not usually
+    /// be exposed directly to users.
+    ///
+    /// For the precise specification of case folding, see
+    /// [Chapter 3 (Conformance)](https://www.unicode.org/versions/latest/core-spec/chapter-3/#G63737)
+    /// of the Unicode standard.
+    ///
+    /// Since some characters can expand into multiple characters when case folding,
+    /// this function returns a [`String`] instead of modifying the parameter in-place.
+    ///
+    /// No [normalization] (e.g. NFC) is performed, so visually and semantically identical strings
+    /// might still casefold differently. For example, `"Å"` (U+00C5 LATIN CAPITAL LETTER A WITH RING ABOVE)
+    /// is considered distinct from `"Å"` (A followed by U+030A COMBINING RING ABOVE),
+    /// even though Unicode considers them canonically equivalent.
+    ///
+    /// Like [`char::to_casefold_unnormalized()`] this method does not handle language-specific
+    /// casing, like Turkish and Azeri I/ı/İ/i. See that method's documentation
+    /// for more information.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(casefold)]
+    /// let s0 = "HELLO";
+    /// let s1 = "Hello";
+    ///
+    /// assert_eq!(s0.to_casefold_unnormalized(), s1.to_casefold_unnormalized());
+    /// assert_eq!(s0.to_casefold_unnormalized(), "hello")
+    /// ```
+    ///
+    /// Scripts without case are not changed:
+    ///
+    /// ```
+    /// #![feature(casefold)]
+    /// let new_year = "农历新年";
+    ///
+    /// assert_eq!(new_year, new_year.to_casefold_unnormalized());
+    /// ```
+    ///
+    /// One character can become multiple:
+    ///
+    /// ```
+    /// #![feature(casefold)]
+    /// let s0 = "TSCHÜẞ";
+    /// let s1 = "TSCHÜSS";
+    /// let s2 = "tschüß";
+    ///
+    /// assert_eq!(s0.to_casefold_unnormalized(), s1.to_casefold_unnormalized());
+    /// assert_eq!(s0.to_casefold_unnormalized(), s2.to_casefold_unnormalized());
+    /// assert_eq!(s0.to_casefold_unnormalized(), "tschüss");
+    /// ```
+    ///
+    /// No NFC [normalization] is performed:
+    ///
+    /// ```rust
+    /// #![feature(casefold)]
+    /// // These two strings are visually and semantically identical...
+    /// let comp = "Å";
+    /// let decomp = "Å";
+    ///
+    /// // ... but not codepoint-for-codepoint equal.
+    /// assert_eq!(comp, "\u{C5}");
+    /// assert_eq!(decomp, "A\u{030A}");
+    ///
+    /// // Their case-foldings are likewise unequal:
+    /// assert_eq!(comp.to_casefold_unnormalized(), "\u{E5}");
+    /// assert_eq!(decomp.to_casefold_unnormalized(), "a\u{030A}");
+    /// ```
+    ///
+    /// [normalization]: https://www.unicode.org/faq/normalization.html
+    #[cfg(not(no_global_oom_handling))]
+    #[rustc_allow_incoherent_impl]
+    #[must_use = "this returns the case-folded string as a new String, \
+                  without modifying the original"]
+    #[unstable(feature = "casefold", issue = "157000")]
+    pub fn to_casefold_unnormalized(&self) -> String {
+        // SAFETY: `to_ascii_lowercase` preserves ASCII bytes, so the converted
+        // prefix remains valid UTF-8.
+        let (mut s, rest) = unsafe { convert_while_ascii(self, u8::to_ascii_lowercase) };
+
+        for c in rest.chars() {
+            match conversions::to_casefold(c) {
                 [a, '\0', _] => s.push(a),
                 [a, b, '\0'] => {
                     s.push(a);
@@ -734,9 +844,10 @@ impl str {
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
     #[inline]
     pub fn to_ascii_uppercase(&self) -> String {
-        let mut s = self.to_owned();
-        s.make_ascii_uppercase();
-        s
+        let bytes = self.as_bytes().to_ascii_uppercase();
+        // SAFETY: ASCII case conversion only maps a-z to A-Z and leaves
+        // all other bytes unchanged as valid UTF-8
+        unsafe { String::from_utf8_unchecked(bytes) }
     }
 
     /// Returns a copy of this string where each character is mapped to its
@@ -766,9 +877,10 @@ impl str {
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
     #[inline]
     pub fn to_ascii_lowercase(&self) -> String {
-        let mut s = self.to_owned();
-        s.make_ascii_lowercase();
-        s
+        let bytes = self.as_bytes().to_ascii_lowercase();
+        // SAFETY: ASCII case conversion only maps A-Z to a-z and leaves
+        // all other bytes unchanged as valid UTF-8
+        unsafe { String::from_utf8_unchecked(bytes) }
     }
 }
 
@@ -792,6 +904,18 @@ impl str {
 #[inline]
 pub unsafe fn from_boxed_utf8_unchecked(v: Box<[u8]>) -> Box<str> {
     unsafe { Box::from_raw(Box::into_raw(v) as *mut str) }
+}
+
+/// Internal; same as `from_boxed_utf8_unchecked` but allocator-generic. Name
+/// probably not suitable for being made `pub` as-is.
+#[must_use]
+#[inline]
+#[cfg(not(no_global_oom_handling))]
+pub(crate) unsafe fn from_boxed_utf8_unchecked_in<A: crate::alloc::Allocator>(
+    v: Box<[u8], A>,
+) -> Box<str, A> {
+    let (ptr, alloc) = Box::into_raw_with_allocator(v);
+    unsafe { Box::from_raw_in(ptr as *mut str, alloc) }
 }
 
 /// Converts leading ascii bytes in `s` by calling the `convert` function.
@@ -853,7 +977,7 @@ pub unsafe fn convert_while_ascii(s: &str, convert: fn(&u8) -> u8) -> (String, &
     }
 
     // handle the remainder as individual bytes
-    while slice.len() > 0 {
+    while !slice.is_empty() {
         let byte = slice[0];
         if byte > 127 {
             break;

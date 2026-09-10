@@ -1,6 +1,6 @@
 use crate::consts::ConstEvalCtxt;
 use crate::macros::macro_backtrace;
-use crate::source::{SpanRange, SpanRangeExt, walk_span_to_context};
+use crate::source::{SpanExt as _, SpanRange, walk_span_to_context};
 use crate::{sym, tokenize_with_text};
 use core::mem;
 use rustc_ast::ast;
@@ -21,7 +21,7 @@ use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
 use rustc_lint::LateContext;
 use rustc_middle::ty::TypeckResults;
 use rustc_span::{BytePos, ExpnKind, MacroKind, Symbol, SyntaxContext};
-use std::hash::{Hash, Hasher};
+use std::hash::{Hash as _, Hasher as _};
 use std::ops::Range;
 use std::slice;
 
@@ -69,7 +69,7 @@ impl<'a, 'tcx> SpanlessEq<'a, 'tcx> {
     pub fn new(cx: &'a LateContext<'tcx>) -> Self {
         Self {
             cx,
-            maybe_typeck_results: cx.maybe_typeck_results().map(|x| (x, x)),
+            maybe_typeck_results: cx.typeck_results.map(|x| (x, x)),
             allow_side_effects: true,
             expr_fallback: None,
             path_check: PathCheck::default(),
@@ -300,9 +300,6 @@ impl HirEqInterExpr<'_, '_, '_> {
             (WherePredicateKind::RegionPredicate(l_region), WherePredicateKind::RegionPredicate(r_region)) => {
                 Self::eq_lifetime(l_region.lifetime, r_region.lifetime)
                     && self.eq_generics_bound(l_region.bounds, r_region.bounds)
-            },
-            (WherePredicateKind::EqPredicate(l_eq), WherePredicateKind::EqPredicate(r_eq)) => {
-                self.eq_ty(l_eq.lhs_ty, r_eq.lhs_ty)
             },
             _ => false,
         })
@@ -1039,7 +1036,7 @@ fn reduce_exprkind<'hir>(
             // `{}` => `()`
             ([], None)
                 if block.span.ctxt() != eval_ctxt
-                    || block.span.check_source_text(cx, |src| {
+                    || block.span.check_text(cx, |src| {
                         tokenize(src, FrontmatterAllowed::No)
                             .map(|t| t.kind)
                             .filter(|t| {
@@ -1143,7 +1140,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
     pub fn new(cx: &'a LateContext<'tcx>) -> Self {
         Self {
             cx,
-            maybe_typeck_results: cx.maybe_typeck_results(),
+            maybe_typeck_results: cx.typeck_results,
             s: FxHasher::default(),
             path_check: PathCheck::default(),
         }
@@ -1652,6 +1649,10 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
             },
             TyKind::UnsafeBinder(binder) => {
                 self.hash_ty(binder.inner_ty);
+            },
+            TyKind::View(ty, _) => {
+                self.hash_ty(ty);
+                // FIXME(scrabsha): probably hash the fields as well?
             },
             TyKind::Err(_)
             | TyKind::Infer(())

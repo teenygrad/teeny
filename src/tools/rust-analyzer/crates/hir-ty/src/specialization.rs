@@ -1,9 +1,6 @@
 //! Impl specialization related things
 
-use hir_def::{
-    ExpressionStoreOwnerId, GenericDefId, HasModule, ImplId, signatures::ImplSignature,
-    unstable_features::UnstableFeatures,
-};
+use hir_def::{HasModule, ImplId, signatures::ImplSignature, unstable_features::UnstableFeatures};
 use tracing::debug;
 
 use crate::{
@@ -42,15 +39,13 @@ fn specializes_query_cycle(
 /// `parent_impl_def_id` is a const impl (conditionally based off of some `[const]`
 /// bounds), then `specializing_impl_def_id` must also be const for the same
 /// set of types.
-#[salsa::tracked(cycle_result = specializes_query_cycle)]
+#[salsa::tracked(cycle_result = specializes_query_cycle, returns(copy))]
 fn specializes_query(
     db: &dyn HirDatabase,
     specializing_impl_def_id: ImplId,
     parent_impl_def_id: ImplId,
 ) -> bool {
-    let trait_env = db.trait_environment(ExpressionStoreOwnerId::from(GenericDefId::from(
-        specializing_impl_def_id,
-    )));
+    let trait_env = db.trait_environment(specializing_impl_def_id.into());
     let interner = DbInterner::new_with(db, specializing_impl_def_id.krate(db));
 
     let specializing_impl_signature = ImplSignature::of(db, specializing_impl_def_id);

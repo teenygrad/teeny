@@ -1,17 +1,17 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::res::MaybeResPath;
-use clippy_utils::source::SpanRangeExt;
+use clippy_utils::res::MaybeResPath as _;
+use clippy_utils::source::SpanExt as _;
 use clippy_utils::{SpanlessEq, fulfill_or_allowed, hash_expr, is_lint_allowed, search_same};
 use core::cmp::Ordering;
 use core::{iter, slice};
-use itertools::Itertools;
+use itertools::Itertools as _;
 use rustc_arena::DroplessArena;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::def_id::DefId;
 use rustc_hir::{Arm, Expr, HirId, HirIdMap, HirIdMapEntry, HirIdSet, Pat, PatExpr, PatExprKind, PatKind, RangeEnd};
 use rustc_lint::builtin::NON_EXHAUSTIVE_OMITTED_PATTERNS;
-use rustc_lint::{LateContext, LintContext};
+use rustc_lint::{LateContext, LintContext as _};
 use rustc_middle::ty::{self, TypeckResults};
 use rustc_span::{ByteSymbol, ErrorGuaranteed, Span, Symbol, SyntaxContext};
 
@@ -152,7 +152,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
                     if let Some(((_, dest), src)) = split
                         && let Some(pat_snippets) = group
                             .iter()
-                            .map(|(_, arm)| arm.pat.span.get_source_text(cx))
+                            .map(|(_, arm)| arm.pat.span.get_text(cx))
                             .collect::<Option<Vec<_>>>()
                     {
                         let suggs = src

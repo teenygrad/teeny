@@ -120,6 +120,7 @@ pub struct DefaultEmpty<'db> {
     pub clauses: Clauses<'db>,
     pub region_assumptions: RegionAssumptions<'db>,
     pub consts: Consts<'db>,
+    pub projection: crate::mir::Projection<'db>,
 }
 
 pub struct DefaultAny<'db> {
@@ -142,7 +143,7 @@ impl std::fmt::Debug for DefaultAny<'_> {
 }
 
 #[inline]
-pub fn default_types<'a, 'db>(db: &'db dyn HirDatabase) -> &'a DefaultAny<'db> {
+pub fn default_types<'db>(db: &'db dyn HirDatabase) -> &'db DefaultAny<'db> {
     static TYPES: OnceLock<DefaultAny<'static>> = OnceLock::new();
 
     let interner = DbInterner::new_no_crate(db);
@@ -237,6 +238,12 @@ pub fn default_types<'a, 'db>(db: &'db dyn HirDatabase) -> &'a DefaultAny<'db> {
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
+        let create_projection = |slice| {
+            let it = crate::mir::Projection::new_from_slice(slice);
+            // We need to increase the refcount (forever), so that the types won't be freed.
+            let it = ManuallyDrop::new(it.store());
+            it.as_ref()
+        };
 
         let str = create_ty(TyKind::Str);
         let statik = create_region(RegionKind::ReStatic);
@@ -303,6 +310,7 @@ pub fn default_types<'a, 'db>(db: &'db dyn HirDatabase) -> &'a DefaultAny<'db> {
                 clauses: create_clauses(&[]),
                 region_assumptions: create_region_assumptions(&[]),
                 consts: create_consts(&[]),
+                projection: create_projection(&[]),
             },
             one_invariant: create_variances_of(&[rustc_type_ir::Variance::Invariant]),
             one_covariant: create_variances_of(&[rustc_type_ir::Variance::Covariant]),

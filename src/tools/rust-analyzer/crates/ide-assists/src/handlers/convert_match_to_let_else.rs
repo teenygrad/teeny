@@ -93,7 +93,7 @@ fn find_arms(
     let mut extracting = None;
     let mut diverging = None;
     for arm in arms {
-        if ctx.sema.type_of_expr(&arm.expr()?)?.original().is_never() {
+        if ctx.sema.expr_is_diverging(&arm.expr()?) {
             diverging = Some(arm);
         } else {
             extracting = Some(arm);
@@ -148,8 +148,7 @@ fn rename_variable(pat: &ast::Pat, extracted: &[Name], binding: ast::Pat) -> Syn
             if let Some(name_ref) = record_pat_field.field_name() {
                 editor.replace(
                     record_pat_field.syntax(),
-                    make.record_pat_field(make.name_ref(&name_ref.text()), binding.clone())
-                        .syntax(),
+                    make.record_pat_field(make.name_ref(name_ref.text()), binding.clone()).syntax(),
                 );
             }
         } else {

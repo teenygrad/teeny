@@ -17,7 +17,7 @@ use smallvec::SmallVec;
 use tracing::{debug, instrument};
 
 use super::{HirTyLowerer, IsMethodCall};
-use crate::errors::wrong_number_of_generic_args::{GenericArgsInfo, WrongNumberOfGenericArgs};
+use crate::diagnostics::wrong_number_of_generic_args::{GenericArgsInfo, WrongNumberOfGenericArgs};
 use crate::hir_ty_lowering::errors::prohibit_assoc_item_constraint;
 use crate::hir_ty_lowering::{
     ExplicitLateBound, GenericArgCountMismatch, GenericArgCountResult, GenericArgPosition,
@@ -254,7 +254,11 @@ pub fn lower_generic_args<'tcx: 'a, 'a>(
                     match (arg, &param.kind, arg_count.explicit_late_bound) {
                         (GenericArg::Lifetime(_), GenericParamDefKind::Lifetime, _)
                         | (
-                            GenericArg::Type(_) | GenericArg::Infer(_),
+                            GenericArg::Type(_)
+                            | GenericArg::Infer(hir::InferArg {
+                                kind: hir::InferArgKind::TypeOrConst,
+                                ..
+                            }),
                             GenericParamDefKind::Type { .. },
                             _,
                         )
@@ -411,6 +415,22 @@ pub(crate) fn check_generic_arg_count(
     let gen_args = seg.args();
     let default_counts = gen_params.own_defaults();
     let param_counts = gen_params.own_counts();
+    // If we have any `Vec<foo: Bar>` constraint, where `Bar` is unresolved, the user likely meant
+    // to write `Vec<foo::Bar>`, so we silence the incorrect number of generics error.
+    let has_invalid_bound = match seg.args {
+        Some(args) => args.constraints.iter().any(|c| {
+            if let hir::AssocItemConstraintKind::Bound {
+                bounds: [hir::GenericBound::Trait(poly_trait_ref)],
+            } = c.kind
+                && let Res::Err = poly_trait_ref.trait_ref.path.res
+            {
+                true
+            } else {
+                false
+            }
+        }),
+        None => false,
+    };
 
     // Subtracting from param count to ensure type params synthesized from `impl Trait`
     // cannot be explicitly specified.
@@ -422,7 +442,7 @@ pub(crate) fn check_generic_arg_count(
     let named_type_param_count = param_counts.types - has_self as usize - synth_type_param_count;
     let named_const_param_count = param_counts.consts;
     let infer_lifetimes =
-        (gen_pos != GenericArgPosition::Type || seg.infer_args) && !gen_args.has_lifetime_params();
+        (gen_pos != GenericArgPosition::Type || seg.infer_args) && !gen_args.has_lifetime_args();
 
     if gen_pos != GenericArgPosition::Type
         && let Some(c) = gen_args.constraints.first()
@@ -430,8 +450,14 @@ pub(crate) fn check_generic_arg_count(
         prohibit_assoc_item_constraint(cx, c, None);
     }
 
-    let explicit_late_bound =
-        prohibit_explicit_late_bound_lifetimes(cx, gen_params, gen_args, gen_pos);
+    let tcx = cx.tcx();
+
+    // Suppress this warning for delegations as it is compiler generated and lifetimes are
+    // propagated while late-bound lifetimes may be present.
+    let explicit_late_bound = match seg.delegation_child_segment {
+        true => ExplicitLateBound::No,
+        false => prohibit_explicit_late_bound_lifetimes(cx, gen_params, gen_args, gen_pos),
+    };
 
     let mut invalid_args = vec![];
 
@@ -458,7 +484,7 @@ pub(crate) fn check_generic_arg_count(
         };
 
         let reported = cx.dcx().emit_err(WrongNumberOfGenericArgs::new(
-            cx.tcx(),
+            tcx,
             gen_args_info,
             seg,
             gen_params,
@@ -472,7 +498,7 @@ pub(crate) fn check_generic_arg_count(
 
     let min_expected_lifetime_args = if infer_lifetimes { 0 } else { param_counts.lifetimes };
     let max_expected_lifetime_args = param_counts.lifetimes;
-    let num_provided_lifetime_args = gen_args.num_lifetime_params();
+    let num_provided_lifetime_args = gen_args.num_lifetime_args();
 
     let lifetimes_correct = check_lifetime_args(
         min_expected_lifetime_args,
@@ -536,20 +562,19 @@ pub(crate) fn check_generic_arg_count(
                     .map(|param| param.name)
                     .collect();
                 if constraint_names == param_names {
-                    let has_assoc_ty_with_same_name =
-                        if let DefKind::Trait = cx.tcx().def_kind(def_id) {
-                            gen_args.constraints.iter().any(|constraint| {
-                                traits::supertrait_def_ids(cx.tcx(), def_id).any(|trait_did| {
-                                    cx.probe_trait_that_defines_assoc_item(
-                                        trait_did,
-                                        ty::AssocTag::Type,
-                                        constraint.ident,
-                                    )
-                                })
+                    let has_assoc_ty_with_same_name = if let DefKind::Trait = tcx.def_kind(def_id) {
+                        gen_args.constraints.iter().any(|constraint| {
+                            traits::supertrait_def_ids(tcx, def_id).any(|trait_did| {
+                                cx.probe_trait_that_defines_assoc_item(
+                                    trait_did,
+                                    ty::AssocTag::Type,
+                                    constraint.ident,
+                                )
                             })
-                        } else {
-                            false
-                        };
+                        })
+                    } else {
+                        false
+                    };
                     // We set this to true and delay emitting `WrongNumberOfGenericArgs`
                     // to provide a succinct error for cases like issue #113073,
                     // but only if when we don't have any assoc type with the same name with a
@@ -573,7 +598,7 @@ pub(crate) fn check_generic_arg_count(
         let reported = gen_args.has_err().unwrap_or_else(|| {
             cx.dcx()
                 .create_err(WrongNumberOfGenericArgs::new(
-                    cx.tcx(),
+                    tcx,
                     gen_args_info,
                     seg,
                     gen_params,
@@ -581,7 +606,7 @@ pub(crate) fn check_generic_arg_count(
                     gen_args,
                     def_id,
                 ))
-                .emit_unless_delay(all_params_are_binded)
+                .emit_unless_delay(all_params_are_binded || has_invalid_bound)
         });
 
         Err(reported)
@@ -596,7 +621,7 @@ pub(crate) fn check_generic_arg_count(
                 - default_counts.consts
         };
         debug!(?expected_min);
-        debug!(arg_counts.lifetimes=?gen_args.num_lifetime_params());
+        debug!(arg_counts.lifetimes=?gen_args.num_lifetime_args());
 
         let provided = gen_args.num_generic_params();
 
@@ -606,7 +631,7 @@ pub(crate) fn check_generic_arg_count(
             named_const_param_count + named_type_param_count + synth_type_param_count,
             provided,
             param_counts.lifetimes + has_self as usize,
-            gen_args.num_lifetime_params(),
+            gen_args.num_lifetime_args(),
         )
     };
 
@@ -640,7 +665,7 @@ pub(crate) fn prohibit_explicit_late_bound_lifetimes(
     let param_counts = def.own_counts();
 
     if let Some(span_late) = def.has_late_bound_regions
-        && args.has_lifetime_params()
+        && args.has_lifetime_args()
     {
         let msg = "cannot specify lifetime arguments explicitly \
                        if late bound lifetime parameters are present";
@@ -648,7 +673,7 @@ pub(crate) fn prohibit_explicit_late_bound_lifetimes(
         let span = args.args[0].span();
 
         if position == GenericArgPosition::Value(IsMethodCall::No)
-            && args.num_lifetime_params() != param_counts.lifetimes
+            && args.num_lifetime_args() != param_counts.lifetimes
         {
             struct_span_code_err!(cx.dcx(), span, E0794, "{}", msg)
                 .with_span_note(span_late, note)

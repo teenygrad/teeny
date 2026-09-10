@@ -64,7 +64,7 @@ impl TcpStream {
         self.inner.read(buf, self.read_timeout()?)
     }
 
-    pub fn read_buf(&self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         crate::io::default_read_buf(|buf| self.read(buf), cursor)
     }
 
@@ -147,7 +147,8 @@ impl TcpStream {
 
 impl fmt::Debug for TcpStream {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        // FIXME(implement this)
+        unimplemented!()
     }
 }
 
@@ -206,7 +207,8 @@ impl TcpListener {
 
 impl fmt::Debug for TcpListener {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        // FIXME(implement this)
+        unimplemented!()
     }
 }
 

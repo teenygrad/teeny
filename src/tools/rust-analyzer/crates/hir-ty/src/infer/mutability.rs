@@ -13,7 +13,7 @@ use crate::{
     lower::lower_mutability,
 };
 
-impl<'db> InferenceContext<'_, 'db> {
+impl<'db> InferenceContext<'db> {
     pub(crate) fn infer_mut_body(&mut self, body_expr: ExprId) {
         self.infer_mut_expr(body_expr, Mutability::Not);
     }
@@ -159,8 +159,7 @@ impl<'db> InferenceContext<'_, 'db> {
             | Expr::Range { lhs: Some(expr), rhs: None, range_type: _ }
             | Expr::Range { rhs: Some(expr), lhs: None, range_type: _ }
             | Expr::Await { expr }
-            | Expr::Box { expr }
-            | Expr::Loop { body: expr, label: _ }
+            | Expr::Loop { body: expr, label: _, source: _ }
             | Expr::Cast { expr, type_ref: _ } => {
                 self.infer_mut_expr(*expr, Mutability::Not);
             }
@@ -197,7 +196,8 @@ impl<'db> InferenceContext<'_, 'db> {
             | Expr::Literal(_)
             | Expr::Path(_)
             | Expr::Continue { .. }
-            | Expr::Underscore => (),
+            | Expr::Underscore
+            | Expr::IncludeBytes => (),
         }
     }
 

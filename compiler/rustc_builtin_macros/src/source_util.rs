@@ -9,7 +9,7 @@ use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::{join_path_idents, token};
 use rustc_ast_pretty::pprust;
 use rustc_expand::base::{
-    DummyResult, ExpandResult, ExtCtxt, MacEager, MacResult, MacroExpanderResult, resolve_path,
+    DummyResult, ExpandResult, ExtCtxt, MacEager, MacResult, MacroExpanderResult,
 };
 use rustc_expand::module::DirOwnership;
 use rustc_parse::lexer::StripTokens;
@@ -21,7 +21,7 @@ use rustc_span::source_map::SourceMap;
 use rustc_span::{ByteSymbol, Pos, Span, Symbol};
 use smallvec::SmallVec;
 
-use crate::errors;
+use crate::diagnostics;
 use crate::util::{
     check_zero_tts, get_single_str_from_tts, get_single_str_spanned_from_tts, parse_expr,
 };
@@ -117,7 +117,7 @@ pub(crate) fn expand_include<'cx>(
         Err(guar) => return ExpandResult::Ready(DummyResult::any(sp, guar)),
     };
     // The file will be added to the code map by the parser
-    let path = match resolve_path(&cx.sess, path.as_str(), sp) {
+    let path = match cx.sess.resolve_path(path.as_str(), sp) {
         Ok(path) => path,
         Err(err) => {
             let guar = err.emit();
@@ -153,7 +153,7 @@ pub(crate) fn expand_include<'cx>(
                     INCOMPLETE_INCLUDE,
                     p.token.span,
                     self.node_id,
-                    errors::IncompleteInclude,
+                    diagnostics::IncompleteInclude,
                 );
             }
             Some(expr)
@@ -176,7 +176,7 @@ pub(crate) fn expand_include<'cx>(
                     Ok(Some(item)) => ret.push(item),
                     Ok(None) => {
                         if p.token != token::Eof {
-                            p.dcx().emit_err(errors::ExpectedItem {
+                            p.dcx().emit_err(diagnostics::ExpectedItem {
                                 span: p.token.span,
                                 token: &pprust::token_to_string(&p.token),
                             });
@@ -267,7 +267,7 @@ fn load_binary_file(
     macro_span: Span,
     path_span: Span,
 ) -> Result<(Arc<[u8]>, Span), Box<dyn MacResult>> {
-    let resolved_path = match resolve_path(&cx.sess, original_path, macro_span) {
+    let resolved_path = match cx.sess.resolve_path(original_path, macro_span) {
         Ok(path) => path,
         Err(err) => {
             let guar = err.emit();

@@ -66,7 +66,6 @@ macro_rules! trace_io {
     }
 }
 
-#[cfg(feature = "tracing")]
 pub fn format_location(location: std::panic::Location<'static>) -> String {
     format!("{}:{}", location.file(), location.line())
 }
@@ -118,7 +117,7 @@ mod inner {
     use tracing_subscriber::{EnvFilter, Layer};
 
     use super::{COMMAND_SPAN_TARGET, IO_SPAN_TARGET};
-    use crate::STEP_SPAN_TARGET;
+    use crate::core::builder::STEP_SPAN_TARGET;
 
     pub fn setup_tracing(env_name: &str) -> TracingGuard {
         let filter = EnvFilter::from_env(env_name);
@@ -351,7 +350,7 @@ mod inner {
                         let field = &values.fields[0];
                         write!(writer, " {{{}}}", field.1)?;
                     }
-                    write_location(writer, span.metadata())?;
+                    write_with_location(writer)?;
                 }
                 // Executed command
                 COMMAND_SPAN_TARGET => {

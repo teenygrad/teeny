@@ -96,7 +96,13 @@ enum GroupedMoveError<'tcx> {
     },
 }
 
-impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
+struct PatternBindingInfo {
+    pat_span: Span,
+    binding_spans: Vec<Span>,
+    has_mutable_by_value_binding: bool,
+}
+
+impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
     pub(crate) fn report_move_errors(&mut self) {
         let grouped_errors = self.group_move_errors();
         for error in grouped_errors {
@@ -304,7 +310,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
             && self.infcx.tcx.ensure_result().coherent_trait(copy_def_id).is_err()
     }
 
-    fn report_cannot_move_from_static(&mut self, place: Place<'tcx>, span: Span) -> Diag<'infcx> {
+    fn report_cannot_move_from_static(&mut self, place: Place<'tcx>, span: Span) -> Diag<'diag> {
         let description = if place.projection.len() == 1 {
             format!("static item {}", self.describe_any_place(place.as_ref()))
         } else {
@@ -433,7 +439,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         deref_target_place: Place<'tcx>,
         span: Span,
         use_spans: Option<UseSpans<'tcx>>,
-    ) -> (Diag<'infcx>, CloneSuggestion) {
+    ) -> (Diag<'diag>, CloneSuggestion) {
         let tcx = self.infcx.tcx;
         // Inspect the type of the content behind the
         // borrow to provide feedback about why this
@@ -567,7 +573,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         closure_kind_ty: Ty<'tcx>,
         upvar_field: FieldIdx,
         asyncness: ty::Asyncness,
-    ) -> Diag<'infcx> {
+    ) -> Diag<'diag> {
         let tcx = self.infcx.tcx;
 
         let closure_kind = match closure_kind_ty.to_opt_closure_kind() {
@@ -637,26 +643,26 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         let closure_hir_id = tcx.local_def_id_to_hir_id(def_id.expect_local());
         let hir::Node::Expr(parent) = tcx.parent_hir_node(closure_hir_id) else { return None };
 
-        let predicates = match parent.kind {
+        let gen_clauses = match parent.kind {
             hir::ExprKind::Call(callee, _) => {
                 let ty = typeck_result.node_type_opt(callee.hir_id)?;
                 let ty::FnDef(fn_def_id, args) = *ty.kind() else { return None };
-                tcx.predicates_of(fn_def_id).instantiate(tcx, args)
+                tcx.clauses_of(fn_def_id).instantiate(tcx, args.no_bound_vars().unwrap())
             }
             hir::ExprKind::MethodCall(..) => {
                 let (_, method) = typeck_result.type_dependent_def(parent.hir_id)?;
                 let args = typeck_result.node_args(parent.hir_id);
-                tcx.predicates_of(method).instantiate(tcx, args)
+                tcx.clauses_of(method).instantiate(tcx, args)
             }
             _ => return None,
         };
 
         // Check whether one of the where-bounds requires the closure to impl `Fn[Mut]`
         // or `AsyncFn[Mut]`.
-        for (pred, span) in predicates.predicates.iter().zip(predicates.spans.iter()) {
-            let pred = pred.skip_norm_wip();
+        for (clause, span) in gen_clauses.clauses.iter().zip(gen_clauses.spans.iter()) {
+            let clause = clause.skip_norm_wip();
             let dominated_by_fn_trait = self
-                .closure_clause_kind(pred, def_id, asyncness)
+                .closure_clause_kind(clause, def_id, asyncness)
                 .is_some_and(|kind| matches!(kind, ty::ClosureKind::Fn | ty::ClosureKind::FnMut));
             if dominated_by_fn_trait {
                 // Found `<TyOfCapturingClosure as FnMut>` or
@@ -710,7 +716,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
             return CloneSuggestion::NotEmitted;
         };
 
-        if !errors.is_empty() {
+        if errors.has_errors() {
             return CloneSuggestion::NotEmitted;
         }
         let sugg = vec![
@@ -735,8 +741,11 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
     ) {
         match error {
             GroupedMoveError::MovesFromPlace { mut binds_to, move_from, .. } => {
-                self.add_borrow_suggestions(err, span, !binds_to.is_empty());
+                binds_to.sort();
+                binds_to.dedup();
+
                 if binds_to.is_empty() {
+                    self.add_borrow_suggestions(err, span, false);
                     let place_ty = move_from.ty(self.body, self.infcx.tcx).ty;
                     let place_desc = match self.describe_place(move_from.as_ref()) {
                         Some(desc) => format!("`{desc}`"),
@@ -754,16 +763,30 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                         span,
                     });
                 } else {
-                    binds_to.sort();
-                    binds_to.dedup();
-
-                    self.add_move_error_details(err, &binds_to, &[]);
+                    let binding_info = self.pattern_binding_info(&binds_to);
+                    let suggest_pattern_binding = binding_info.as_ref().is_some_and(|info| {
+                        self.should_suggest_pattern_binding_instead(span, info)
+                    });
+                    let desugar_spans = if suggest_pattern_binding {
+                        self.add_move_error_suggestions(err, &binds_to)
+                    } else {
+                        if self.should_suggest_borrow_instead(span, binding_info.as_ref()) {
+                            self.add_borrow_suggestions(err, span, true);
+                        }
+                        None
+                    };
+                    self.add_move_error_details(
+                        err,
+                        &binds_to,
+                        desugar_spans.as_deref().unwrap_or_default(),
+                    );
                 }
             }
             GroupedMoveError::MovesFromValue { mut binds_to, .. } => {
                 binds_to.sort();
                 binds_to.dedup();
-                let desugar_spans = self.add_move_error_suggestions(err, &binds_to);
+                let desugar_spans =
+                    self.add_move_error_suggestions(err, &binds_to).unwrap_or_default();
                 self.add_move_error_details(err, &binds_to, &desugar_spans);
             }
             // No binding. Nothing to suggest.
@@ -947,7 +970,102 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         }
     }
 
-    fn add_move_error_suggestions(&self, err: &mut Diag<'_>, binds_to: &[Local]) -> Vec<Span> {
+    fn should_suggest_pattern_binding_instead(
+        &self,
+        span: Span,
+        binding_info: &PatternBindingInfo,
+    ) -> bool {
+        let Some(expr) = self.find_expr(span) else {
+            return false;
+        };
+
+        let typeck_results = self.infcx.tcx.typeck(self.mir_def_id());
+        let projection_qualifies = match expr.kind {
+            hir::ExprKind::Field(base, ..) => {
+                !typeck_results.node_type_opt(base.hir_id).is_some_and(|base_ty| {
+                    binding_info.has_mutable_by_value_binding
+                        && matches!(base_ty.kind(), ty::Ref(_, _, hir::Mutability::Not))
+                })
+            }
+            hir::ExprKind::Index(base, ..) => typeck_results
+                .node_type_opt(base.hir_id)
+                .is_some_and(|base_ty| match base_ty.kind() {
+                    ty::Ref(_, _, hir::Mutability::Not) | ty::RawPtr(..) => false,
+                    ty::Ref(_, _, hir::Mutability::Mut) => {
+                        binding_info.has_mutable_by_value_binding
+                    }
+                    _ => true,
+                }),
+            _ => false,
+        };
+        if !projection_qualifies {
+            return false;
+        }
+
+        let is_single_binding = binding_info.binding_spans.len() == 1
+            && binding_info.binding_spans[0] == binding_info.pat_span;
+        !is_single_binding
+    }
+
+    fn should_suggest_borrow_instead(
+        &self,
+        span: Span,
+        binding_info: Option<&PatternBindingInfo>,
+    ) -> bool {
+        if !binding_info.is_some_and(|info| info.has_mutable_by_value_binding) {
+            return true;
+        }
+
+        let Some(expr) = self.find_expr(span) else {
+            return true;
+        };
+
+        let Some(base) = (match expr.kind {
+            hir::ExprKind::Field(base, _) | hir::ExprKind::Index(base, ..) => Some(base),
+            _ => None,
+        }) else {
+            return true;
+        };
+
+        !self
+            .infcx
+            .tcx
+            .typeck(self.mir_def_id())
+            .node_type_opt(base.hir_id)
+            .is_some_and(|base_ty| matches!(base_ty.kind(), ty::Ref(_, _, hir::Mutability::Not)))
+    }
+
+    fn pattern_binding_info(&self, binds_to: &[Local]) -> Option<PatternBindingInfo> {
+        let mut pat_span = None;
+        let mut binding_spans = Vec::new();
+        let mut has_mutable_by_value_binding = false;
+        for local in binds_to {
+            let bind_to = &self.body.local_decls[*local];
+            if let LocalInfo::User(BindingForm::Var(VarBindingForm {
+                pat_span: pat_sp,
+                binding_mode,
+                ..
+            })) = *bind_to.local_info()
+            {
+                pat_span = Some(pat_sp);
+                binding_spans.push(bind_to.source_info.span);
+                has_mutable_by_value_binding |=
+                    matches!(binding_mode, hir::BindingMode(hir::ByRef::No, hir::Mutability::Mut));
+            }
+        }
+
+        Some(PatternBindingInfo {
+            pat_span: pat_span?,
+            binding_spans,
+            has_mutable_by_value_binding,
+        })
+    }
+
+    fn add_move_error_suggestions(
+        &self,
+        err: &mut Diag<'_>,
+        binds_to: &[Local],
+    ) -> Option<Vec<Span>> {
         /// A HIR visitor to associate each binding with a `&` or `&mut` that could be removed to
         /// make it bind by reference instead (if possible)
         struct BindingFinder<'tcx> {
@@ -1050,27 +1168,20 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                 self.has_adjustments = parent_has_adjustments;
             }
         }
-        let mut pat_span = None;
-        let mut binding_spans = Vec::new();
-        for local in binds_to {
-            let bind_to = &self.body.local_decls[*local];
-            if let LocalInfo::User(BindingForm::Var(VarBindingForm { pat_span: pat_sp, .. })) =
-                *bind_to.local_info()
-            {
-                pat_span = Some(pat_sp);
-                binding_spans.push(bind_to.source_info.span);
-            }
-        }
-        let Some(pat_span) = pat_span else { return Vec::new() };
+        let Some(binding_info) = self.pattern_binding_info(binds_to) else {
+            return None;
+        };
 
         let tcx = self.infcx.tcx;
-        let Some(body) = tcx.hir_maybe_body_owned_by(self.mir_def_id()) else { return Vec::new() };
+        let Some(body) = tcx.hir_maybe_body_owned_by(self.mir_def_id()) else {
+            return None;
+        };
         let typeck_results = self.infcx.tcx.typeck(self.mir_def_id());
         let mut finder = BindingFinder {
             typeck_results,
             tcx,
-            pat_span,
-            binding_spans,
+            pat_span: binding_info.pat_span,
+            binding_spans: binding_info.binding_spans,
             found_pat: false,
             ref_pat: None,
             has_adjustments: false,
@@ -1101,7 +1212,8 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         for (span, msg, suggestion) in suggestions {
             err.span_suggestion_verbose(span, msg, suggestion, Applicability::MachineApplicable);
         }
-        finder.desugar_binding_spans
+
+        Some(finder.desugar_binding_spans)
     }
 
     fn add_move_error_details(
@@ -1131,6 +1243,9 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                 }
             } else if j == 0 {
                 err.span_label(binding_span, "data moved here");
+            } else if j == 5 && binds_to.len() > 6 && !self.infcx.tcx.sess.opts.verbose {
+                err.note(format!("...and {} other places", binds_to.len() - 5));
+                break;
             } else {
                 err.span_label(binding_span, "...and here");
             }

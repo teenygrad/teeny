@@ -26,6 +26,7 @@
 #![feature(min_specialization)]
 #![feature(negative_impls)]
 #![feature(never_type)]
+#![feature(nonzero_internals)]
 #![feature(pattern_type_macro)]
 #![feature(pattern_types)]
 #![feature(ptr_alignment_type)]
@@ -48,10 +49,10 @@ pub use ena::{snapshot_vec, undo_log, unify};
 // (via `ShardedHashMap`), and because it lets other compiler crates use the
 // lower-level `HashTable` API without a tricky `hashbrown` dependency.
 pub use hashbrown::hash_table;
+pub use limit::Limit;
 pub use rustc_index::static_assert_size;
 // Re-export some data-structure crates which are part of our public API.
 pub use {either, indexmap, smallvec, thin_vec};
-
 pub mod aligned;
 pub mod base_n;
 pub mod binary_search_util;
@@ -63,19 +64,20 @@ pub mod fx;
 pub mod graph;
 pub mod intern;
 pub mod jobserver;
+mod limit;
 pub mod marker;
 pub mod memmap;
 pub mod obligation_forest;
 pub mod owned_slice;
 pub mod packed;
 pub mod profiling;
+pub mod range_set;
 pub mod sharded;
 pub mod small_c_str;
 pub mod snapshot_map;
 pub mod sorted_map;
 pub mod sso;
 pub mod stable_hash;
-pub mod stack;
 pub mod steal;
 pub mod svh;
 pub mod sync;
@@ -87,7 +89,6 @@ pub mod unhash;
 pub mod union_find;
 pub mod unord;
 pub mod vec_cache;
-pub mod work_queue;
 
 mod atomic_ref;
 

@@ -461,7 +461,7 @@ impl<'db> ImportAssets<'db> {
         .into_iter()
     }
 
-    fn scope_definitions(&self, sema: &Semantics<'_, RootDatabase>) -> FxHashSet<ScopeDef> {
+    fn scope_definitions<'a>(&self, sema: &Semantics<'a, RootDatabase>) -> FxHashSet<ScopeDef<'a>> {
         let _p = tracing::info_span!("ImportAssets::scope_definitions").entered();
         let mut scope_definitions = FxHashSet::default();
         if let Some(scope) = sema.scope(&self.candidate_node) {
@@ -814,13 +814,13 @@ fn trait_applicable_items<'db>(
         let mut deref_chain = trait_candidate.receiver_ty.autoderef(db).collect::<Vec<_>>();
         // As a last step, we can do array unsizing (that's the only unsizing that rustc does for method receivers!)
         if let Some((ty, _len)) = deref_chain.last().and_then(|ty| ty.as_array(db)) {
-            let slice = Type::new_slice(ty);
+            let slice = Type::new_slice(db, ty);
             deref_chain.push(slice);
         }
         deref_chain
             .into_iter()
             .flat_map(|ty| {
-                let fingerprint = ty.fingerprint_for_trait_impl()?;
+                let fingerprint = ty.fingerprint_for_trait_impl(db)?;
                 let mut crates = vec![];
 
                 if let Some(adt) = ty.as_adt() {
@@ -979,7 +979,7 @@ impl<'db> ImportCandidate<'db> {
             return None;
         }
         let after = std::iter::successors(path.parent_path(), |it| it.parent_path())
-            .map(|seg| seg.segment()?.name_ref().map(|name| Name::new_root(&name.text())))
+            .map(|seg| seg.segment()?.name_ref().map(|name| Name::new_root(name.text())))
             .collect::<Option<_>>()?;
         path_import_candidate(
             sema,
@@ -993,7 +993,7 @@ impl<'db> ImportCandidate<'db> {
     fn for_name(sema: &Semantics<'db, RootDatabase>, name: &ast::Name) -> Option<Self> {
         if sema
             .scope(name.syntax())?
-            .speculative_resolve(&make::ext::ident_path(&name.text()))
+            .speculative_resolve(&make::ext::ident_path(name.text()))
             .is_some()
         {
             return None;
@@ -1033,7 +1033,7 @@ fn path_import_candidate<'db>(
                 if qualifier.first_qualifier().is_none_or(|it| sema.resolve_path(&it).is_none()) {
                     let qualifier = qualifier
                         .segments()
-                        .map(|seg| seg.name_ref().map(|name| Name::new_root(&name.text())))
+                        .map(|seg| seg.name_ref().map(|name| Name::new_root(name.text())))
                         .collect::<Option<Vec<_>>>()?;
                     ImportCandidate::Path(PathImportCandidate {
                         qualifier,

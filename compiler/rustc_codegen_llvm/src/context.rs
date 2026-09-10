@@ -8,27 +8,26 @@ use std::str;
 use rustc_abi::{HasDataLayout, Size, TargetDataLayout, VariantIdx};
 use rustc_codegen_ssa::back::versioned_llvm_target;
 use rustc_codegen_ssa::base::{wants_msvc_seh, wants_wasm_eh};
-use rustc_codegen_ssa::errors as ssa_errors;
+use rustc_codegen_ssa::diagnostics as ssa_errors;
 use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::base_n::{ALPHANUMERIC_ONLY, ToBaseN};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_hir::def_id::DefId;
-use rustc_middle::middle::codegen_fn_attrs::PatchableFunctionEntry;
 use rustc_middle::mono::CodegenUnit;
 use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOfHelpers, FnAbiRequest, HasTypingEnv, LayoutError, LayoutOfHelpers,
 };
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
 use rustc_middle::{bug, span_bug};
-use rustc_session::Session;
 use rustc_session::config::{
     BranchProtection, CFGuard, CFProtection, CrateType, DebugInfo, FunctionReturn, PAuthKey, PacRet,
 };
-use rustc_span::{DUMMY_SP, Span, Spanned, Symbol};
-use rustc_symbol_mangling::mangle_internal_symbol;
+use rustc_session::{PointerAuthSchema, Session};
+use rustc_span::{DUMMY_SP, Span, Spanned, Symbol, sym};
 use rustc_target::spec::{
-    Arch, CfgAbi, Env, HasTargetSpec, Os, RelocModel, SmallDataThresholdSupport, Target, TlsModel,
+    Arch, CfgAbi, Env, FramePointer, HasTargetSpec, Os, RelocModel, SmallDataThresholdSupport,
+    Target, TlsModel,
 };
 use smallvec::SmallVec;
 
@@ -135,7 +134,6 @@ pub(crate) struct FullCx<'ll, 'tcx> {
     pub dbg_cx: Option<debuginfo::CodegenUnitDebugContext<'ll, 'tcx>>,
 
     eh_personality: Cell<Option<&'ll Value>>,
-    eh_catch_typeinfo: Cell<Option<&'ll Value>>,
     pub rust_try_fn: Cell<Option<(&'ll Type, &'ll Value)>>,
 
     intrinsics:
@@ -143,6 +141,9 @@ pub(crate) struct FullCx<'ll, 'tcx> {
 
     /// A counter that is used for generating local symbol names
     local_gen_sym_counter: Cell<usize>,
+
+    /// A counter that is used for generating global symbol names
+    global_gen_sym_counter: Cell<usize>,
 
     /// `codegen_static` will sometimes create a second global variable with a
     /// different type and clear the symbol name of the original global.
@@ -202,6 +203,14 @@ pub(crate) unsafe fn create_module<'ll>(
         if sess.target.arch == Arch::PowerPC64 {
             // LLVM 22 updated the ABI alignment for double on AIX: https://github.com/llvm/llvm-project/pull/144673
             target_data_layout = target_data_layout.replace("-f64:32:64", "");
+
+            // LLVM 22 fixed the data layout calculation for targets that default to ELFv1
+            // when the ABI is set to ELFv2. With LLVM 21, the ELFv1 datalayout must be used,
+            // which will overalign function entries.
+            // https://github.com/llvm/llvm-project/pull/149725
+            if sess.target.llvm_target == "powerpc64-unknown-linux-gnu" {
+                target_data_layout = target_data_layout.replace("-Fn32", "-Fi64");
+            }
         }
         if sess.target.arch == Arch::AmdGpu {
             // LLVM 22 specified ELF mangling in the amdgpu data layout:
@@ -229,7 +238,7 @@ pub(crate) unsafe fn create_module<'ll>(
                 .expect("got a non-UTF8 data-layout from LLVM");
 
         if target_data_layout != llvm_data_layout {
-            tcx.dcx().emit_err(crate::errors::MismatchedDataLayout {
+            tcx.dcx().emit_err(crate::diagnostics::MismatchedDataLayout {
                 rustc_target: sess.opts.target_triple.to_string().as_str(),
                 rustc_layout: target_data_layout.as_str(),
                 llvm_target: sess.target.llvm_target.borrow(),
@@ -311,20 +320,38 @@ pub(crate) unsafe fn create_module<'ll>(
         );
     }
 
+    if sess.must_emit_unwind_tables() {
+        // This assertion checks that Max is the correct merge behavior.
+        // Async unwind tables are strictly more useful than sync uwtables.
+        const {
+            assert!((llvm::UWTableKind::None as u32) < (llvm::UWTableKind::Sync as u32));
+            assert!((llvm::UWTableKind::Sync as u32) < (llvm::UWTableKind::Async as u32));
+        }
+
+        llvm::add_module_flag_u32(
+            llmod,
+            llvm::ModuleFlagMergeBehavior::Max,
+            "uwtable",
+            match sess.opts.unstable_opts.use_sync_unwind {
+                Some(true) => llvm::UWTableKind::Sync as u32,
+                Some(false) | None => llvm::UWTableKind::Async as u32,
+            },
+        );
+    }
+
     // Add "kcfi" module flag if KCFI is enabled. (See https://reviews.llvm.org/D119296.)
     if sess.is_sanitizer_kcfi_enabled() {
         llvm::add_module_flag_u32(llmod, llvm::ModuleFlagMergeBehavior::Override, "kcfi", 1);
 
         // Add "kcfi-offset" module flag with -Z patchable-function-entry (See
         // https://reviews.llvm.org/D141172).
-        let pfe =
-            PatchableFunctionEntry::from_config(sess.opts.unstable_opts.patchable_function_entry);
-        if pfe.prefix() > 0 {
+        let patchable_prefix_nops = sess.opts.unstable_opts.patchable_function_entry.prefix();
+        if patchable_prefix_nops > 0 {
             llvm::add_module_flag_u32(
                 llmod,
                 llvm::ModuleFlagMergeBehavior::Override,
                 "kcfi-offset",
-                pfe.prefix().into(),
+                patchable_prefix_nops.into(),
             );
         }
 
@@ -378,8 +405,7 @@ pub(crate) unsafe fn create_module<'ll>(
         );
     }
 
-    if let Some(BranchProtection { bti, pac_ret, gcs }) = sess.opts.unstable_opts.branch_protection
-    {
+    if let Some(BranchProtection { bti, pac_ret, gcs }) = sess.branch_protection() {
         if sess.target.arch == Arch::AArch64 {
             llvm::add_module_flag_u32(
                 llmod,
@@ -393,7 +419,11 @@ pub(crate) unsafe fn create_module<'ll>(
                 "sign-return-address",
                 pac_ret.is_some().into(),
             );
-            let pac_opts = pac_ret.unwrap_or(PacRet { leaf: false, pc: false, key: PAuthKey::A });
+            let pac_opts = pac_ret.unwrap_or_else(|| {
+                // Windows on Arm only supports PAC key B.
+                let key = if sess.target.os == Os::Windows { PAuthKey::B } else { PAuthKey::A };
+                PacRet { leaf: false, pc: false, key }
+            });
             llvm::add_module_flag_u32(
                 llmod,
                 llvm::ModuleFlagMergeBehavior::Min,
@@ -468,6 +498,20 @@ pub(crate) unsafe fn create_module<'ll>(
                 1,
             );
         }
+    }
+
+    let fp = attributes::frame_pointer(sess);
+    if fp != FramePointer::MayOmit {
+        llvm::add_module_flag_u32(
+            llmod,
+            llvm::ModuleFlagMergeBehavior::Max,
+            "frame-pointer",
+            match fp {
+                FramePointer::Always => llvm::FramePointerKind::All as u32,
+                FramePointer::NonLeaf => llvm::FramePointerKind::NonLeaf as u32,
+                FramePointer::MayOmit => llvm::FramePointerKind::None as u32,
+            },
+        );
     }
 
     if sess.opts.unstable_opts.indirect_branch_cs_prefix {
@@ -607,7 +651,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
             tcx.sess.instrument_coverage().then(coverageinfo::CguCoverageContext::new);
 
         let dbg_cx = if tcx.sess.opts.debuginfo != DebugInfo::None {
-            let dctx = debuginfo::CodegenUnitDebugContext::new(llmod);
+            let dctx = debuginfo::CodegenUnitDebugContext::new(llmod, tcx.sess);
             debuginfo::metadata::build_compile_unit_di_node(
                 tcx,
                 codegen_unit.name().as_str(),
@@ -638,10 +682,10 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
                 coverage_cx,
                 dbg_cx,
                 eh_personality: Cell::new(None),
-                eh_catch_typeinfo: Cell::new(None),
                 rust_try_fn: Cell::new(None),
                 intrinsics: Default::default(),
                 local_gen_sym_counter: Cell::new(0),
+                global_gen_sym_counter: Cell::new(0),
                 renamed_statics: Default::default(),
                 objc_class_t: Cell::new(None),
                 objc_classrefs: Default::default(),
@@ -686,6 +730,47 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
             // (a.k.a the "non-fragile ABI").
             2
         }
+    }
+
+    pub(crate) fn add_ptrauth_elf_got_flag(&self) {
+        llvm::add_module_flag_u32(
+            self.llmod,
+            llvm::ModuleFlagMergeBehavior::Error,
+            "ptrauth-elf-got",
+            1,
+        );
+    }
+
+    pub(crate) fn add_ptrauth_sign_personality_flag(&self) {
+        llvm::add_module_flag_u32(
+            self.llmod,
+            llvm::ModuleFlagMergeBehavior::Error,
+            "ptrauth-sign-personality",
+            1,
+        );
+    }
+
+    pub(crate) fn add_ptrauth_pauthabi_version_and_platform_flags(
+        &self,
+        aarch64_elf_pauthabi_version: u32,
+    ) {
+        // NOTE: This must correspond to llvm's AARCH64_PAUTH_PLATFORM_LLVM_LINUX, as defined in
+        // <llvm_root>/llvm/include/llvm/BinaryFormat/ELF.h.
+        // FIXME (jchlanda) extend possible values once we start supporting other platforms (for
+        // example: AARCH64_PAUTH_PLATFORM_BAREMETAL = 0x1);
+        const AARCH64_PAUTH_PLATFORM_LLVM_LINUX: u32 = 0x10000002;
+        llvm::add_module_flag_u32(
+            self.llmod,
+            llvm::ModuleFlagMergeBehavior::Error,
+            "aarch64-elf-pauthabi-platform",
+            AARCH64_PAUTH_PLATFORM_LLVM_LINUX,
+        );
+        llvm::add_module_flag_u32(
+            self.llmod,
+            llvm::ModuleFlagMergeBehavior::Error,
+            "aarch64-elf-pauthabi-version",
+            aarch64_elf_pauthabi_version,
+        );
     }
 
     // We do our best here to match what Clang does when compiling Objective-C natively.
@@ -832,8 +917,28 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         get_fn(self, instance)
     }
 
-    fn get_fn_addr(&self, instance: Instance<'tcx>) -> &'ll Value {
-        get_fn(self, instance)
+    fn get_fn_addr(
+        &self,
+        instance: Instance<'tcx>,
+        pointer_auth_schema: Option<&PointerAuthSchema>,
+    ) -> &'ll Value {
+        // When pointer authentication metadata is provided, `get_fn_addr` will
+        // attempt to sign the pointer using LLVM's `ConstPtrAuth` constant
+        // expression.
+        //
+        // FIXME(jchlanda) Currently, all function addresses requested from
+        // within LLVM codegen are signed. This behavior is too broad, resulting
+        // in the logic being applied to function values, not just pointers
+        // (addresses).
+        //
+        // See the discussion in the rust-lang issue:
+        // <https://github.com/rust-lang/rust/issues/152532>, and comment in
+        // builder's `ptrauth_operand_bundle`.
+        let llfn = get_fn(self, instance);
+        match pointer_auth_schema {
+            Some(schema) => common::maybe_sign_fn_ptr(self, instance, llfn, schema),
+            None => llfn,
+        }
     }
 
     fn eh_personality(&self) -> &'ll Value {
@@ -875,13 +980,16 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
 
         let tcx = self.tcx;
         let llfn = match tcx.lang_items().eh_personality() {
-            Some(def_id) if name.is_none() => self.get_fn_addr(ty::Instance::expect_resolve(
-                tcx,
-                self.typing_env(),
-                def_id,
-                ty::List::empty(),
-                DUMMY_SP,
-            )),
+            Some(def_id) if name.is_none() => self.get_fn_addr(
+                ty::Instance::expect_resolve(
+                    tcx,
+                    self.typing_env(),
+                    def_id,
+                    ty::List::empty(),
+                    DUMMY_SP,
+                ),
+                tcx.sess.pointer_authentication_functions(),
+            ),
             _ => {
                 let name = name.unwrap_or("rust_eh_personality");
                 if let Some(llfn) = self.get_declared_value(name) {
@@ -936,6 +1044,10 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
             // #[no_mangle] extern "C" fn main(..) {..}
             None
         }
+    }
+
+    fn intrinsic_call_expects_place_always(&self, name: Symbol) -> bool {
+        matches!(name, sym::black_box)
     }
 }
 
@@ -1001,23 +1113,6 @@ impl<'ll> CodegenCx<'ll, '_> {
             }
         }
     }
-
-    pub(crate) fn eh_catch_typeinfo(&self) -> &'ll Value {
-        if let Some(eh_catch_typeinfo) = self.eh_catch_typeinfo.get() {
-            return eh_catch_typeinfo;
-        }
-        let tcx = self.tcx;
-        assert!(self.sess().target.os == Os::Emscripten);
-        let eh_catch_typeinfo = match tcx.lang_items().eh_catch_typeinfo() {
-            Some(def_id) => self.get_static(def_id),
-            _ => {
-                let ty = self.type_struct(&[self.type_ptr(), self.type_ptr()], false);
-                self.declare_global(&mangle_internal_symbol(self.tcx, "rust_eh_catch_typeinfo"), ty)
-            }
-        };
-        self.eh_catch_typeinfo.set(Some(eh_catch_typeinfo));
-        eh_catch_typeinfo
-    }
 }
 
 impl CodegenCx<'_, '_> {
@@ -1028,6 +1123,20 @@ impl CodegenCx<'_, '_> {
         self.local_gen_sym_counter.set(idx + 1);
         // Include a '.' character, so there can be no accidental conflicts with
         // user defined names
+        let mut name = String::with_capacity(prefix.len() + 6);
+        name.push_str(prefix);
+        name.push('.');
+        name.push_str(&(idx as u64).to_base(ALPHANUMERIC_ONLY));
+        name
+    }
+
+    /// Generates a new global symbol name with the given prefix.
+    pub(crate) fn generate_global_symbol_name(&self) -> String {
+        let idx = self.global_gen_sym_counter.get();
+        self.global_gen_sym_counter.set(idx + 1);
+
+        let sym = self.codegen_unit.symbol_name();
+        let prefix = sym.as_str();
         let mut name = String::with_capacity(prefix.len() + 6);
         name.push_str(prefix);
         name.push('.');
@@ -1062,9 +1171,10 @@ impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
         instruction: &'ll Value,
         kind_id: MetadataKindId,
         md_list: &[&'ll Metadata],
-    ) {
+    ) -> &'ll Metadata {
         let md = self.md_node_in_context(md_list);
         self.set_metadata(instruction, kind_id, md);
+        md
     }
 
     /// Helper method for the sequence of calls:

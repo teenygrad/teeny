@@ -12,21 +12,20 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_errors::{Applicability, Diag, DiagArgValue, PResult, StashKey};
-use rustc_session::errors::ExprParenthesesNeeded;
 use rustc_span::{BytePos, ErrorGuaranteed, Ident, Span, Spanned, kw, respan, sym};
 use thin_vec::{ThinVec, thin_vec};
 
 use super::{ForceCollect, Parser, PathStyle, Restrictions, Trailing, UsePreAttrPos};
-use crate::errors::{
+use crate::diagnostics::{
     self, AmbiguousRangePattern, AtDotDotInStructPattern, AtInStructPattern,
     DotDotDotForRemainingFields, DotDotDotRangeToPatternNotAllowed, DotDotDotRestPattern,
     EnumPatternInsteadOfIdentifier, ExpectedBindingLeftOfAt, ExpectedCommaAfterPatternField,
-    GenericArgsInPatRequireTurbofishSyntax, InclusiveRangeExtraEquals, InclusiveRangeMatchArrow,
-    InclusiveRangeNoEnd, InvalidMutInPattern, ParenRangeSuggestion, PatternOnWrongSideOfAt,
-    RemoveLet, RepeatedMutInPattern, SwitchRefBoxOrder, TopLevelOrPatternNotAllowed,
-    TopLevelOrPatternNotAllowedSugg, TrailingVertNotAllowed, TrailingVertSuggestion,
-    UnexpectedExpressionInPattern, UnexpectedExpressionInPatternSugg, UnexpectedLifetimeInPattern,
-    UnexpectedParenInRangePat, UnexpectedParenInRangePatSugg,
+    ExprParenthesesNeeded, GenericArgsInPatRequireTurbofishSyntax, InclusiveRangeExtraEquals,
+    InclusiveRangeMatchArrow, InclusiveRangeNoEnd, InvalidMutInPattern, ParenRangeSuggestion,
+    PatternOnWrongSideOfAt, RemoveLet, RepeatedMutInPattern, SwitchRefBoxOrder,
+    TopLevelOrPatternNotAllowed, TopLevelOrPatternNotAllowedSugg, TrailingVertNotAllowed,
+    TrailingVertSuggestion, UnexpectedExpressionInPattern, UnexpectedExpressionInPatternSugg,
+    UnexpectedLifetimeInPattern, UnexpectedParenInRangePat, UnexpectedParenInRangePatSugg,
     UnexpectedVertVertBeforeFunctionParam, UnexpectedVertVertInPattern, WrapInParens,
 };
 use crate::parser::expr::{DestructuredFloat, could_be_unclosed_char_literal};
@@ -479,7 +478,7 @@ impl<'a> Parser<'a> {
         // Parse an associative expression such as `+ expr`, `% expr`, ...
         // Assignments, ranges and `|` are disabled by [`Restrictions::IS_PAT`].
         let Ok((expr, _)) = snapshot
-            .parse_expr_assoc_rest_with(Bound::Unbounded, false, expr)
+            .parse_expr_assoc_rest(Bound::Unbounded, false, expr)
             .map_err(|err| err.cancel())
         else {
             // We got a trailing method/operator, but that wasn't an expression.
@@ -497,18 +496,14 @@ impl<'a> Parser<'a> {
                 && self.look_ahead(1, Token::is_range_separator);
 
         let span = expr.span;
+        let mut diag = self.dcx().create_err(UnexpectedExpressionInPattern { span, is_bound });
+        // The unexpected expr's precedence. Not used directly in the error message, but
+        // needed for the stashing of this error to work correctly. We store a `u32` rather
+        // than an `ExprPrecedence` to avoid having to impl `IntoDiagArg` for
+        // `ExprPrecedence`.
+        diag.arg("expr_precedence", expr.precedence() as u32);
 
-        Some((
-            self.dcx()
-                .create_err(UnexpectedExpressionInPattern {
-                    span,
-                    is_bound,
-                    expr_precedence: expr.precedence() as u32,
-                })
-                .stash(span, StashKey::ExprInPat)
-                .unwrap(),
-            span,
-        ))
+        Some((diag.stash(span, StashKey::ExprInPat).unwrap(), span))
     }
 
     /// Called by [`Parser::parse_stmt_without_recovery`], used to add statement-aware subdiagnostics to the errors stashed
@@ -1478,7 +1473,7 @@ impl<'a> Parser<'a> {
 
         if self.isnt_pattern_start() {
             let descr = super::token_descr(&self.token);
-            self.dcx().emit_err(errors::BoxNotPat {
+            self.dcx().emit_err(diagnostics::BoxNotPat {
                 span: self.token.span,
                 kw: box_span,
                 lo: box_span.shrink_to_lo(),
@@ -1789,6 +1784,6 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn mk_pat(&self, span: Span, kind: PatKind) -> Pat {
-        Pat { kind, span, id: ast::DUMMY_NODE_ID, tokens: None }
+        Pat { kind, span, id: ast::DUMMY_NODE_ID }
     }
 }

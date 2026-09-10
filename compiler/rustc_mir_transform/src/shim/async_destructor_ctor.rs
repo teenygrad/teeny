@@ -1,5 +1,5 @@
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def_id::DefId;
-use rustc_hir::lang_items::LangItem;
 use rustc_hir::{CoroutineDesugaring, CoroutineKind, CoroutineSource};
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir::{
@@ -9,7 +9,10 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{self, EarlyBinder, Ty, TyCtxt, TypeVisitableExt};
 
 use super::*;
+use crate::deref_separator::deref_finder;
 use crate::patch::MirPatch;
+
+const SELF_ARG: Local = Local::arg(0);
 
 pub(super) fn build_async_destructor_ctor_shim<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -20,7 +23,8 @@ pub(super) fn build_async_destructor_ctor_shim<'tcx>(
     debug_assert_eq!(Some(def_id), tcx.lang_items().async_drop_in_place_fn());
     let generic_body = tcx.optimized_mir(def_id);
     let args = tcx.mk_args(&[ty.into()]);
-    let mut body = EarlyBinder::bind(generic_body.clone()).instantiate(tcx, args).skip_norm_wip();
+    let mut body =
+        EarlyBinder::bind(tcx, generic_body.clone()).instantiate(tcx, args).skip_norm_wip();
 
     // Minimal shim passes except MentionedItems,
     // it causes error "mentioned_items for DefId(...async_drop_in_place...) have already been set
@@ -33,18 +37,17 @@ pub(super) fn build_async_destructor_ctor_shim<'tcx>(
             &add_call_guards::CriticalCallEdges,
         ],
         None,
-        pm::Optimizations::Allowed,
     );
     body
 }
 
 // build_drop_shim analog for async drop glue (for generated coroutine poll function)
+#[tracing::instrument(level = "trace", skip(tcx), ret)]
 pub(super) fn build_async_drop_shim<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     ty: Ty<'tcx>,
 ) -> Body<'tcx> {
-    debug!("build_async_drop_shim(def_id={:?}, ty={:?})", def_id, ty);
     let ty::Coroutine(_, parent_args) = ty.kind() else {
         bug!();
     };
@@ -75,14 +78,17 @@ pub(super) fn build_async_drop_shim<'tcx>(
     let source_info = SourceInfo::outermost(span);
 
     // The first argument (index 0) which will be local 1 (after the return value).
-    let coroutine_layout = Place::from(Local::arg(0));
+    let coroutine_layout = Place::from(SELF_ARG);
     let coroutine_layout_dropee =
         tcx.mk_place_field(coroutine_layout, FieldIdx::new(0), drop_ptr_ty);
 
     let return_block = BasicBlock::new(1);
     let mut blocks = IndexVec::with_capacity(2);
     let block = |blocks: &mut IndexVec<_, _>, kind| {
-        blocks.push(BasicBlockData::new(Some(Terminator { source_info, kind }), false))
+        blocks.push(BasicBlockData::new(
+            Some(Terminator { source_info, kind, attributes: ThinVec::new() }),
+            false,
+        ))
     };
     block(
         &mut blocks,
@@ -93,7 +99,6 @@ pub(super) fn build_async_drop_shim<'tcx>(
                 unwind: UnwindAction::Continue,
                 replace: false,
                 drop: None,
-                async_fut: None,
             }
         } else {
             TerminatorKind::Goto { target: return_block }
@@ -101,7 +106,7 @@ pub(super) fn build_async_drop_shim<'tcx>(
     );
     block(&mut blocks, TerminatorKind::Return);
 
-    let source = MirSource::from_instance(ty::InstanceKind::AsyncDropGlue(def_id, ty));
+    let source = MirSource::from_shim(ty::ShimKind::AsyncDropGlue(def_id, ty));
     let mut body =
         new_body(source, blocks, local_decls_for_sig(&sig, span), sig.inputs().len(), span);
 
@@ -111,45 +116,47 @@ pub(super) fn build_async_drop_shim<'tcx>(
         parent_args.as_coroutine().resume_ty(),
     )));
     body.phase = MirPhase::Runtime(RuntimePhase::Initial);
-    if !needs_async_drop || drop_ty.references_error() {
-        // Returning noop body for types without `need async drop`
-        // (or sync Drop in case of !`need async drop` && `need drop`).
-        // And also for error types.
-        return body;
+
+    // Returning noop body for types without `need async drop`
+    // (or sync Drop in case of !`need async drop` && `need drop`).
+    // And also for error types.
+    if needs_async_drop && !drop_ty.references_error() {
+        let dropee_ptr = Place::from(body.local_decls.push(LocalDecl::new(drop_ptr_ty, span)));
+        let st_kind = StatementKind::Assign(Box::new((
+            dropee_ptr,
+            Rvalue::Use(Operand::Move(coroutine_layout_dropee), WithRetag::Yes),
+        )));
+        body.basic_blocks_mut()[START_BLOCK].statements.push(Statement::new(source_info, st_kind));
+
+        let dropline = body.basic_blocks.last_index();
+
+        let patch = {
+            let mut elaborator = DropShimElaborator {
+                body: &body,
+                patch: MirPatch::new(&body),
+                tcx,
+                typing_env,
+                produce_async_drops: true,
+            };
+            let dropee = tcx.mk_place_deref(dropee_ptr);
+            let resume_block = elaborator.patch.resume_block();
+            elaborate_drop(
+                &mut elaborator,
+                source_info,
+                dropee,
+                (),
+                return_block,
+                Unwind::To(resume_block),
+                START_BLOCK,
+                dropline,
+            );
+            elaborator.patch
+        };
+        patch.apply(&mut body);
     }
 
-    let dropee_ptr = Place::from(body.local_decls.push(LocalDecl::new(drop_ptr_ty, span)));
-    let st_kind = StatementKind::Assign(Box::new((
-        dropee_ptr,
-        Rvalue::Use(Operand::Move(coroutine_layout_dropee), WithRetag::Yes),
-    )));
-    body.basic_blocks_mut()[START_BLOCK].statements.push(Statement::new(source_info, st_kind));
-
-    let dropline = body.basic_blocks.last_index();
-
-    let patch = {
-        let mut elaborator = DropShimElaborator {
-            body: &body,
-            patch: MirPatch::new(&body),
-            tcx,
-            typing_env,
-            produce_async_drops: true,
-        };
-        let dropee = tcx.mk_place_deref(dropee_ptr);
-        let resume_block = elaborator.patch.resume_block();
-        elaborate_drop(
-            &mut elaborator,
-            source_info,
-            dropee,
-            (),
-            return_block,
-            Unwind::To(resume_block),
-            START_BLOCK,
-            dropline,
-        );
-        elaborator.patch
-    };
-    patch.apply(&mut body);
+    // We did not bother respecting deref separation, do it here.
+    deref_finder(tcx, &mut body, false);
 
     body
 }
@@ -168,17 +175,17 @@ pub(super) fn build_future_drop_poll_shim<'tcx>(
     proxy_ty: Ty<'tcx>,
     impl_ty: Ty<'tcx>,
 ) -> Body<'tcx> {
-    let instance = ty::InstanceKind::FutureDropPollShim(def_id, proxy_ty, impl_ty);
+    let shim = ty::ShimKind::FutureDropPoll(def_id, proxy_ty, impl_ty);
     let ty::Coroutine(coroutine_def_id, _) = impl_ty.kind() else {
-        bug!("build_future_drop_poll_shim not for coroutine impl type: ({:?})", instance);
+        bug!("build_future_drop_poll_shim not for coroutine impl type: ({:?})", shim);
     };
 
     let span = tcx.def_span(def_id);
 
     if tcx.is_async_drop_in_place_coroutine(*coroutine_def_id) {
-        build_adrop_for_adrop_shim(tcx, proxy_ty, impl_ty, span, instance)
+        build_adrop_for_adrop_shim(tcx, proxy_ty, impl_ty, span, shim)
     } else {
-        build_adrop_for_coroutine_shim(tcx, proxy_ty, impl_ty, span, instance)
+        build_adrop_for_coroutine_shim(tcx, proxy_ty, impl_ty, span, shim)
     }
 }
 
@@ -191,92 +198,105 @@ fn build_adrop_for_coroutine_shim<'tcx>(
     proxy_ty: Ty<'tcx>,
     impl_ty: Ty<'tcx>,
     span: Span,
-    instance: ty::InstanceKind<'tcx>,
+    shim: ty::ShimKind<'tcx>,
 ) -> Body<'tcx> {
     let ty::Coroutine(coroutine_def_id, impl_args) = impl_ty.kind() else {
-        bug!("build_adrop_for_coroutine_shim not for coroutine impl type: ({:?})", instance);
+        bug!("build_adrop_for_coroutine_shim not for coroutine impl type: ({:?})", shim);
     };
-    let proxy_ref = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, proxy_ty);
-    // taking _1.0 (impl from Pin)
-    let pin_proxy_layout_local = Local::new(1);
+    let ty::Coroutine(_, id_args) = *tcx.type_of(*coroutine_def_id).skip_binder().kind() else {
+        bug!()
+    };
     let source_info = SourceInfo::outermost(span);
+
+    // If the kind tys differ, we must use the by-move body
+    let def_id = if id_args.as_coroutine().kind_ty() == impl_args.as_coroutine().kind_ty() {
+        *coroutine_def_id
+    } else {
+        assert_eq!(
+            impl_args.as_coroutine().kind_ty().to_opt_closure_kind().unwrap(),
+            ty::ClosureKind::FnOnce
+        );
+
+        tcx.coroutine_by_move_body_def_id(*coroutine_def_id)
+    };
+    let body = tcx.optimized_mir(def_id).future_drop_poll().unwrap();
+    let mut body: Body<'tcx> =
+        EarlyBinder::bind(tcx, body.clone()).instantiate(tcx, impl_args).skip_norm_wip();
+    body.source.instance = ty::InstanceKind::Shim(shim);
+    body.phase = MirPhase::Runtime(RuntimePhase::Initial);
+    body.var_debug_info.clear();
+
     // converting `(_1: Pin<&mut CorLayout>, _2: &mut Context<'_>) -> Poll<()>`
     // into `(_1: Pin<&mut ProxyLayout>, _2: &mut Context<'_>) -> Poll<()>`
     // let mut _x: &mut CorLayout = &mut *_1.0.0;
     // Replace old _1.0 accesses into _x accesses;
-    let body = tcx.optimized_mir(*coroutine_def_id).future_drop_poll().unwrap();
-    let mut body: Body<'tcx> =
-        EarlyBinder::bind(body.clone()).instantiate(tcx, impl_args).skip_norm_wip();
-    body.source.instance = instance;
-    body.phase = MirPhase::Runtime(RuntimePhase::Initial);
-    body.var_debug_info.clear();
+    let proxy_ref = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, proxy_ty);
+
     let pin_adt_ref = tcx.adt_def(tcx.require_lang_item(LangItem::Pin, span));
     let args = tcx.mk_args(&[proxy_ref.into()]);
     let pin_proxy_ref = Ty::new_adt(tcx, pin_adt_ref, args);
 
     let cor_ref = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, impl_ty);
-
-    let proxy_ref_local = body.local_decls.push(LocalDecl::new(proxy_ref, span));
     let cor_ref_local = body.local_decls.push(LocalDecl::new(cor_ref, span));
 
     FixProxyFutureDropVisitor { tcx, replace_to: cor_ref_local }.visit_body(&mut body);
+
     // Now changing first arg from Pin<&mut ImplCoroutine> to Pin<&mut ProxyCoroutine>
-    body.local_decls[pin_proxy_layout_local] = LocalDecl::new(pin_proxy_ref, span);
+    body.local_decls[SELF_ARG] = LocalDecl::new(pin_proxy_ref, span);
 
-    {
-        let mut idx: usize = 0;
-        // _proxy = _1.0 : Pin<&mut ProxyLayout> ==> &mut ProxyLayout
-        let proxy_ref_place = Place::from(pin_proxy_layout_local)
-            .project_deeper(&[PlaceElem::Field(FieldIdx::ZERO, proxy_ref)], tcx);
-        body.basic_blocks_mut()[START_BLOCK].statements.insert(
-            idx,
-            Statement::new(
-                source_info,
-                StatementKind::Assign(Box::new((
-                    Place::from(proxy_ref_local),
-                    Rvalue::Use(Operand::Copy(proxy_ref_place), WithRetag::Yes),
-                ))),
-            ),
-        );
-        idx += 1;
+    // Build the projection to assign `cor_ref_local = _1.<projection>`.
+    let mut pin_proxy_to_cor_projection = vec![
+        // _1.0 : Pin<&mut ProxyLayout> ==> &mut ProxyLayout
+        PlaceElem::Field(FieldIdx::ZERO, proxy_ref),
+    ];
 
-        // _cor_ref_tmp = (*(*_proxy).0).0...
-        let mut cor_ref_tmp_local = proxy_ref_local;
-        proxy_ty.find_async_drop_impl_coroutine(tcx, |ty| {
-            if ty != proxy_ty {
-                let ty_ref = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, ty);
-                let impl_ptr_place = Place::from(cor_ref_tmp_local).project_deeper(
-                    &[PlaceElem::Deref, PlaceElem::Field(FieldIdx::ZERO, ty_ref)],
-                    tcx,
-                );
-                cor_ref_tmp_local = body.local_decls.push(LocalDecl::new(ty_ref, span));
-                body.basic_blocks_mut()[START_BLOCK].statements.insert(
-                    idx,
-                    Statement::new(
-                        source_info,
-                        StatementKind::Assign(Box::new((
-                            Place::from(cor_ref_tmp_local),
-                            Rvalue::Use(Operand::Copy(impl_ptr_place), WithRetag::Yes),
-                        ))),
-                    ),
-                );
-                idx += 1;
-            }
-        });
+    // _cor_ref_tmp = (*(*_proxy).0).0...
+    proxy_ty.find_async_drop_impl_coroutine(tcx, |ty| {
+        if ty != proxy_ty {
+            let ty_ref = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, ty);
+            pin_proxy_to_cor_projection.push(PlaceElem::Deref);
+            pin_proxy_to_cor_projection.push(PlaceElem::Field(FieldIdx::ZERO, ty_ref));
+        }
+    });
 
-        // _cor_ref = cor_ref_tmp
-        body.basic_blocks_mut()[START_BLOCK].statements.insert(
-            idx,
-            Statement::new(
-                source_info,
-                StatementKind::Assign(Box::new((
-                    Place::from(cor_ref_local),
-                    Rvalue::Use(Operand::Move(Place::from(cor_ref_tmp_local)), WithRetag::Yes),
-                ))),
-            ),
-        );
+    // _cor_ref = cor_ref_tmp
+    let projected_pin = Place::from(SELF_ARG).project_deeper(&pin_proxy_to_cor_projection, tcx);
+    body.basic_blocks_mut()[START_BLOCK].statements.insert(
+        0,
+        Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                Place::from(cor_ref_local),
+                Rvalue::Use(Operand::Move(projected_pin), WithRetag::Yes),
+            ))),
+        ),
+    );
+
+    // We did not bother respecting deref separation, do it here.
+    deref_finder(tcx, &mut body, false);
+
+    return body;
+
+    /// Replace Pin<&mut ImplCoroutine> accesses (_1.0) into Pin<&mut ProxyCoroutine> accesses
+    struct FixProxyFutureDropVisitor<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        replace_to: Local,
     }
-    body
+
+    impl<'tcx> MutVisitor<'tcx> for FixProxyFutureDropVisitor<'tcx> {
+        fn tcx(&self) -> TyCtxt<'tcx> {
+            self.tcx
+        }
+
+        fn visit_place(&mut self, place: &mut Place<'tcx>, _: PlaceContext, _: Location) {
+            if place.local == SELF_ARG
+                && let Some((first, rest)) = place.projection.split_first()
+            {
+                assert!(matches!(first, ProjectionElem::Field(FieldIdx::ZERO, _)));
+                *place = Place::from(self.replace_to).project_deeper(rest, self.tcx);
+            }
+        }
+    }
 }
 
 // When dropping async drop coroutine, we continue its execution.
@@ -286,14 +306,13 @@ fn build_adrop_for_adrop_shim<'tcx>(
     proxy_ty: Ty<'tcx>,
     impl_ty: Ty<'tcx>,
     span: Span,
-    instance: ty::InstanceKind<'tcx>,
+    shim: ty::ShimKind<'tcx>,
 ) -> Body<'tcx> {
     let source_info = SourceInfo::outermost(span);
     let proxy_ref = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, proxy_ty);
     // taking _1.0 (impl from Pin)
-    let pin_proxy_layout_local = Local::new(1);
-    let proxy_ref_place = Place::from(pin_proxy_layout_local)
-        .project_deeper(&[PlaceElem::Field(FieldIdx::ZERO, proxy_ref)], tcx);
+    let proxy_ref_place =
+        Place::from(SELF_ARG).project_deeper(&[PlaceElem::Field(FieldIdx::ZERO, proxy_ref)], tcx);
     let cor_ref = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, impl_ty);
 
     // ret_ty = `Poll<()>`
@@ -366,7 +385,7 @@ fn build_adrop_for_adrop_shim<'tcx>(
         Some(Terminator {
             source_info,
             kind: TerminatorKind::Call {
-                func: Operand::function_handle(tcx, pin_fn, [cor_ref.into()], span),
+                func: Operand::function_handle(tcx, pin_fn, &[cor_ref.into()], span),
                 args: [dummy_spanned(Operand::Move(cor_ref_place))].into(),
                 destination: cor_pin_place,
                 target: Some(call_bb),
@@ -374,6 +393,8 @@ fn build_adrop_for_adrop_shim<'tcx>(
                 call_source: CallSource::Misc,
                 fn_span: span,
             },
+
+            attributes: ThinVec::new(),
         }),
         false,
     ));
@@ -385,7 +406,7 @@ fn build_adrop_for_adrop_shim<'tcx>(
         Some(Terminator {
             source_info,
             kind: TerminatorKind::Call {
-                func: Operand::function_handle(tcx, poll_fn, [impl_ty.into()], span),
+                func: Operand::function_handle(tcx, poll_fn, &[impl_ty.into()], span),
                 args: [
                     dummy_spanned(Operand::Move(cor_pin_place)),
                     dummy_spanned(Operand::Move(resume_ctx)),
@@ -397,15 +418,17 @@ fn build_adrop_for_adrop_shim<'tcx>(
                 call_source: CallSource::Misc,
                 fn_span: span,
             },
+
+            attributes: ThinVec::new(),
         }),
         false,
     ));
     blocks.push(BasicBlockData::new(
-        Some(Terminator { source_info, kind: TerminatorKind::Return }),
+        Some(Terminator { source_info, kind: TerminatorKind::Return, attributes: ThinVec::new() }),
         false,
     ));
 
-    let source = MirSource::from_instance(instance);
+    let source = MirSource::from_shim(shim);
     let mut body = new_body(source, blocks, locals, sig.inputs().len(), span);
     body.phase = MirPhase::Runtime(RuntimePhase::Initial);
     return body;

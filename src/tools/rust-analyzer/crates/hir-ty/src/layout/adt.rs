@@ -19,6 +19,7 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 
+#[salsa::tracked(cycle_result = layout_of_adt_cycle_result, returns(clone))]
 pub fn layout_of_adt_query(
     db: &dyn HirDatabase,
     def: AdtId,
@@ -60,8 +61,8 @@ pub fn layout_of_adt_query(
             let variants = e.enum_variants(db);
             let r = variants
                 .variants
-                .iter()
-                .map(|&(v, _, _)| handle_variant(v.into(), v.fields(db)))
+                .values()
+                .map(|&(v, _)| handle_variant(v.into(), v.fields(db)))
                 .collect::<Result<SmallVec<_>, _>>()?;
             (r, AttrFlags::repr(db, e.into()).unwrap_or_default(), false)
         }
@@ -96,7 +97,7 @@ pub fn layout_of_adt_query(
     Ok(Arc::new(result))
 }
 
-pub(crate) fn layout_of_adt_cycle_result(
+fn layout_of_adt_cycle_result(
     _: &dyn HirDatabase,
     _: salsa::Id,
     _def: AdtId,
@@ -141,8 +142,8 @@ fn repr_discr(
         Integer::I8
     };
 
-    // If there are no negative values, we can use the unsigned fit.
-    Ok(if min >= 0 {
+    // `min` and `max` are the ends of a wrapping range, so their sign is not a usable test.
+    Ok(if unsigned_fit <= signed_fit {
         (cmp::max(unsigned_fit, at_least), false)
     } else {
         (cmp::max(signed_fit, at_least), true)

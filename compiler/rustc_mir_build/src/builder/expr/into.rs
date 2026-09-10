@@ -3,9 +3,8 @@
 use rustc_abi::FieldIdx;
 use rustc_ast::{AsmMacro, InlineAsmOptions};
 use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir as hir;
-use rustc_hir::lang_items::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::mir::*;
 use rustc_middle::span_bug;
 use rustc_middle::thir::*;
@@ -15,10 +14,10 @@ use rustc_trait_selection::infer::InferCtxtExt;
 use tracing::{debug, instrument};
 
 use crate::builder::expr::category::{Category, RvalueFunc};
-use crate::builder::matches::{DeclareLetBindings, HasMatchGuard};
+use crate::builder::matches::{DeclareLetBindings, Exhaustive, HasMatchGuard};
 use crate::builder::scope::LintLevel;
 use crate::builder::{BlockAnd, BlockAndExtension, BlockFrame, Builder, NeedsTemporary};
-use crate::errors::{LoopMatchArmWithGuard, LoopMatchUnsupportedType};
+use crate::diagnostics::{LoopMatchArmWithGuard, LoopMatchUnsupportedType};
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Compile `expr`, storing the result into `destination`, which
@@ -48,10 +47,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let block_and = match expr.kind {
             ExprKind::Scope { region_scope, hir_id, value } => {
                 let region_scope = (region_scope, source_info);
-                ensure_sufficient_stack(|| {
-                    this.in_scope(region_scope, LintLevel::Explicit(hir_id), |this| {
-                        this.expr_into_dest(destination, block, value)
-                    })
+                this.in_scope(region_scope, LintLevel::Explicit(hir_id), |this| {
+                    this.expr_into_dest(destination, block, value)
                 })
             }
             ExprKind::Block { block: ast_block } => {
@@ -238,7 +235,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     let tmp = this.get_unit_temp();
                     // Execute the body, branching back to the test.
                     let body_block_end = this.expr_into_dest(tmp, body_block, body).into_block();
-                    this.cfg.goto(body_block_end, source_info, loop_block);
+
+                    let goto = this.cfg.goto(body_block_end, source_info, loop_block);
+                    if let Some(attrs) = this.thir.attributes.get(&expr_id) {
+                        goto.attributes = attrs.clone();
+                    }
 
                     // Loops are only exited by `break` expressions.
                     None
@@ -322,7 +323,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         &scrutinee_place_builder,
                         match_start_span,
                         patterns,
-                        false,
+                        Exhaustive::Yes,
                     );
 
                     let state_place = scrutinee_place_builder.to_place(this);
@@ -399,6 +400,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     && let Some(intrinsic) = this.tcx.intrinsic(def_id)
                     && matches!(intrinsic.name, sym::write_via_move | sym::write_box_via_move) =>
             {
+                let generic_args = generic_args.no_bound_vars().unwrap();
                 // We still have to evaluate the callee expression as normal (but we don't care
                 // about its result).
                 let _fun = unpack!(block = this.as_local_operand(block, fun));
@@ -527,7 +529,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     let success = this.cfg.start_new_block();
                     let clone_trait = this.tcx.require_lang_item(LangItem::Clone, span);
                     let clone_fn = this.tcx.associated_item_def_ids(clone_trait)[0];
-                    let func = Operand::function_handle(this.tcx, clone_fn, [ty.into()], expr_span);
+                    let func =
+                        Operand::function_handle(this.tcx, clone_fn, &[ty.into()], expr_span);
                     let ref_ty = Ty::new_imm_ref(this.tcx, this.tcx.lifetimes.re_erased, ty);
                     let ref_place = this.temp(ref_ty, span);
                     this.cfg.push_assign(
@@ -914,7 +917,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     block,
                     source_info,
                     destination,
-                    Rvalue::Reborrow(target, mutability, place.into()),
+                    Rvalue::Reborrow(target, mutability, place),
                 );
                 block.unit()
             }

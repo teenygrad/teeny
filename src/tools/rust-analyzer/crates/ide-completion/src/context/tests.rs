@@ -329,6 +329,27 @@ fn foo(x: Foo) -> Foo {
 "#,
         expect![[r#"ty: u32, name: ?"#]],
     );
+
+    check_expected_type_and_name(
+        r#"
+//- minicore: option
+struct Foo<T>(T);
+fn foo(x: Foo<Option<i32>>) -> Foo {
+   match x { Foo($0) => () }
+}
+"#,
+        expect![[r#"ty: Option<i32>, name: ?"#]],
+    );
+    check_expected_type_and_name(
+        r#"
+//- minicore: option
+enum Foo<T> { Var(T) };
+fn foo(x: Foo<Option<i32>>) -> Foo {
+   match x { Foo::Var($0) => () }
+}
+"#,
+        expect![[r#"ty: Option<i32>, name: ?"#]],
+    );
 }
 
 #[test]
@@ -382,6 +403,21 @@ fn expected_type_if_condition() {
         r#"
 fn foo() {
     if a$0 { }
+}
+"#,
+        expect![[r#"ty: bool, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_guard_condition() {
+    check_expected_type_and_name(
+        r#"
+enum E { V }
+fn foo() {
+    match E::V {
+        _ if a$0 => {}
+    }
 }
 "#,
         expect![[r#"ty: bool, name: ?"#]],

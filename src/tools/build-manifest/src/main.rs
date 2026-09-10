@@ -26,6 +26,7 @@ static DOCS_FALLBACK: &[(&str, &str)] = &[
     ("-apple-", "aarch64-apple-darwin"),
     ("aarch64", "aarch64-unknown-linux-gnu"),
     ("arm-", "aarch64-unknown-linux-gnu"),
+    ("i686-pc-windows", "x86_64-pc-windows-msvc"),
     ("", "x86_64-unknown-linux-gnu"),
 ];
 
@@ -38,7 +39,8 @@ fn is_nightly_only(pkg: &PkgType) -> bool {
         | PkgType::RustcCodegenCranelift
         | PkgType::RustcCodegenGcc
         | PkgType::Gcc { .. }
-        | PkgType::Enzyme => true,
+        | PkgType::Enzyme
+        | PkgType::Offload => true,
         PkgType::Rust
         | PkgType::RustSrc
         | PkgType::Rustc
@@ -339,7 +341,8 @@ impl Builder {
                 | PkgType::RustcCodegenGcc
                 | PkgType::Gcc { .. }
                 | PkgType::LlvmBitcodeLinker
-                | PkgType::Enzyme => {
+                | PkgType::Enzyme
+                | PkgType::Offload => {
                     extensions.push(host_component(pkg));
                 }
                 PkgType::RustcDev => {

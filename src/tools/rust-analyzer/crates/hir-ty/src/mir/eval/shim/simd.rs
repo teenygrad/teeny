@@ -6,7 +6,7 @@ use crate::consteval::try_const_usize;
 
 use super::*;
 
-impl<'a, 'db: 'a> Evaluator<'a, 'db> {
+impl<'a, 'db> Evaluator<'a, 'db> {
     fn detect_simd_ty(&self, ty: Ty<'db>) -> Result<'db, (usize, Ty<'db>)> {
         match ty.kind() {
             TyKind::Adt(adt_def, subst) => {
@@ -20,7 +20,7 @@ impl<'a, 'db: 'a> Evaluator<'a, 'db> {
                                 not_supported!("simd type with no field");
                             };
                             let field_ty = self.db.field_types(id.into())[first_field]
-                                .get()
+                                .ty()
                                 .instantiate(self.interner(), subst)
                                 .skip_norm_wip();
                             return Ok((fields.len(), field_ty));
@@ -54,7 +54,7 @@ impl<'a, 'db: 'a> Evaluator<'a, 'db> {
         args: &[IntervalAndTy<'db>],
         _generic_args: GenericArgs<'db>,
         destination: Interval,
-        _locals: &Locals<'a>,
+        _locals: &Locals<'a, 'db>,
         _span: MirSpan,
     ) -> Result<'db, ()> {
         match name {

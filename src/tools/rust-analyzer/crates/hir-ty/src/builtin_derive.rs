@@ -17,12 +17,11 @@ use rustc_type_ir::{
 };
 
 use crate::{
-    GenericPredicates,
+    FieldType, GenericPredicates,
     db::HirDatabase,
     next_solver::{
         AliasTy, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs, ParamEnv,
-        StoredEarlyBinder, StoredTy, TraitRef, Ty, TyKind, Unnormalized, fold::fold_tys,
-        generics::Generics,
+        StoredEarlyBinder, TraitRef, Ty, TyKind, Unnormalized, fold::fold_tys, generics::Generics,
     },
 };
 
@@ -69,14 +68,16 @@ pub(crate) fn generics_of<'db>(
         | BuiltinDeriveImplTrait::Ord
         | BuiltinDeriveImplTrait::PartialOrd
         | BuiltinDeriveImplTrait::Eq
-        | BuiltinDeriveImplTrait::PartialEq => Generics::from_generic_def(db, loc.adt.into()),
+        | BuiltinDeriveImplTrait::PartialEq => {
+            Generics::from_generic_def(db, loc.adt.into(), false)
+        }
         BuiltinDeriveImplTrait::CoerceUnsized | BuiltinDeriveImplTrait::DispatchFromDyn => {
             let trait_id = loc
                 .trait_
                 .get_id(interner.lang_items())
                 .expect("we don't pass the impl to the solver if we can't resolve the trait");
-            let additional_param = coerce_pointee_new_type_param(trait_id).into();
-            Generics::from_generic_def_plus_one(db, loc.adt.into(), additional_param)
+            let additional_param = coerce_pointee_new_type_param(trait_id);
+            Generics::from_generic_def_plus_one(db, loc.adt.into(), additional_param, false)
         }
     }
 }
@@ -193,7 +194,7 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
             else {
                 // Malformed derive.
                 return GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
-                    Clauses::default().store(),
+                    Clauses::empty(interner).store(),
                 ));
             };
             let duplicated_bounds =
@@ -305,7 +306,7 @@ fn simple_trait_predicates<'db>(
             loc.trait_,
         ),
         AdtId::EnumId(id) => {
-            for &(variant_id, _, _) in &id.enum_variants(interner.db).variants {
+            for &(variant_id, _) in id.enum_variants(interner.db).variants.values() {
                 extend_assoc_type_bounds(
                     interner,
                     &mut assoc_type_bounds,
@@ -333,7 +334,7 @@ fn simple_trait_predicates<'db>(
 fn extend_assoc_type_bounds<'db>(
     interner: DbInterner<'db>,
     assoc_type_bounds: &mut Vec<Clause<'db>>,
-    fields: &ArenaMap<LocalFieldId, StoredEarlyBinder<StoredTy>>,
+    fields: &ArenaMap<LocalFieldId, FieldType>,
     trait_id: TraitId,
     trait_: BuiltinDeriveImplTrait,
 ) {
@@ -365,7 +366,7 @@ fn extend_assoc_type_bounds<'db>(
 
     let mut visitor = ProjectionFinder { interner, assoc_type_bounds, trait_id, trait_ };
     for (_, field) in fields.iter() {
-        field.get().instantiate_identity().skip_norm_wip().visit_with(&mut visitor);
+        field.ty().instantiate_identity().skip_norm_wip().visit_with(&mut visitor);
     }
 }
 

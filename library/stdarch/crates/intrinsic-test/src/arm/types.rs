@@ -1,20 +1,40 @@
-use super::intrinsic::ArmIntrinsicType;
-use crate::common::intrinsic_helpers::{IntrinsicType, IntrinsicTypeDefinition, Sign, TypeKind};
+use super::intrinsic::ArmType;
+use crate::common::intrinsic_helpers::{
+    IntrinsicType, Sign, SimdLen, TypeDefinition, TypeKind, default_fixed_vector_comparison,
+};
+use itertools::Itertools;
 
-impl IntrinsicTypeDefinition for ArmIntrinsicType {
+impl TypeDefinition for ArmType {
     /// Gets a string containing the typename for this type in C format.
     fn c_type(&self) -> String {
         let prefix = self.kind.c_prefix();
 
-        if let Some(bit_len) = self.bit_len {
-            match (self.simd_len, self.vec_len) {
-                (None, None) => format!("{prefix}{bit_len}_t"),
-                (Some(simd), None) => format!("{prefix}{bit_len}x{simd}_t"),
-                (Some(simd), Some(vec)) => format!("{prefix}{bit_len}x{simd}x{vec}_t"),
-                (None, Some(_)) => todo!("{self:#?}"), // Likely an invalid case
+        match (self.bit_len, self.simd_len, self.vec_len) {
+            // e.g. `bool`
+            (Some(_), None, None) if matches!(self.kind, TypeKind::Bool) => {
+                format!("{prefix}")
             }
-        } else {
-            todo!("{self:#?}")
+            // e.g. `float32_t`, `int64_t`
+            (Some(bit_len), None, None) => format!("{prefix}{bit_len}_t"),
+            // e.g. `float32x2_t`, `int64x2_t`
+            (Some(bit_len), Some(SimdLen::Fixed(simd)), None) => {
+                format!("{prefix}{bit_len}x{simd}_t")
+            }
+            // e.g. `float32x2x3_t`, `int64x2x3_t`
+            (Some(bit_len), Some(SimdLen::Fixed(simd)), Some(vec)) => {
+                format!("{prefix}{bit_len}x{simd}x{vec}_t")
+            }
+            // e.g. `svbool_t`
+            (Some(_), Some(SimdLen::Scalable), None) if matches!(self.kind, TypeKind::Bool) => {
+                format!("sv{prefix}_t")
+            }
+            // e.g. `svfloat32_t`, `svint64_t`
+            (Some(bit_len), Some(SimdLen::Scalable), None) => format!("sv{prefix}{bit_len}_t"),
+            // e.g. `svfloat32x3_t`, `svint64x3_t`
+            (Some(bit_len), Some(SimdLen::Scalable), Some(vec)) => {
+                format!("sv{prefix}{bit_len}x{vec}_t")
+            }
+            _ => todo!("{self:#?}"),
         }
     }
 
@@ -22,126 +42,224 @@ impl IntrinsicTypeDefinition for ArmIntrinsicType {
         let rust_prefix = self.kind.rust_prefix();
         let c_prefix = self.kind.c_prefix();
 
-        if let Some(bit_len) = self.bit_len {
-            match (self.simd_len, self.vec_len) {
-                (None, None) => format!("{rust_prefix}{bit_len}"),
-                (Some(simd), None) => format!("{c_prefix}{bit_len}x{simd}_t"),
-                (Some(simd), Some(vec)) => format!("{c_prefix}{bit_len}x{simd}x{vec}_t"),
-                (None, Some(_)) => todo!("{self:#?}"), // Likely an invalid case
+        match (self.bit_len, self.simd_len, self.vec_len) {
+            // e.g. `svpattern`
+            (None, _, _) => format!("{rust_prefix}"),
+            // e.g. `bool`
+            (Some(_), None, None) if matches!(self.kind, TypeKind::Bool) => {
+                format!("{rust_prefix}")
             }
+            // e.g. `i32`
+            (Some(bit_len), None, None) => format!("{rust_prefix}{bit_len}"),
+            // e.g. `int32x2_t`
+            (Some(bit_len), Some(SimdLen::Fixed(simd)), None) => {
+                format!("{c_prefix}{bit_len}x{simd}_t")
+            }
+            // e.g. `int32x2x3_t`
+            (Some(bit_len), Some(SimdLen::Fixed(simd)), Some(vec)) => {
+                format!("{c_prefix}{bit_len}x{simd}x{vec}_t")
+            }
+            // e.g. `svbool_t`
+            (Some(_), Some(SimdLen::Scalable), None) if matches!(self.kind, TypeKind::Bool) => {
+                format!("sv{c_prefix}_t")
+            }
+            // e.g. `svint32_t`
+            (Some(bit_len), Some(SimdLen::Scalable), None) => format!("sv{c_prefix}{bit_len}_t"),
+            // e.g. `svint32x3_t`
+            (Some(bit_len), Some(SimdLen::Scalable), Some(vec)) => {
+                format!("sv{c_prefix}{bit_len}x{vec}_t")
+            }
+            (Some(_), None, Some(_)) => todo!("{self:#?}"),
+        }
+    }
+
+    fn rust_scalar_type_for_test_value_array(&self) -> String {
+        if self.kind() == TypeKind::Bool && self.num_lanes() == SimdLen::Scalable {
+            let mut ty = self.clone();
+            ty.kind = TypeKind::Int(Sign::Signed);
+            ty.rust_scalar_type()
         } else {
-            todo!("{self:#?}")
+            self.rust_scalar_type()
         }
     }
 
     /// Determines the load function for this type.
-    fn get_load_function(&self) -> String {
-        if let IntrinsicType {
-            kind: k,
-            bit_len: Some(bl),
-            simd_len,
-            vec_len,
-            ..
-        } = &self.data
-        {
-            let quad = if simd_len.unwrap_or(1) * bl > 64 {
-                "q"
-            } else {
-                ""
-            };
+    fn load_function(&self) -> String {
+        if let Some(bl) = self.bit_len {
+            match self.num_lanes() {
+                SimdLen::Scalable => {
+                    format!(
+                        "svld{len}_{type}{bl}",
+                        len = self.num_vectors(),
+                        type = self.rust_intrinsic_name_prefix(),
+                    )
+                }
+                SimdLen::Fixed(num_lanes) => {
+                    format!(
+                        "vld{len}{quad}_{type}{bl}",
+                        quad = if num_lanes * bl > 64 { "q" } else { "" },
+                        len = self.num_vectors(),
+                        type = self.rust_intrinsic_name_prefix(),
+                    )
+                }
+            }
+        } else {
+            todo!("load_function IntrinsicType: {self:#?}")
+        }
+    }
+
+    fn comparison_function(&self) -> String {
+        if let SimdLen::Fixed(num_lanes) = self.num_lanes() {
+            return default_fixed_vector_comparison(self, num_lanes);
+        }
+
+        // Returns `of` when `num_vectors == 1` otherwise returns the appropriate `svget` invocation
+        // for `of`.
+        let get = |num_vectors: u32, idx: u32, from: &'static str| -> String {
+            if num_vectors == 1 {
+                return from.to_string();
+            }
 
             format!(
-                "vld{len}{quad}_{type}{size}",
-                type = match k {
-                    TypeKind::Int(Sign::Unsigned) => "u",
-                    TypeKind::Int(Sign::Signed) => "s",
-                    TypeKind::Float => "f",
-                    TypeKind::Poly => "p",
-                    x => todo!("get_load_function TypeKind: {x:#?}"),
-                },
-                size = bl,
-                quad = quad,
-                len = vec_len.unwrap_or(1),
+                "svget{num_vectors}_{ty}{bl}::<{idx}>({from})",
+                ty = self.rust_intrinsic_name_prefix(),
+                bl = self.inner_size(),
             )
-        } else {
-            todo!("get_load_function IntrinsicType: {self:#?}")
+        };
+
+        let prefix = match self.kind {
+            TypeKind::Bool => "svbool".to_owned(),
+            kind => format!("sv{}{}", kind.c_prefix(), self.inner_size()),
+        };
+
+        let n = self.num_vectors();
+        (0..n)
+            .format_with("\n", |i, fmt| {
+                fmt(&format_args!(
+                    r#"
+assert_eq!(
+    {prefix}_to_slice(&{rust_return_value}),
+    {prefix}_to_slice(&{c_return_value}),
+    "{{id}}-({i_plus_one}/{n})"
+);
+"#,
+                    rust_return_value = get(n, i, "__rust_return_value"),
+                    c_return_value = get(n, i, "__c_return_value"),
+                    i_plus_one = i + 1, // so that the output is "1/2" and "2/2"
+                ))
+            })
+            .to_string()
+    }
+}
+
+impl ArmType {
+    /// Returns the Rust prefix for the name of an intrinsic with this type kind (i.e. `s` for
+    /// `i16`, or `u` for `u16`). For type kinds without any bit length at the end (e.g. `bool`),
+    /// returns the whole type name.
+    pub fn rust_intrinsic_name_prefix(&self) -> &str {
+        match self.kind() {
+            TypeKind::Char(Sign::Signed) => "s",
+            TypeKind::Int(Sign::Signed) => "s",
+            TypeKind::Poly => "p",
+            TypeKind::Bool => "s",
+            _ => self.kind.rust_prefix(),
         }
     }
 }
 
-impl ArmIntrinsicType {
-    pub fn from_c(s: &str, target: &str) -> Result<Self, String> {
-        const CONST_STR: &str = "const";
-        if let Some(s) = s.strip_suffix('*') {
-            let (s, constant) = match s.trim().strip_suffix(CONST_STR) {
-                Some(stripped) => (stripped, true),
-                None => (s, false),
-            };
-            let s = s.trim_end();
-            let temp_return = ArmIntrinsicType::from_c(s, target);
-            temp_return.map(|mut op| {
-                op.ptr = true;
-                op.ptr_constant = constant;
-                op
-            })
+pub fn parse_intrinsic_type(s: &str) -> Result<IntrinsicType, String> {
+    const CONST_STR: &str = "const";
+    const ENUM_STR: &str = "enum ";
+
+    // Recurse to handle pointers..
+    if let Some(s) = s.strip_suffix('*') {
+        let s = s.trim();
+        let (s, constant) = if s.ends_with(CONST_STR) || s.starts_with(CONST_STR) {
+            (
+                s.trim_start_matches(CONST_STR).trim_end_matches(CONST_STR),
+                true,
+            )
         } else {
-            // [const ]TYPE[{bitlen}[x{simdlen}[x{vec_len}]]][_t]
-            let (mut s, constant) = match s.strip_prefix(CONST_STR) {
-                Some(stripped) => (stripped.trim(), true),
-                None => (s, false),
-            };
-            s = s.strip_suffix("_t").unwrap_or(s);
-            let mut parts = s.split('x'); // [[{bitlen}], [{simdlen}], [{vec_len}] ]
-            let start = parts.next().ok_or("Impossible to parse type")?;
-            if let Some(digit_start) = start.find(|c: char| c.is_ascii_digit()) {
-                let (arg_kind, bit_len) = start.split_at(digit_start);
-                let arg_kind = arg_kind.parse::<TypeKind>()?;
-                let bit_len = bit_len.parse::<u32>().map_err(|err| err.to_string())?;
-                let simd_len = match parts.next() {
-                    Some(part) => Some(
-                        part.parse::<u32>()
-                            .map_err(|_| "Couldn't parse simd_len: {part}")?,
-                    ),
-                    None => None,
-                };
-                let vec_len = match parts.next() {
-                    Some(part) => Some(
-                        part.parse::<u32>()
-                            .map_err(|_| "Couldn't parse vec_len: {part}")?,
-                    ),
-                    None => None,
-                };
-                Ok(ArmIntrinsicType {
-                    data: IntrinsicType {
-                        ptr: false,
-                        ptr_constant: false,
-                        constant,
-                        kind: arg_kind,
-                        bit_len: Some(bit_len),
-                        simd_len,
-                        vec_len,
-                    },
-                    target: target.to_string(),
-                })
-            } else {
-                let kind = start.parse::<TypeKind>()?;
-                let bit_len = match kind {
-                    TypeKind::Int(_) => Some(32),
-                    _ => None,
-                };
-                Ok(ArmIntrinsicType {
-                    data: IntrinsicType {
-                        ptr: false,
-                        ptr_constant: false,
-                        constant,
-                        kind: start.parse::<TypeKind>()?,
-                        bit_len,
-                        simd_len: None,
-                        vec_len: None,
-                    },
-                    target: target.to_string(),
-                })
-            }
-        }
+            (s, false)
+        };
+
+        let mut ty = parse_intrinsic_type(s.trim())?;
+        ty.ptr = true;
+        ty.ptr_constant = constant;
+        return Ok(ty);
     }
+
+    // [const ][sv]TYPE[{element_bits}[x{num_lanes}[x{num_vecs}]]][_t]
+    //   | [enum ]TYPE
+    let (mut s, constant) = match (s.strip_prefix(CONST_STR), s.strip_prefix(ENUM_STR)) {
+        (Some(const_strip), _) => (const_strip, true),
+        (_, Some(enum_strip)) => (enum_strip, true),
+        (None, None) => (s, false),
+    };
+    s = s.trim();
+    s = s.strip_suffix("_t").unwrap_or(s);
+
+    // Consider the following types as examples:
+    // A) `svuint32x3_t`
+    // B) `float16x4x2_t`
+    // C) `svbool_t`
+
+    let sve = s.starts_with("sv");
+
+    let mut parts = s.split('x');
+    let start = parts.next().ok_or("failed to parse type")?;
+
+    // Continuing the previous examples..
+    // A) kind=TypeKind::Int(Sign::Unsigned), bit_len=Some(32)
+    // B) kind=TypeKind::Float, bit_len=Some(16)
+    // C) kind=TypeKind::Bool, bit_len=None
+    let (kind, bit_len) = if let Some(digit_start) = start.find(|c: char| c.is_ascii_digit()) {
+        let (element_kind, element_bits) = start.split_at(digit_start);
+        let element_kind = element_kind.parse::<TypeKind>()?;
+        let element_bits = element_bits.parse::<u32>().map_err(|err| err.to_string())?;
+        (element_kind, Some(element_bits))
+    } else {
+        let element_kind = start.parse::<TypeKind>()?;
+        (element_kind, None)
+    };
+
+    let bit_len = match (bit_len, kind) {
+        (None, TypeKind::SvPattern | TypeKind::SvPrefetchOp | TypeKind::Int(_)) => Some(32),
+        (None, TypeKind::Bool) => Some(8),
+        _ => bit_len,
+    };
+
+    // Continuing the previous examples..
+    // A) second_len=Some(3)
+    // B) second_len=Some(4)
+    // C) second_len=None
+    let second_len = parts.next().map(|part| {
+        part.parse::<u32>()
+            .expect("failed to parse second part of type")
+    });
+
+    // Continuing the previous examples..
+    // A) third_len=None
+    // B) third_len=Some(2)
+    // C) third_len=None
+    let third_len = parts.next().map(|part| {
+        part.parse::<u32>()
+            .expect("failed to parse third part of type")
+    });
+
+    let (simd_len, vec_len) = if sve {
+        (Some(SimdLen::Scalable), second_len)
+    } else {
+        (second_len.map(SimdLen::Fixed), third_len)
+    };
+
+    Ok(IntrinsicType {
+        ptr: false,
+        ptr_constant: false,
+        constant,
+        kind,
+        bit_len,
+        simd_len,
+        vec_len,
+    })
 }

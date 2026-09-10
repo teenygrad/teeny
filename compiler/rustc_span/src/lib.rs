@@ -19,6 +19,7 @@
 #![allow(internal_features)]
 #![cfg_attr(target_arch = "loongarch64", feature(stdarch_loongarch))]
 #![feature(core_io_borrowed_buf)]
+#![feature(diagnostic_on_unknown)]
 #![feature(map_try_insert)]
 #![feature(negative_impls)]
 #![feature(read_buf)]
@@ -34,6 +35,7 @@ use derive_where::derive_where;
 use rustc_data_structures::stable_hash::StableHashCtxt;
 use rustc_data_structures::{AtomicRef, outline};
 use rustc_macros::{Decodable, Encodable, StableHash};
+use rustc_serialize::opaque::mem_encoder::MemEncoder;
 use rustc_serialize::opaque::{FileEncoder, MemDecoder};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use tracing::debug;
@@ -737,7 +739,7 @@ impl Default for SpanData {
 
 impl PartialOrd for Span {
     fn partial_cmp(&self, rhs: &Self) -> Option<Ordering> {
-        PartialOrd::partial_cmp(&self.data(), &rhs.data())
+        Some(self.cmp(rhs))
     }
 }
 impl Ord for Span {
@@ -1237,20 +1239,25 @@ impl Span {
     /// If "self" is the span of the outer_ident, and "within" is the span of the `($ident,)`
     /// expr, then this will return the span of the `$ident` macro variable.
     pub fn within_macro(self, within: Span, sm: &SourceMap) -> Option<Span> {
-        match Span::prepare_to_combine(self, within) {
-            // Only return something if it doesn't overlap with the original span,
-            // and the span isn't "imported" (i.e. from unavailable sources).
-            // FIXME: This does limit the usefulness of the error when the macro is
-            // from a foreign crate; we could also take into account `-Zmacro-backtrace`,
-            // which doesn't redact this span (but that would mean passing in even more
-            // args to this function, lol).
-            Ok((self_, _, parent))
-                if self_.hi < self.lo() || self.hi() < self_.lo && !sm.is_imported(within) =>
-            {
-                Some(Span::new(self_.lo, self_.hi, self_.ctxt, parent))
-            }
-            _ => None,
+        let (self_, _, parent) = Span::prepare_to_combine(self, within).ok()?;
+
+        // Only return something if it doesn't overlap with the original span
+        // and the span isn't "imported" (i.e. from unavailable sources).
+        // FIXME: This does limit the usefulness of the error when the macro is
+        // from a foreign crate; we could also take into account `-Zmacro-backtrace`,
+        // which doesn't redact this span (but that would mean passing in even more
+        // args to this function, lol).
+        if self.data().contains(self_) || sm.is_imported(within) {
+            return None;
         }
+
+        // Don't return something if it's marked with `#[diagnostic::opaque]`.
+        // This already accounts for `-Zmacro-backtrace`.
+        if within.data().ctxt.outer_expn_data().diagnostic_opaque {
+            return None;
+        }
+
+        Some(Span::new(self_.lo, self_.hi, self_.ctxt, parent))
     }
 
     pub fn from_inner(self, inner: InnerSpan) -> Span {
@@ -1361,7 +1368,44 @@ pub trait SpanEncoder: Encoder {
     fn encode_def_id(&mut self, def_id: DefId);
 }
 
-impl SpanEncoder for FileEncoder {
+impl SpanEncoder for FileEncoder<'_> {
+    fn encode_span(&mut self, span: Span) {
+        let span = span.data();
+        span.lo.encode(self);
+        span.hi.encode(self);
+    }
+
+    fn encode_symbol(&mut self, sym: Symbol) {
+        self.emit_str(sym.as_str());
+    }
+
+    fn encode_byte_symbol(&mut self, byte_sym: ByteSymbol) {
+        self.emit_byte_str(byte_sym.as_byte_str());
+    }
+
+    fn encode_expn_id(&mut self, _expn_id: ExpnId) {
+        panic!("cannot encode `ExpnId` with `FileEncoder`");
+    }
+
+    fn encode_syntax_context(&mut self, _syntax_context: SyntaxContext) {
+        panic!("cannot encode `SyntaxContext` with `FileEncoder`");
+    }
+
+    fn encode_crate_num(&mut self, crate_num: CrateNum) {
+        self.emit_u32(crate_num.as_u32());
+    }
+
+    fn encode_def_index(&mut self, _def_index: DefIndex) {
+        panic!("cannot encode `DefIndex` with `FileEncoder`");
+    }
+
+    fn encode_def_id(&mut self, def_id: DefId) {
+        def_id.krate.encode(self);
+        def_id.index.encode(self);
+    }
+}
+
+impl SpanEncoder for MemEncoder {
     fn encode_span(&mut self, span: Span) {
         let span = span.data();
         span.lo.encode(self);
@@ -2083,10 +2127,8 @@ impl fmt::Debug for SourceFile {
 ///
 /// When `SourceFile`s are exported in crate metadata, the `StableSourceFileId`
 /// is updated to incorporate the `StableCrateId` of the exporting crate.
-#[derive(
-    Debug, Clone, Copy, Hash, PartialEq, Eq, StableHash, Encodable, Decodable, Default, PartialOrd,
-    Ord
-)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Default, Ord)]
+#[derive(StableHash, Encodable, Decodable)]
 pub struct StableSourceFileId(Hash128);
 
 impl StableSourceFileId {
@@ -2535,7 +2577,7 @@ fn normalize_newlines(src: &mut String, normalized_pos: &mut Vec<NormalizedPos>)
     // directly, let's rather steal the contents of `src`. This makes the code
     // safe even if a panic occurs.
 
-    let mut buf = std::mem::replace(src, String::new()).into_bytes();
+    let mut buf = std::mem::take(src).into_bytes();
     let mut gap_len = 0;
     let mut tail = buf.as_mut_slice();
     let mut cursor = 0;

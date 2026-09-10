@@ -19,7 +19,7 @@ use tracing::debug;
 use crate::abi::FnAbiLlvmExt;
 use crate::builder::Builder;
 use crate::context::CodegenCx;
-use crate::errors::SymbolAlreadyDefined;
+use crate::diagnostics::SymbolAlreadyDefined;
 use crate::type_of::LayoutLlvmExt;
 use crate::{base, llvm};
 
@@ -169,7 +169,10 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
     ) {
         for (alias, linkage, visibility) in aliases {
             let symbol_name = self.tcx.symbol_name(Instance::mono(self.tcx, *alias));
-            tracing::debug!("FUNCTION ALIAS: {alias:?} {linkage:?} {visibility:?}");
+            tracing::debug!(
+                "FUNCTION ALIAS: generating fn {} that calls {aliasee_instance:?} ({alias:?} {linkage:?} {visibility:?})",
+                symbol_name.name
+            );
 
             // predefine another copy of the original instance
             // with a new symbol name

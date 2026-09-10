@@ -1,7 +1,7 @@
 use base_db::target::TargetData;
 use either::Either;
 use hir_def::{
-    DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, HasModule,
+    DefWithBodyId, HasModule,
     expr_store::Body,
     signatures::{
         EnumSignature, FunctionSignature, StructSignature, TypeAliasSignature, UnionSignature,
@@ -30,6 +30,7 @@ fn current_machine_target_data() -> TargetData {
         QueryConfig::Rustc(&Sysroot::empty(), &std::env::current_dir().unwrap()),
         None,
         &FxHashMap::default(),
+        None,
     )
     .unwrap()
 }
@@ -92,13 +93,10 @@ fn eval_goal(
             ),
             Either::Right(ty_id) => db.ty(ty_id.into()).instantiate_identity().skip_norm_wip(),
         };
-        let param_env = db.trait_environment(
-            match adt_or_type_alias_id {
-                Either::Left(adt) => hir_def::GenericDefId::AdtId(adt),
-                Either::Right(ty) => hir_def::GenericDefId::TypeAliasId(ty),
-            }
-            .into(),
-        );
+        let param_env = db.trait_environment(match adt_or_type_alias_id {
+            Either::Left(adt) => hir_def::GenericDefId::AdtId(adt),
+            Either::Right(ty) => hir_def::GenericDefId::TypeAliasId(ty),
+        });
         let krate = match adt_or_type_alias_id {
             Either::Left(it) => it.krate(&db),
             Either::Right(it) => it.krate(&db),
@@ -145,8 +143,7 @@ fn eval_expr(
             .0;
         let infer = InferenceResult::of(&db, DefWithBodyId::from(function_id));
         let goal_ty = infer.type_of_binding[b].clone();
-        let param_env =
-            db.trait_environment(ExpressionStoreOwnerId::from(GenericDefId::from(function_id)));
+        let param_env = db.trait_environment(function_id.into());
         let krate = function_id.krate(&db);
         db.layout_of_ty(goal_ty, ParamEnvAndCrate { param_env, krate }.store())
     })
@@ -182,6 +179,7 @@ fn check_fail(#[rust_analyzer::rust_fixture] ra_fixture: &str, e: LayoutError) {
     assert_eq!(r, Err(e));
 }
 
+#[rust_analyzer::macro_style(braces)]
 macro_rules! size_and_align {
     (minicore: $($x:tt),*;$($t:tt)*) => {
         {
@@ -444,6 +442,7 @@ fn return_position_impl_trait() {
             // but rustc actually runs this code.
             let pinned = pin!(inp);
             struct EmptyWaker;
+            #[expect(clippy::manual_noop_waker, reason = "we don't have access to std here")]
             impl Wake for EmptyWaker {
                 fn wake(self: Arc<Self>) {
                 }
@@ -529,13 +528,29 @@ fn tuple_ptr_with_dst_tail() {
 }
 
 #[test]
-#[ignore = "FIXME: We need to have proper pattern types"]
 fn non_zero_and_non_null() {
     size_and_align! {
         minicore: non_zero, non_null, option;
         use core::{num::NonZeroU8, ptr::NonNull};
         struct Goal(Option<NonZeroU8>, Option<NonNull<i32>>);
     }
+    check_size_and_align(
+        r#"
+    const END: usize = 10;
+    struct Goal(core::pattern_type!(usize is 0..=END));
+        "#,
+        "//- minicore: pat\n",
+        8,
+        8,
+    );
+    check_size_and_align(
+        r#"
+pub struct Goal(core::pattern_type!(i32 is ..0 | 1..));
+    "#,
+        "//- minicore: pat\n",
+        4,
+        4,
+    );
 }
 
 #[test]
@@ -594,6 +609,13 @@ fn enums_with_discriminants() {
     size_and_align! {
         enum Goal {
             A = 1, // This one is (perhaps surprisingly) zero sized.
+        }
+    }
+    size_and_align! {
+        #[allow(overflowing_literals, clippy::enum_clike_unportable_variant)]
+        enum Goal {
+            A = 0,
+            B = 0x8000_0000_0000_0001, // Wraps around to a negative discriminant.
         }
     }
 }

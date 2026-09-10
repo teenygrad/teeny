@@ -177,7 +177,7 @@ pub(super) fn doc_comment(
         match sema.first_crate(vfs_file_id) {
             Some(krate) => krate.base().data(sema.db).proc_macro_cwd.clone(),
             None => {
-                // Arbitrarily pick /, since from_single_file treats this file as as /main.rs anyway.
+                // Arbitrarily pick /, since from_single_file treats this file as /main.rs anyway.
                 Arc::new(ide_db::base_db::AbsPathBuf::try_from("/").unwrap())
             }
         }
@@ -211,7 +211,7 @@ pub(super) fn doc_comment(
     }
 }
 
-fn module_def_to_hl_tag(db: &dyn HirDatabase, def: Definition) -> HlTag {
+fn module_def_to_hl_tag(db: &dyn HirDatabase, def: Definition<'_>) -> HlTag {
     let symbol = match def {
         Definition::Crate(_) | Definition::ExternCrateDecl(_) => SymbolKind::CrateRoot,
         Definition::Module(m) if m.is_crate_root(db) => SymbolKind::CrateRoot,

@@ -177,7 +177,7 @@ impl fmt::Debug for CStr {
 
 #[stable(feature = "cstr_default", since = "1.10.0")]
 #[rustc_const_unstable(feature = "const_default", issue = "143894")]
-impl const Default for &CStr {
+const impl Default for &CStr {
     #[inline]
     fn default() -> Self {
         c""
@@ -582,7 +582,12 @@ impl CStr {
     pub const fn to_bytes_with_nul(&self) -> &[u8] {
         // SAFETY: Transmuting a slice of `c_char`s to a slice of `u8`s
         // is safe on all supported targets.
-        unsafe { &*((&raw const self.inner) as *const [u8]) }
+        let bytes = unsafe { &*((&raw const self.inner) as *const [u8]) };
+
+        // SAFETY: A valid `CStr` always contains at least its trailing nul byte.
+        unsafe { crate::hint::assert_unchecked(!bytes.is_empty()) };
+
+        bytes
     }
 
     /// Iterates over the bytes in this C string.
@@ -729,7 +734,7 @@ impl ops::Index<range::RangeFrom<usize>> for CStr {
 
 #[stable(feature = "cstring_asref", since = "1.7.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl const AsRef<CStr> for CStr {
+const impl AsRef<CStr> for CStr {
     #[inline]
     fn as_ref(&self) -> &CStr {
         self

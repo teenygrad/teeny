@@ -44,9 +44,9 @@ where
     }
 }
 
-pub(crate) fn complete_expr_path(
+pub(crate) fn complete_expr_path<'db>(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_, '_>,
+    ctx: &CompletionContext<'_, 'db>,
     path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx<'_>,
     expr_ctx: &PathExprCtx<'_>,
 ) {
@@ -87,7 +87,7 @@ pub(crate) fn complete_expr_path(
         false
     };
 
-    let scope_def_applicable = |def| match def {
+    let scope_def_applicable = |def: ScopeDef<'db>| match def {
         ScopeDef::GenericParam(hir::GenericParam::LifetimeParam(_)) | ScopeDef::Label(_) => false,
         ScopeDef::ModuleDef(hir::ModuleDef::Macro(mac)) => mac.is_fn_like(ctx.db),
         _ => true,
@@ -182,6 +182,9 @@ pub(crate) fn complete_expr_path(
                         }
                         _ => return,
                     };
+                    // Note: this is not *required* here, we do it to also find methods that require
+                    // the type to be instantiated with specific types.
+                    let ty = ty.instantiate_with_errors();
 
                     if let Some(hir::Adt::Enum(e)) = ty.as_adt() {
                         cov_mark::hit!(completes_variant_through_alias);
@@ -317,12 +320,7 @@ pub(crate) fn complete_expr_path(
                 }
                 // synthetic names currently leak out as we lack synthetic hygiene, so filter them
                 // out here
-                ScopeDef::Local(_) =>
-                {
-                    #[expect(
-                        clippy::collapsible_match,
-                        reason = "this changes meaning, causing the next arm to be selected"
-                    )]
+                ScopeDef::Local(_) => {
                     if !name.as_str().starts_with('<') {
                         acc.add_path_resolution(ctx, path_ctx, name, def, doc_aliases)
                     }
@@ -486,7 +484,6 @@ pub(crate) fn complete_expr(
             scope: &ctx.scope,
             goal: ty.clone(),
             config: hir::term_search::TermSearchConfig {
-                enable_borrowcheck: false,
                 many_alternatives_threshold: 1,
                 fuel: 200,
             },

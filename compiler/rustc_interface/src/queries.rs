@@ -3,17 +3,16 @@ use std::sync::Arc;
 
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_codegen_ssa::{CompiledModules, CrateInfo};
-use rustc_data_structures::indexmap::IndexMap;
 use rustc_data_structures::svh::Svh;
 use rustc_errors::timings::TimingSection;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_metadata::EncodedMetadata;
-use rustc_middle::dep_graph::DepGraph;
+use rustc_middle::dep_graph::{DepGraph, WorkProductMap};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::Session;
 use rustc_session::config::{self, OutputFilenames, OutputType};
+use rustc_session::{IncrCompSession, Session};
 
-use crate::errors::FailedWritingFile;
+use crate::diagnostics::FailedWritingFile;
 use crate::passes;
 
 pub struct Linker {
@@ -47,15 +46,21 @@ impl Linker {
         }
     }
 
-    pub fn link(self, sess: &Session, codegen_backend: &dyn CodegenBackend) {
+    pub fn link(
+        self,
+        sess: &Session,
+        incr_comp_session: Option<IncrCompSession>,
+        codegen_backend: &dyn CodegenBackend,
+    ) {
         let (compiled_modules, mut work_products) = sess.time("finish_ongoing_codegen", || {
             match self.ongoing_codegen.downcast::<CompiledModules>() {
                 // This was a check only build
-                Ok(compiled_modules) => (*compiled_modules, IndexMap::default()),
+                Ok(compiled_modules) => (*compiled_modules, WorkProductMap::default()),
 
                 Err(ongoing_codegen) => codegen_backend.join_codegen(
                     ongoing_codegen,
                     sess,
+                    incr_comp_session.as_ref(),
                     &self.output_filenames,
                     &self.crate_info,
                 ),
@@ -90,23 +95,30 @@ impl Linker {
 
         if sess.opts.incremental.is_some()
             && let Some(path) = self.metadata.path()
-            && let Some((id, product)) =
-                rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
-                    sess,
-                    "metadata",
-                    &[("rmeta", path)],
-                    &[],
-                )
         {
+            let (id, product) = rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
+                sess,
+                incr_comp_session.as_ref().unwrap(),
+                "metadata",
+                &[("rmeta", path)],
+                &[],
+            );
             work_products.insert(id, product);
         }
 
-        sess.dcx().abort_if_errors();
+        if let Some(guar) = sess.dcx().has_errors_or_delayed_bugs() {
+            guar.raise_fatal();
+        }
 
         let _timer = sess.timer("link");
 
         sess.time("serialize_work_products", || {
-            rustc_incremental::save_work_product_index(sess, &self.dep_graph, work_products)
+            rustc_incremental::save_work_product_index(
+                sess,
+                incr_comp_session.as_ref(),
+                &self.dep_graph,
+                work_products,
+            )
         });
 
         let prof = sess.prof.clone();
@@ -114,7 +126,7 @@ impl Linker {
 
         // Now that we won't touch anything in the incremental compilation directory
         // any more, we can finalize it (which involves renaming it)
-        rustc_incremental::finalize_session_directory(sess, self.crate_hash);
+        rustc_incremental::finalize_session_directory(sess, incr_comp_session, self.crate_hash);
 
         if !sess
             .opts

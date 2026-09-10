@@ -249,6 +249,34 @@ fn main() {
 }
 
 #[test]
+fn fuzzy_completion_order_is_case_insensitive_and_deterministic() {
+    check(
+        r#"
+//- /lib.rs crate:dep
+pub mod zed {
+    pub struct HIRThing;
+}
+pub mod alpha {
+    pub struct HIRThing;
+}
+pub struct BeforeHIRThing;
+pub struct HiiirThing;
+
+//- /main.rs crate:main deps:dep
+fn main() {
+    hir$0
+}
+"#,
+        expect![[r#"
+            st HIRThing (use dep::alpha::HIRThing)            HIRThing
+            st HIRThing (use dep::zed::HIRThing)              HIRThing
+            st BeforeHIRThing (use dep::BeforeHIRThing) BeforeHIRThing
+            st HiiirThing (use dep::HiiirThing)             HiiirThing
+        "#]],
+    );
+}
+
+#[test]
 fn trait_function_fuzzy_completion() {
     let fixture = r#"
         //- /lib.rs crate:dep
@@ -781,9 +809,9 @@ fn main() {
 }
 "#,
         expect![[r#"
-            me random_method(…) (use dep::test_mod::TestTrait) fn(&self) DEPRECATED
             ct SPECIAL_CONST (use dep::test_mod::TestTrait)           u8 DEPRECATED
             fn weird_function() (use dep::test_mod::TestTrait)      fn() DEPRECATED
+            me random_method(…) (use dep::test_mod::TestTrait) fn(&self) DEPRECATED
         "#]],
     );
 }
@@ -1280,10 +1308,10 @@ fn no_inherent_candidates_proposed() {
     check(
         r#"
 mod baz {
-    pub trait DefDatabase {
+    pub trait SourceDatabase {
         fn method1(&self);
     }
-    pub trait HirDatabase: DefDatabase {
+    pub trait HirDatabase: SourceDatabase {
         fn method2(&self);
     }
 }
@@ -1299,10 +1327,10 @@ mod bar {
     check(
         r#"
 mod baz {
-    pub trait DefDatabase {
+    pub trait SourceDatabase {
         fn method1(&self);
     }
-    pub trait HirDatabase: DefDatabase {
+    pub trait HirDatabase: SourceDatabase {
         fn method2(&self);
     }
 }
@@ -1318,10 +1346,10 @@ mod bar {
     check(
         r#"
 mod baz {
-    pub trait DefDatabase {
+    pub trait SourceDatabase {
         fn method1(&self);
     }
-    pub trait HirDatabase: DefDatabase {
+    pub trait HirDatabase: SourceDatabase {
         fn method2(&self);
     }
 }

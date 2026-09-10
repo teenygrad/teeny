@@ -2,6 +2,7 @@
 //! runtime or const-eval processable way.
 
 use crate::any::TypeId;
+use crate::fmt;
 use crate::intrinsics::{self, type_id, type_of};
 use crate::marker::PointeeSized;
 use crate::ptr::DynMetadata;
@@ -19,7 +20,6 @@ pub struct Type {
 /// Info of a trait implementation, you can retrieve the vtable with [Self::get_vtable]
 #[derive(Debug, PartialEq, Eq)]
 #[unstable(feature = "type_info", issue = "146922")]
-#[non_exhaustive]
 pub struct TraitImpl<T: PointeeSized> {
     pub(crate) vtable: DynMetadata<T>,
 }
@@ -36,7 +36,8 @@ impl TypeId {
     /// It can only be called at compile time.
     #[unstable(feature = "type_info", issue = "146922")]
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
-    pub const fn info(self) -> Type {
+    #[rustc_comptime]
+    pub fn info(self) -> Type {
         type_of(self)
     }
 }
@@ -214,7 +215,7 @@ pub struct Variant {
     pub name: &'static str,
     /// All fields of the variant.
     pub fields: &'static [Field],
-    /// Whether the enum variant fields is non-exhaustive.
+    /// Whether the enum variant fields are non-exhaustive.
     pub non_exhaustive: bool,
 }
 
@@ -222,6 +223,7 @@ pub struct Variant {
 #[derive(Debug)]
 #[non_exhaustive]
 #[unstable(feature = "type_info", issue = "146922")]
+#[lang = "type_info_generic"]
 pub enum Generic {
     /// Lifetimes.
     Lifetime(Lifetime),
@@ -341,6 +343,22 @@ pub struct FnPtr {
 
     /// Vardiadic function, e.g. extern "C" fn add(n: usize, mut args: ...);
     pub variadic: bool,
+
+    // FIXME(splat): should these fields be private, or merged into an Option<u8/u16>?
+    /// Is any function argument splatted?
+    pub is_splatted: bool,
+
+    /// The index of the splatted function argument in `inputs`, only valid if `is_splatted` is true.
+    /// e.g. in `fn overload(a: u8, #[rustc_splat] b: (f32, usize))` the index is 1, and it can be called
+    /// as `overload(a, 1.0, 2)`.
+    pub splatted_index: u8,
+}
+
+impl FnPtr {
+    /// Returns the splatted function argument index, or `None` if no argument is splatted.
+    pub const fn splatted(&self) -> Option<u8> {
+        if self.is_splatted { Some(self.splatted_index) } else { None }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -360,6 +378,27 @@ pub enum Abi {
 }
 
 impl TypeId {
+    /// Returns `true` if the type represented by this `TypeId` is an signed integer.
+    ///
+    /// For everything else this returns false.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// use std::any::TypeId;
+    ///
+    /// assert_eq!(const { TypeId::of::<i32>().is_signed() }, true);
+    /// assert_eq!(const { TypeId::of::<u8>().is_signed() }, false);
+    /// assert_eq!(const { TypeId::of::<bool>().is_signed() }, false);
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn is_signed(self) -> bool {
+        intrinsics::type_id_is_signed(self)
+    }
+
     /// Returns the size of the type represented by this `TypeId`. `None` if it is unsized.
     ///
     /// # Examples
@@ -373,7 +412,275 @@ impl TypeId {
     /// ```
     #[unstable(feature = "type_info", issue = "146922")]
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
-    pub const fn size(self) -> Option<usize> {
+    #[rustc_comptime]
+    pub fn size(self) -> Option<usize> {
         intrinsics::size_of_type_id(self)
+    }
+
+    /// Returns the number of variants of the type represented by this `TypeId`.
+    ///
+    /// For enums, this is the number of variants. For structs and unions, this is always 1.
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// use std::any::TypeId;
+    ///
+    /// assert_eq!(const { TypeId::of::<Option<()>>().variants() }, 2);
+    ///
+    /// struct Unit;
+    /// struct Point {
+    ///     x: u32,
+    ///     y: u32,
+    /// }
+    /// assert_eq!(const { TypeId::of::<Unit>().variants() }, 1);
+    /// assert_eq!(const { TypeId::of::<Point>().variants() }, 1);
+    /// assert_eq!(const { TypeId::of::<(f32, f32)>().variants() }, 1);
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn variants(self) -> usize {
+        intrinsics::type_id_variants(self)
+    }
+
+    /// Returns the number of fields at the given `variant_index` of the type represented by this `TypeId`.
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// use std::any::TypeId;
+    ///
+    /// assert_eq!(const { TypeId::of::<u32>().fields(0) }, 0);
+    ///
+    /// struct Point {
+    ///     x: u32,
+    ///     y: u32,
+    /// }
+    /// assert_eq!(const { TypeId::of::<Point>().fields(0) }, 2);
+    ///
+    /// enum Enum {
+    ///     Unit,
+    ///     Tuple(u32, u64),
+    ///     Struct { x: u32, y: u32, z: String },
+    /// }
+    /// assert_eq!(const { TypeId::of::<Enum>().fields(0) }, 0);
+    /// assert_eq!(const { TypeId::of::<Enum>().fields(1) }, 2);
+    /// assert_eq!(const { TypeId::of::<Enum>().fields(2) }, 3);
+    /// ```
+    ///
+    /// The variant index refers to the source order index of a variant in a type.
+    ///
+    /// For enums, these are always `0..variant_count`, regardless of any custom discriminants that may have been defined.
+    /// `struct`s, `tuples`, and `unions`s are considered to have a single variant with variant index zero.
+    ///
+    /// ```
+    /// enum Number {
+    ///     Seven = 7, // variant index == 0
+    ///     Six = 6,   // variant index == 1
+    /// }
+    /// ```
+    ///
+    /// Out-of-bounds indexing will be treated as a compile-time error.
+    ///
+    /// ```compile_fail,E0080
+    /// # #![feature(type_info)]
+    /// # use std::any::TypeId;
+    /// #
+    /// # struct Point {
+    /// #     x: u32,
+    /// #     y: u32,
+    /// # }
+    /// # enum Enum {
+    /// #     Unit,
+    /// #     Tuple(u32, u64),
+    /// #     Struct { x: u32, y: u32, z: String },
+    /// # }
+    /// const {
+    ///     _ = TypeId::of::<Point>().fields(10); // error: indexing out of bounds: the len is 2 but the index is 10
+    ///     _ = TypeId::of::<Enum>().fields(10); // error: indexing out of bounds: the len is 3 but the index is 10
+    /// }
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    // FIXME(type_info): Add enum variant pattern types and use them to represent individual variants
+    // Then add a `variant` method to get a wrapper around such a pattern type (similar to the FRT
+    // type we have) and add methods on that. It's the only way to really sensibly represent
+    // things like `non_exhaustive` which can be applied to variants as well.
+    pub fn fields(self, variant_index: usize) -> usize {
+        intrinsics::type_id_fields(self, variant_index)
+    }
+
+    /// Returns the field representing type at the given index of the type represented by this `TypeId`.
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// use std::any::TypeId;
+    ///
+    /// struct Point {
+    ///     x: u32,
+    ///     y: u32,
+    /// }
+    /// assert_eq!(const { TypeId::of::<Point>().field(0, 0).type_id() }, TypeId::of::<u32>());
+    /// assert_eq!(const { TypeId::of::<Point>().field(0, 1).type_id() }, TypeId::of::<u32>());
+    ///
+    /// enum Enum {
+    ///     Unit,
+    ///     Tuple(u32, u64),
+    ///     Struct { x: u32, y: u32, z: String },
+    /// }
+    /// assert_eq!(const { TypeId::of::<Enum>().field(1, 0).type_id() }, TypeId::of::<u32>());
+    /// assert_eq!(const { TypeId::of::<Enum>().field(2, 2).type_id() }, TypeId::of::<String>());
+    /// ```
+    ///
+    /// The variant index and field index refer to the source order index of a variant in a type and
+    /// the source order index of a field in a variant, respectively.
+    ///
+    /// For enums, variant indexes are always `0..variant_count`, regardless of any custom discriminants that may have been defined.
+    /// `struct`s, `tuples`, and `unions`s are considered to have a single variant with variant index zero.
+    ///
+    /// As for field indexes, they may not be the same as the layout order for `repr(Rust)` types, but they are for `repr(C)` types.
+    ///
+    /// ```
+    /// enum Enum {
+    ///     Foo,  // variant index == 0
+    ///     Bar { // variant index == 1
+    ///         a: (), // field index == 0 in `Bar`
+    ///         b: (), // field index == 1 in `Bar`
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Out-of-bounds indexing will be treated as a compile-time error.
+    ///
+    /// ```compile_fail,E0080
+    /// # #![feature(type_info)]
+    /// # use std::any::TypeId;
+    /// #
+    /// # struct Point {
+    /// #     x: u32,
+    /// #     y: u32,
+    /// # }
+    /// # enum Enum {
+    /// #     Unit,
+    /// #     Tuple(u32, u64),
+    /// #     Struct { x: u32, y: u32, z: String },
+    /// # }
+    /// const {
+    ///     _ = TypeId::of::<Point>().field(0, 10); // error: indexing out of bounds: the len is 2 but the index is 10
+    ///     _ = TypeId::of::<Enum>().field(2, 10); // error: indexing out of bounds: the len is 3 but the index is 10
+    /// }
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn field(self, variant_index: usize, field_index: usize) -> FieldId {
+        FieldId {
+            frt_type_id: intrinsics::type_id_field_representing_type(
+                self,
+                variant_index,
+                field_index,
+            ),
+        }
+    }
+
+    /// Returns whether a type is marked with `#[non_exhaustive]`.
+    /// Returns `false` for everything but adts.
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn non_exhaustive(self) -> bool {
+        intrinsics::non_exhaustive(self)
+    }
+
+    /// Returns a list of generic parameters of the type.
+    /// Returns an empty slice for everything that doesn't have generics.
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn generics(self) -> &'static [Generic] {
+        intrinsics::type_id_generics(self)
+    }
+}
+
+/// Field representing type ID. Representing a field of a struct, tuple or enum variant.
+#[derive(Copy, PartialOrd, Ord, Hash)]
+#[derive_const(Clone, PartialEq, Eq)]
+#[unstable(feature = "type_info", issue = "146922")]
+pub struct FieldId {
+    frt_type_id: TypeId,
+}
+
+#[unstable(feature = "type_info", issue = "146922")]
+impl fmt::Debug for FieldId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FieldId({:#034x})", self.frt_type_id.as_u128())
+    }
+}
+
+impl FieldId {
+    /// Returns the `TypeId` of the actual field type.
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// use std::any::TypeId;
+    ///
+    /// struct Point {
+    ///     x: u32,
+    ///     y: u32,
+    /// }
+    /// assert_eq!(
+    ///     const { TypeId::of::<Point>().field(0, 0).type_id() },
+    ///     TypeId::of::<u32>()
+    /// );
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn type_id(self) -> TypeId {
+        intrinsics::field_representing_type_actual_type_id(self.frt_type_id)
+    }
+
+    /// Returns the name of the field.
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// use std::any::TypeId;
+    ///
+    /// struct Point {
+    ///     x: u32,
+    ///     y: u32,
+    /// }
+    /// assert_eq!(
+    ///     const { TypeId::of::<Point>().field(0, 0).name() },
+    ///     "x",
+    /// );
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn name(self) -> &'static str {
+        intrinsics::field_representing_type_name(self.frt_type_id)
+    }
+    /// Returns the offset of the field wrt to its containing type.
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// use std::any::TypeId;
+    ///
+    /// #[repr(C)]
+    /// struct Point {
+    ///     x: u32,
+    ///     y: u32,
+    /// }
+    /// assert_eq!(
+    ///     const { TypeId::of::<Point>().field(0, 1).offset() },
+    ///     4,
+    /// );
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn offset(self) -> usize {
+        intrinsics::field_representing_type_offset(self.frt_type_id)
     }
 }

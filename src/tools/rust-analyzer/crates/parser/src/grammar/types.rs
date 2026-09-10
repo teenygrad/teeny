@@ -1,3 +1,5 @@
+use crate::grammar::entry::prefix::pat_top;
+
 use super::*;
 
 pub(super) const TYPE_FIRST: TokenSet = paths::PATH_FIRST.union(TokenSet::new(&[
@@ -341,6 +343,10 @@ fn bare_dyn_trait_type(p: &mut Parser<'_>) {
 // type B = crate::foo!();
 fn path_or_macro_type(p: &mut Parser<'_>, allow_bounds: bool) {
     assert!(paths::is_path_start(p));
+    if p.at_contextual_kw(T![builtin]) && p.nth_at(1, T![#]) {
+        pattern_type(p);
+        return;
+    }
     let r = p.start();
     let m = p.start();
 
@@ -387,11 +393,17 @@ pub(super) fn opt_type_bounds_as_dyn_trait_type(
     p: &mut Parser<'_>,
     type_marker: CompletedMarker,
 ) -> CompletedMarker {
-    assert!(matches!(
-        type_marker.kind(),
-        SyntaxKind::PATH_TYPE | SyntaxKind::FOR_TYPE | SyntaxKind::MACRO_TYPE
-    ));
+    assert!(matches!(type_marker.kind(), PATH_TYPE | FOR_TYPE | MACRO_TYPE));
     if !p.at(T![+]) {
+        return type_marker;
+    }
+
+    // test_err macro_as_type_bound
+    // fn main() { let x: foo!() + bar!() + baz!(); }
+
+    // `foo!() + ...` is invalid syntax for type bounds,
+    // gracefully exit and let the caller handle the error
+    if type_marker.kind() == MACRO_TYPE {
         return type_marker;
     }
 
@@ -410,4 +422,24 @@ pub(super) fn opt_type_bounds_as_dyn_trait_type(
 
     // Finally precede everything with DYN_TRAIT_TYPE
     m.precede(p).complete(p, DYN_TRAIT_TYPE)
+}
+
+// test pattern_type
+// type T = builtin#pattern_type (u8 is 0..10);
+fn pattern_type(p: &mut Parser<'_>) {
+    let m = p.start();
+    p.bump_remap(T![builtin]);
+    p.bump(T![#]);
+    if p.eat_contextual_kw(T![pattern_type]) {
+        p.expect(T!['(']);
+        type_(p);
+        if !p.eat_contextual_kw(T![is]) {
+            p.error("expected `is`")
+        }
+        pat_top(p);
+        p.expect(T![')']);
+        m.complete(p, PATTERN_TYPE);
+    } else {
+        m.abandon(p);
+    }
 }

@@ -1,1 +1,2 @@
-custom: ["rust-lang.org/funding"]
+github: rustfoundation
+custom: ["https://rust-lang.org/funding"]

@@ -88,7 +88,7 @@ pub(super) fn atom_expr(
         T!['('] => tuple_expr(p),
         T!['['] => array_expr(p),
         T![if] => if_expr(p),
-        T![let] => let_expr(p),
+        T![let] => let_expr(p, r),
         T![_] => {
             // test destructuring_assignment_wildcard_pat
             // fn foo() {
@@ -291,10 +291,8 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
             while !p.at(EOF) && !p.at(T![')']) {
                 let m = p.start();
                 if p.current().is_any_identifier() && p.nth_at(1, T![=]) && !p.nth_at(2, T![=]) {
-                    let m = p.start();
-                    p.bump_any();
+                    name_any_identifier(p);
                     p.bump(T![=]);
-                    m.complete(p, FORMAT_ARGS_ARG_NAME);
                 }
                 if expr(p).is_none() {
                     m.abandon(p);
@@ -320,6 +318,10 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         //     builtin#naked_asm("");
         // }
         parse_asm_expr(p, m)
+    } else if p.eat_contextual_kw(T![include_bytes]) {
+        // test include_bytes
+        // fn foo() { builtin # include_bytes }
+        Some(m.complete(p, INCLUDE_BYTES_EXPR))
     } else {
         m.abandon(p);
         None
@@ -351,6 +353,10 @@ pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedM
         }
 
         let op_n = p.start();
+        // test asm_piece_attr
+        // builtin # global_asm("", #[cfg(false)] options())
+        attributes::outer_attrs(p);
+
         // Parse clobber_abi
         if p.eat_contextual_kw(T![clobber_abi]) {
             parse_clobber_abi(p);
@@ -368,8 +374,12 @@ pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedM
         }
 
         // Parse operand names
-        if p.at(T![ident]) && p.nth_at(1, T![=]) {
-            name(p);
+        if p.current().is_any_identifier() && p.nth_at(1, T![=]) {
+            // test asm_keyword_name
+            // fn foo() {
+            //     builtin # asm("", fn = const 0);
+            // }
+            name_any_identifier(p);
             p.bump(T![=]);
             allow_templates = false;
         }
@@ -711,12 +721,12 @@ fn for_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
 //     if let Some(_) = None && true {}
 //     while 1 == 5 && (let None = None) {}
 // }
-fn let_expr(p: &mut Parser<'_>) -> CompletedMarker {
+fn let_expr(p: &mut Parser<'_>, r: Restrictions) -> CompletedMarker {
     let m = p.start();
     p.bump(T![let]);
     patterns::pattern(p);
     p.expect(T![=]);
-    expr_let(p);
+    expr_let(p, r);
     m.complete(p, LET_EXPR)
 }
 
@@ -852,6 +862,12 @@ fn match_guard(p: &mut Parser<'_>) -> CompletedMarker {
     if p.at(T![=]) {
         p.error("expected expression");
     } else {
+        // test guard_let_struct
+        // fn foo() {
+        //     match () {
+        //         () if let Foo {} = Foo {} => {}
+        //     }
+        // }
         expr(p);
     }
     m.complete(p, MATCH_GUARD)

@@ -76,7 +76,7 @@ fn render(
         completion.edition,
     );
 
-    let ret_type = func.ret_type(db);
+    let ret_type = ctx.completion.rebase_ty(&func.ret_type(db));
     let assoc_item = func.as_assoc_item(db);
 
     let trait_info =
@@ -107,6 +107,7 @@ fn render(
 
     let function = assoc_item
         .and_then(|assoc_item| assoc_item.implementing_ty(db))
+        .map(|self_type| ctx.completion.rebase_ty(&self_type))
         .map(|self_type| compute_return_type_match(db, &ctx, self_type, &ret_type))
         .map(|return_type| CompletionRelevanceFn {
             has_params: has_self_param || func.num_params(db) > 0,
@@ -118,7 +119,7 @@ fn render(
         type_match: if has_call_parens || complete_call_parens.is_some() {
             compute_type_match(completion, &ret_type)
         } else {
-            compute_type_match(completion, &func.ty(db))
+            compute_type_match(completion, &ctx.completion.rebase_ty(&func.ty(db)))
         },
         exact_name_match: compute_exact_name_match(completion, &call),
         function,
@@ -132,10 +133,10 @@ fn render(
             super::path_ref_match(completion, path_ctx, &ret_type, &mut item);
         }
         FuncKind::Method(DotAccess { receiver: Some(receiver), .. }, _) => {
-            if let Some(original_expr) = completion.sema.original_ast_node(receiver.clone())
+            if let Some(original_expr) = completion.sema.original_range_opt(receiver.syntax())
                 && let Some(ref_mode) = compute_ref_match(completion, &ret_type)
             {
-                item.ref_match(ref_mode, original_expr.syntax().text_range().start());
+                item.ref_match(ref_mode, original_expr.range.start());
             }
         }
         _ => (),
@@ -232,7 +233,8 @@ pub(super) fn add_call_parens<'b>(
                         Some(n) => {
                             let smol_str = n.display_no_db(ctx.edition).to_smolstr();
                             let text = smol_str.as_str().trim_start_matches('_');
-                            let ref_ = ref_of_param(ctx, text, param.ty());
+                            let ref_ =
+                                ref_of_param(ctx, text, &param.ty().instantiate_with_errors());
                             f(&format_args!("${{{}:{ref_}{text}}}", index + offset))
                         }
                         None => {
@@ -287,14 +289,16 @@ pub(super) fn add_call_parens<'b>(
 }
 
 fn ref_of_param(ctx: &CompletionContext<'_, '_>, arg: &str, ty: &hir::Type<'_>) -> &'static str {
-    if let Some(derefed_ty) = ty.remove_ref() {
+    if let Some((_, mutability)) = ty.as_reference() {
+        let ref_prefix = if mutability.is_mut() { "&mut " } else { "&" };
+
         for (name, local) in ctx.locals.iter().sorted_by_key(|&(k, _)| k.clone()) {
             if name.as_str() == arg {
-                return if local.ty(ctx.db) == derefed_ty {
-                    if ty.is_mutable_reference() { "&mut " } else { "&" }
-                } else {
-                    ""
-                };
+                let local_ty = local.ty(ctx.db);
+                let added_ref = local_ty.add_reference(ctx.db, mutability);
+                let needs_ref =
+                    !local_ty.could_coerce_to(ctx.db, ty) && added_ref.could_coerce_to(ctx.db, ty);
+                return if needs_ref { ref_prefix } else { "" };
             }
         }
     }
@@ -332,7 +336,7 @@ fn detail_full(ctx: &CompletionContext<'_, '_>, func: hir::Function) -> String {
     let mut detail = String::with_capacity(signature.len());
 
     for segment in signature.split_whitespace() {
-        if !detail.is_empty() {
+        if !detail.is_empty() && !detail.ends_with('(') && !segment.starts_with(')') {
             detail.push(' ');
         }
 
@@ -472,7 +476,7 @@ fn bar(s: &S) {
             r#"
 struct S {}
 impl S {
-    fn foo(&self, x: i32) {
+    fn foo(&self, x: i32, y: &i32) {
         $0
     }
 }
@@ -480,8 +484,8 @@ impl S {
             r#"
 struct S {}
 impl S {
-    fn foo(&self, x: i32) {
-        self.foo(${1:x});$0
+    fn foo(&self, x: i32, y: &i32) {
+        self.foo(${1:x}, ${2:y});$0
     }
 }
 "#,
@@ -558,6 +562,24 @@ struct Foo {}
 fn ref_arg(x: &Foo) {}
 fn main() {
     let x = Foo {};
+    ref_arg(${1:&x});$0
+}
+"#,
+        );
+        check_edit(
+            "ref_arg",
+            r#"
+//- minicore: coerce_unsized
+fn ref_arg(x: &[i32]) {}
+fn main() {
+    let x = [2];
+    ref_ar$0
+}
+"#,
+            r#"
+fn ref_arg(x: &[i32]) {}
+fn main() {
+    let x = [2];
     ref_arg(${1:&x});$0
 }
 "#,
@@ -948,6 +970,25 @@ fn bar() {
 fn foo() {}
 fn bar() {
     let _ = [foo()$0];
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn no_semicolon_in_match() {
+        check_edit(
+            r#"foo"#,
+            r#"
+fn foo() {}
+fn bar() {
+    match fo$0 {}
+}
+"#,
+            r#"
+fn foo() {}
+fn bar() {
+    match foo()$0 {}
 }
 "#,
         );

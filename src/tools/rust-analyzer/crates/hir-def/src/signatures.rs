@@ -1,7 +1,8 @@
 //! Item signature IR definitions
 
-use std::{cell::LazyCell, ops::Not as _};
+use std::cell::LazyCell;
 
+use base_db::SourceDatabase;
 use bitflags::bitflags;
 use cfg::{CfgExpr, CfgOptions};
 use hir_expand::{
@@ -19,10 +20,10 @@ use thin_vec::ThinVec;
 use triomphe::Arc;
 
 use crate::{
-    ConstId, EnumId, EnumVariantId, EnumVariantLoc, ExternBlockId, FunctionId, HasModule, ImplId,
-    ItemContainerId, ModuleId, StaticId, StructId, TraitId, TypeAliasId, UnionId, VariantId,
+    ConstId, EnumId, EnumVariantId, EnumVariantLoc, ExternBlockId, FunctionId, FxIndexMap,
+    HasModule, ImplId, ItemContainerId, LoweringMode, ModuleId, StaticId, StructId, TraitId,
+    TypeAliasId, UnionId, VariantId,
     attrs::AttrFlags,
-    db::DefDatabase,
     expr_store::{
         Body, ExpressionStore, ExpressionStoreBuilder, ExpressionStoreSourceMap,
         lower::{
@@ -51,7 +52,7 @@ pub struct StructSignature {
 
 bitflags! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-    pub struct StructFlags: u8 {
+    pub struct StructFlags: u16 {
         /// Indicates whether this struct has `#[repr]`.
         const HAS_REPR = 1 << 0;
         /// Indicates whether the struct has a `#[rustc_has_incoherent_inherent_impls]` attribute.
@@ -68,19 +69,21 @@ bitflags! {
         const IS_UNSAFE_CELL   = 1 << 6;
         /// Indicates whether this struct is `UnsafePinned`.
         const IS_UNSAFE_PINNED = 1 << 7;
+        /// Indicates whether this struct is `CovariantUnsafeCell`.
+        const IS_COVARIANT_UNSAFE_CELL = 1 << 8;
     }
 }
 
 #[salsa::tracked]
 impl StructSignature {
     #[salsa::tracked(returns(deref))]
-    pub fn of(db: &dyn DefDatabase, id: StructId) -> Arc<Self> {
+    pub fn of(db: &dyn SourceDatabase, id: StructId) -> Arc<Self> {
         Self::with_source_map(db, id).0.clone()
     }
 
     #[salsa::tracked(returns(ref))]
     pub fn with_source_map(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         id: StructId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
@@ -103,6 +106,9 @@ impl StructSignature {
                 _ if lang == sym::owned_box => flags |= StructFlags::IS_BOX,
                 _ if lang == sym::manually_drop => flags |= StructFlags::IS_MANUALLY_DROP,
                 _ if lang == sym::unsafe_cell => flags |= StructFlags::IS_UNSAFE_CELL,
+                _ if lang == sym::covariant_unsafe_cell => {
+                    flags |= StructFlags::IS_COVARIANT_UNSAFE_CELL
+                }
                 _ if lang == sym::unsafe_pinned => flags |= StructFlags::IS_UNSAFE_PINNED,
                 _ => (),
             }
@@ -116,6 +122,7 @@ impl StructSignature {
             file_id,
             source.generic_param_list(),
             source.where_clause(),
+            LoweringMode::Analysis,
         );
         (
             Arc::new(StructSignature {
@@ -130,7 +137,7 @@ impl StructSignature {
     }
 
     #[inline]
-    pub fn repr(&self, db: &dyn DefDatabase, id: StructId) -> Option<ReprOptions> {
+    pub fn repr(&self, db: &dyn SourceDatabase, id: StructId) -> Option<ReprOptions> {
         if self.flags.contains(StructFlags::HAS_REPR) {
             AttrFlags::repr_assume_has(db, id.into())
         } else {
@@ -159,13 +166,13 @@ pub struct UnionSignature {
 #[salsa::tracked]
 impl UnionSignature {
     #[salsa::tracked(returns(deref))]
-    pub fn of(db: &dyn DefDatabase, id: UnionId) -> Arc<Self> {
+    pub fn of(db: &dyn SourceDatabase, id: UnionId) -> Arc<Self> {
         Self::with_source_map(db, id).0.clone()
     }
 
     #[salsa::tracked(returns(ref))]
     pub fn with_source_map(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         id: UnionId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
@@ -189,6 +196,7 @@ impl UnionSignature {
             file_id,
             source.generic_param_list(),
             source.where_clause(),
+            LoweringMode::Analysis,
         );
         (
             Arc::new(UnionSignature {
@@ -202,7 +210,7 @@ impl UnionSignature {
     }
 
     #[inline]
-    pub fn repr(&self, db: &dyn DefDatabase, id: UnionId) -> Option<ReprOptions> {
+    pub fn repr(&self, db: &dyn SourceDatabase, id: UnionId) -> Option<ReprOptions> {
         if self.flags.contains(StructFlags::HAS_REPR) {
             AttrFlags::repr_assume_has(db, id.into())
         } else {
@@ -234,13 +242,13 @@ pub struct EnumSignature {
 #[salsa::tracked]
 impl EnumSignature {
     #[salsa::tracked(returns(deref))]
-    pub fn of(db: &dyn DefDatabase, id: EnumId) -> Arc<Self> {
+    pub fn of(db: &dyn SourceDatabase, id: EnumId) -> Arc<Self> {
         Self::with_source_map(db, id).0.clone()
     }
 
     #[salsa::tracked(returns(ref))]
     pub fn with_source_map(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         id: EnumId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
@@ -264,6 +272,7 @@ impl EnumSignature {
             file_id,
             source.generic_param_list(),
             source.where_clause(),
+            LoweringMode::Analysis,
         );
 
         (
@@ -279,7 +288,7 @@ impl EnumSignature {
 }
 
 impl EnumSignature {
-    pub fn variant_body_type(db: &dyn DefDatabase, id: EnumId) -> IntegerType {
+    pub fn variant_body_type(db: &dyn SourceDatabase, id: EnumId) -> IntegerType {
         match AttrFlags::repr(db, id.into()) {
             Some(ReprOptions { int: Some(builtin), .. }) => builtin,
             _ => IntegerType::Pointer(true),
@@ -287,7 +296,7 @@ impl EnumSignature {
     }
 
     #[inline]
-    pub fn repr(&self, db: &dyn DefDatabase, id: EnumId) -> Option<ReprOptions> {
+    pub fn repr(&self, db: &dyn SourceDatabase, id: EnumId) -> Option<ReprOptions> {
         if self.flags.contains(EnumFlags::HAS_REPR) {
             AttrFlags::repr_assume_has(db, id.into())
         } else {
@@ -315,13 +324,13 @@ pub struct ConstSignature {
 #[salsa::tracked]
 impl ConstSignature {
     #[salsa::tracked(returns(deref))]
-    pub fn of(db: &dyn DefDatabase, id: ConstId) -> Arc<Self> {
+    pub fn of(db: &dyn SourceDatabase, id: ConstId) -> Arc<Self> {
         Self::with_source_map(db, id).0.clone()
     }
 
     #[salsa::tracked(returns(ref))]
     pub fn with_source_map(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         id: ConstId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
@@ -383,13 +392,13 @@ pub struct StaticSignature {
 #[salsa::tracked]
 impl StaticSignature {
     #[salsa::tracked(returns(deref))]
-    pub fn of(db: &dyn DefDatabase, id: StaticId) -> Arc<Self> {
+    pub fn of(db: &dyn SourceDatabase, id: StaticId) -> Arc<Self> {
         Self::with_source_map(db, id).0.clone()
     }
 
     #[salsa::tracked(returns(ref))]
     pub fn with_source_map(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         id: StaticId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
@@ -455,13 +464,13 @@ pub struct ImplSignature {
 #[salsa::tracked]
 impl ImplSignature {
     #[salsa::tracked(returns(deref))]
-    pub fn of(db: &dyn DefDatabase, id: ImplId) -> Arc<Self> {
+    pub fn of(db: &dyn SourceDatabase, id: ImplId) -> Arc<Self> {
         Self::with_source_map(db, id).0.clone()
     }
 
     #[salsa::tracked(returns(ref))]
     pub fn with_source_map(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         id: ImplId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
@@ -526,13 +535,13 @@ pub struct TraitSignature {
 #[salsa::tracked]
 impl TraitSignature {
     #[salsa::tracked(returns(deref))]
-    pub fn of(db: &dyn DefDatabase, id: TraitId) -> Arc<Self> {
+    pub fn of(db: &dyn SourceDatabase, id: TraitId) -> Arc<Self> {
         Self::with_source_map(db, id).0.clone()
     }
 
     #[salsa::tracked(returns(ref))]
     pub fn with_source_map(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         id: TraitId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
@@ -541,7 +550,7 @@ impl TraitSignature {
         let attrs = AttrFlags::query(db, id.into());
         let source = loc.source(db);
         if source.value.auto_token().is_some() {
-            flags.insert(TraitFlags::AUTO);
+            flags.insert(TraitFlags::AUTO | TraitFlags::COINDUCTIVE);
         }
         if source.value.unsafe_token().is_some() {
             flags.insert(TraitFlags::UNSAFE);
@@ -614,13 +623,13 @@ pub struct FunctionSignature {
 #[salsa::tracked]
 impl FunctionSignature {
     #[salsa::tracked(returns(deref))]
-    pub fn of(db: &dyn DefDatabase, id: FunctionId) -> Arc<Self> {
+    pub fn of(db: &dyn SourceDatabase, id: FunctionId) -> Arc<Self> {
         Self::with_source_map(db, id).0.clone()
     }
 
     #[salsa::tracked(returns(ref))]
     pub fn with_source_map(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         id: FunctionId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
@@ -762,7 +771,7 @@ impl FunctionSignature {
     #[inline]
     pub fn legacy_const_generics_indices<'db>(
         &self,
-        db: &'db dyn DefDatabase,
+        db: &'db dyn SourceDatabase,
         id: FunctionId,
     ) -> Option<&'db [u32]> {
         if !self.flags.contains(FnFlags::HAS_LEGACY_CONST_GENERICS) {
@@ -772,7 +781,7 @@ impl FunctionSignature {
         AttrFlags::legacy_const_generic_indices(db, id).as_deref()
     }
 
-    pub fn is_intrinsic(db: &dyn DefDatabase, id: FunctionId) -> bool {
+    pub fn is_intrinsic(db: &dyn SourceDatabase, id: FunctionId) -> bool {
         let data = FunctionSignature::of(db, id);
         data.flags.contains(FnFlags::RUSTC_INTRINSIC)
     }
@@ -800,13 +809,13 @@ pub struct TypeAliasSignature {
 #[salsa::tracked]
 impl TypeAliasSignature {
     #[salsa::tracked(returns(deref))]
-    pub fn of(db: &dyn DefDatabase, id: TypeAliasId) -> Arc<Self> {
+    pub fn of(db: &dyn SourceDatabase, id: TypeAliasId) -> Arc<Self> {
         Self::with_source_map(db, id).0.clone()
     }
 
     #[salsa::tracked(returns(ref))]
     pub fn with_source_map(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         id: TypeAliasId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
@@ -877,7 +886,7 @@ pub struct VariantFields {
 impl VariantFields {
     #[salsa::tracked(returns(ref))]
     pub fn with_source_map(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         id: VariantId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let (shape, result) = match id {
@@ -934,7 +943,7 @@ impl VariantFields {
     }
 
     #[salsa::tracked(returns(deref))]
-    pub fn of(db: &dyn DefDatabase, id: VariantId) -> Arc<Self> {
+    pub fn of(db: &dyn SourceDatabase, id: VariantId) -> Arc<Self> {
         Self::with_source_map(db, id).0.clone()
     }
 }
@@ -954,7 +963,7 @@ impl VariantFields {
 }
 
 fn lower_field_list(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     module: ModuleId,
     fields: InFile<Option<ast::FieldList>>,
     override_visibility: Option<Option<ast::Visibility>>,
@@ -979,17 +988,17 @@ fn lower_field_list(
 }
 
 fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     module: ModuleId,
     fields: InFile<impl Iterator<Item = (Option<ast::Type>, Field)>>,
     mut field_name: impl FnMut(usize, &Field) -> Name,
     override_visibility: Option<Option<ast::Visibility>>,
 ) -> Option<(Arena<FieldData>, ExpressionStore, ExpressionStoreSourceMap)> {
     let cfg_options = module.krate(db).cfg_options(db);
-    let mut col = ExprCollector::new(db, module, fields.file_id);
+    let mut col = ExprCollector::new(db, module, fields.file_id, crate::LoweringMode::Analysis);
     let override_visibility = override_visibility.map(|vis| {
         LazyCell::new(|| {
-            let span_map = db.span_map(fields.file_id);
+            let span_map = fields.file_id.span_map(db);
             visibility_from_ast(db, vis, &mut |range| span_map.span_for_range(range).ctx)
         })
     });
@@ -1055,39 +1064,40 @@ pub struct InactiveEnumVariantCode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumVariants {
-    pub variants: Box<[(EnumVariantId, Name, FieldsShape)]>,
+    pub variants: FxIndexMap<Name, (EnumVariantId, FieldsShape)>,
 }
 
 #[salsa::tracked]
 impl EnumVariants {
     #[salsa::tracked(returns(ref))]
     pub(crate) fn of(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         e: EnumId,
-    ) -> (EnumVariants, Option<ThinVec<InactiveEnumVariantCode>>) {
+    ) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
         let loc = e.lookup(db);
         let source = loc.source(db);
-        let ast_id_map = db.ast_id_map(source.file_id);
+        let ast_id_map = source.file_id.ast_id_map(db);
 
         let mut diagnostics = ThinVec::new();
         let cfg_options = loc.container.krate(db).cfg_options(db);
-        let mut index = 0;
         let Some(variants) = source.value.variant_list() else {
-            return (EnumVariants { variants: Box::default() }, None);
+            return (EnumVariants { variants: FxIndexMap::default() }, ThinVec::new());
         };
-        let variants = variants
+        let mut variants = variants
             .variants()
             .filter_map(|variant| {
                 let ast_id = ast_id_map.ast_id(&variant);
                 match AttrFlags::is_cfg_enabled_for(&variant, cfg_options) {
                     Ok(()) => {
-                        let enum_variant =
-                            EnumVariantLoc { id: source.with_value(ast_id), parent: e, index }
-                                .intern(db);
-                        index += 1;
                         let name = as_name_opt(variant.name());
+                        let enum_variant = EnumVariantLoc {
+                            id: source.with_value(ast_id),
+                            parent: e,
+                            name: name.clone(),
+                        }
+                        .intern(db);
                         let shape = adt_shape(variant.kind());
-                        Some((enum_variant, name, shape))
+                        Some((name, (enum_variant, shape)))
                     }
                     Err(cfg) => {
                         diagnostics.push(InactiveEnumVariantCode {
@@ -1099,34 +1109,38 @@ impl EnumVariants {
                     }
                 }
             })
-            .collect();
+            .collect::<FxIndexMap<_, _>>();
+        variants.shrink_to_fit();
+        diagnostics.shrink_to_fit();
 
-        (EnumVariants { variants }, diagnostics.is_empty().not().then_some(diagnostics))
+        (EnumVariants { variants }, diagnostics)
     }
 }
 
 impl EnumVariants {
     pub fn variant(&self, name: &Name) -> Option<EnumVariantId> {
-        self.variants.iter().find_map(|(v, n, _)| if n == name { Some(*v) } else { None })
+        self.variants.get(name).map(|&(id, _)| id)
     }
 
     pub fn variant_name_by_id(&self, variant_id: EnumVariantId) -> Option<Name> {
         self.variants
             .iter()
-            .find_map(|(id, name, _)| if *id == variant_id { Some(name.clone()) } else { None })
+            .find_map(|(name, (id, _))| if *id == variant_id { Some(name.clone()) } else { None })
     }
 
     // [Adopted from rustc](https://github.com/rust-lang/rust/blob/bd53aa3bf7a24a70d763182303bd75e5fc51a9af/compiler/rustc_middle/src/ty/adt.rs#L446-L448)
-    pub fn is_payload_free(&self, db: &dyn DefDatabase) -> bool {
-        self.variants.iter().all(|&(v, _, _)| {
+    pub fn is_payload_free(&self, db: &dyn SourceDatabase) -> bool {
+        self.variants.values().all(|&(v, shape)| {
             // The condition check order is slightly modified from rustc
             // to improve performance by early returning with relatively fast checks
-            let variant = v.fields(db);
-            if !variant.fields().is_empty() {
-                return false;
-            }
+
             // The outer if condition is whether this variant has const ctor or not
-            if !matches!(variant.shape, FieldsShape::Unit) {
+            if !matches!(shape, FieldsShape::Unit) {
+                let variant = v.fields(db);
+                if !variant.fields().is_empty() {
+                    return false;
+                }
+
                 let body = Body::of(db, v.into());
                 // A variant with explicit discriminant
                 if !matches!(body[body.root_expr()], crate::hir::Expr::Missing) {
@@ -1138,8 +1152,8 @@ impl EnumVariants {
     }
 }
 
-#[salsa::tracked]
-pub(crate) fn extern_block_abi(db: &dyn DefDatabase, extern_block: ExternBlockId) -> ExternAbi {
+#[salsa::tracked(returns(copy))]
+pub(crate) fn extern_block_abi(db: &dyn SourceDatabase, extern_block: ExternBlockId) -> ExternAbi {
     let source = extern_block.lookup(db).source(db);
     source
         .value

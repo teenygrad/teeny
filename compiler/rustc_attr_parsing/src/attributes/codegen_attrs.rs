@@ -1,12 +1,17 @@
-use rustc_hir::attrs::{CoverageAttrKind, OptimizeAttr, RtsanSetting, SanitizerSet, UsedBy};
-use rustc_session::errors::feature_err;
+use rustc_attr_ir::{
+    CoverageAttrKind, InstrumentFnAttr, OptimizeAttr, RtsanSetting, SanitizerSet, UsedBy, find_attr,
+};
+use rustc_feature::AttributeStability;
+use rustc_session::diagnostics::feature_err;
 use rustc_span::edition::Edition::Edition2024;
 
 use super::prelude::*;
 use crate::attributes::AttributeSafety;
-use crate::session_diagnostics::{
-    EmptyExportName, NakedFunctionIncompatibleAttribute, NullOnExport, NullOnObjcClass,
-    NullOnObjcSelector, ObjcClassExpectedStringLiteral, ObjcSelectorExpectedStringLiteral,
+use crate::diagnostics::{
+    EmptyExportName, EmptySection, NakedFunctionIncompatibleAttribute, NullOnExport,
+    NullOnObjcClass, NullOnObjcSelector, NullOnSection, ObjcClassExpectedStringLiteral,
+    ObjcSelectorExpectedStringLiteral, SanitizeInvalidStatic, TargetFeatureOnLangItem,
+    TrackCallerOnLangItem,
 };
 use crate::target_checking::Policy::AllowSilent;
 
@@ -14,7 +19,7 @@ pub(crate) struct OptimizeParser;
 
 impl SingleAttributeParser for OptimizeParser {
     const PATH: &[Symbol] = &[sym::optimize];
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Closure),
         Allow(Target::Method(MethodKind::Trait { body: true })),
@@ -22,11 +27,12 @@ impl SingleAttributeParser for OptimizeParser {
         Allow(Target::Method(MethodKind::Inherent)),
     ]);
     const TEMPLATE: AttributeTemplate = template!(List: &["size", "speed", "none"]);
+    const STABILITY: AttributeStability = unstable!(optimize_attribute);
 
     fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         let single = cx.expect_single_element_list(args, cx.attr_span)?;
 
-        let res = match single.meta_item().and_then(|i| i.path().word().map(|i| i.name)) {
+        let res = match single.meta_item_no_args().and_then(|i| i.path().word().map(|i| i.name)) {
             Some(sym::size) => OptimizeAttr::Size,
             Some(sym::speed) => OptimizeAttr::Speed,
             Some(sym::none) => OptimizeAttr::DoNotOptimize,
@@ -46,7 +52,7 @@ pub(crate) struct ColdParser;
 impl NoArgsAttributeParser for ColdParser {
     const PATH: &[Symbol] = &[sym::cold];
     const ON_DUPLICATE: OnDuplicate = OnDuplicate::Warn;
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowListWarnRest(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowListWarnRest(&[
         Allow(Target::Fn),
         Allow(Target::Method(MethodKind::Trait { body: true })),
         Allow(Target::Method(MethodKind::TraitImpl)),
@@ -54,6 +60,7 @@ impl NoArgsAttributeParser for ColdParser {
         Allow(Target::ForeignFn),
         Allow(Target::Closure),
     ]);
+    const STABILITY: AttributeStability = AttributeStability::Stable;
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::Cold;
 }
 
@@ -61,7 +68,7 @@ pub(crate) struct CoverageParser;
 
 impl SingleAttributeParser for CoverageParser {
     const PATH: &[Symbol] = &[sym::coverage];
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Closure),
         Allow(Target::Method(MethodKind::Trait { body: true })),
@@ -73,6 +80,7 @@ impl SingleAttributeParser for CoverageParser {
         Allow(Target::Crate),
     ]);
     const TEMPLATE: AttributeTemplate = template!(OneOf: &[sym::off, sym::on]);
+    const STABILITY: AttributeStability = unstable!(coverage_attribute);
 
     fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         let arg = cx.expect_single_element_list(args, cx.attr_span)?;
@@ -80,7 +88,7 @@ impl SingleAttributeParser for CoverageParser {
         let mut fail_incorrect_argument =
             |span| cx.adcx().expected_specific_argument(span, &[sym::on, sym::off]);
 
-        let Some(arg) = arg.meta_item() else {
+        let Some(arg) = arg.meta_item_no_args() else {
             fail_incorrect_argument(arg.span());
             return None;
         };
@@ -103,8 +111,11 @@ pub(crate) struct ExportNameParser;
 impl SingleAttributeParser for ExportNameParser {
     const PATH: &[rustc_span::Symbol] = &[sym::export_name];
     const ON_DUPLICATE: OnDuplicate = OnDuplicate::WarnButFutureError;
-    const SAFETY: AttributeSafety = AttributeSafety::Unsafe { unsafe_since: Some(Edition2024) };
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+    const SAFETY: AttributeSafety = AttributeSafety::Unsafe {
+        note: "the linker's behavior with multiple libraries exporting duplicate symbol names is undefined and Rust cannot provide guarantees when you manually override them",
+        unsafe_since: Some(Edition2024),
+    };
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         Allow(Target::Static),
         Allow(Target::Fn),
         Allow(Target::Method(MethodKind::Inherent)),
@@ -116,6 +127,7 @@ impl SingleAttributeParser for ExportNameParser {
         Warn(Target::MacroCall),
     ]);
     const TEMPLATE: AttributeTemplate = template!(NameValueStr: "name");
+    const STABILITY: AttributeStability = AttributeStability::Stable;
 
     fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         let nv = cx.expect_name_value(args, cx.attr_span, None)?;
@@ -140,9 +152,10 @@ pub(crate) struct RustcObjcClassParser;
 
 impl SingleAttributeParser for RustcObjcClassParser {
     const PATH: &[rustc_span::Symbol] = &[sym::rustc_objc_class];
-    const ALLOWED_TARGETS: AllowedTargets =
+    const ALLOWED_TARGETS: AllowedTargets<'_> =
         AllowedTargets::AllowList(&[Allow(Target::ForeignStatic)]);
     const TEMPLATE: AttributeTemplate = template!(NameValueStr: "ClassName");
+    const STABILITY: AttributeStability = unstable!(rustc_attrs);
 
     fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         let nv = cx.expect_name_value(args, cx.attr_span, None)?;
@@ -167,9 +180,10 @@ pub(crate) struct RustcObjcSelectorParser;
 
 impl SingleAttributeParser for RustcObjcSelectorParser {
     const PATH: &[rustc_span::Symbol] = &[sym::rustc_objc_selector];
-    const ALLOWED_TARGETS: AllowedTargets =
+    const ALLOWED_TARGETS: AllowedTargets<'_> =
         AllowedTargets::AllowList(&[Allow(Target::ForeignStatic)]);
     const TEMPLATE: AttributeTemplate = template!(NameValueStr: "methodName");
+    const STABILITY: AttributeStability = unstable!(rustc_attrs);
 
     fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         let nv = cx.expect_name_value(args, cx.attr_span, None)?;
@@ -197,7 +211,7 @@ pub(crate) struct NakedParser {
 
 impl AttributeParser for NakedParser {
     const ATTRIBUTES: AcceptMapping<Self> =
-        &[(&[sym::naked], template!(Word), |this, cx, args| {
+        &[(&[sym::naked], template!(Word), AttributeStability::Stable, |this, cx, args| {
             let Some(()) = cx.expect_no_args(args) else {
                 return;
             };
@@ -209,8 +223,11 @@ impl AttributeParser for NakedParser {
                 this.span = Some(cx.attr_span);
             }
         })];
-    const SAFETY: AttributeSafety = AttributeSafety::Unsafe { unsafe_since: None };
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+    const SAFETY: AttributeSafety = AttributeSafety::Unsafe {
+        note: "the `#[naked]` attribute adds the safety obligation that the function's body must respect the function’s calling convention, uphold its signature, and either return or diverge (i.e., not fall through past the end of the assembly code).",
+        unsafe_since: None,
+    };
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Method(MethodKind::Inherent)),
         Allow(Target::Method(MethodKind::Trait { body: true })),
@@ -232,9 +249,6 @@ impl AttributeParser for NakedParser {
         // NOTE: when making changes to this list, check that `error_codes/E0736.md` remains
         // accurate.
         const ALLOW_LIST: &[rustc_span::Symbol] = &[
-            // conditional compilation
-            sym::cfg_trace,
-            sym::cfg_attr_trace,
             // testing (allowed here so better errors can be generated in `rustc_builtin_macros::test`)
             sym::test,
             sym::ignore,
@@ -267,7 +281,7 @@ impl AttributeParser for NakedParser {
 
         let span = self.span?;
 
-        let Some(tools) = cx.tools else {
+        let Some(tools) = cx.attr_tools else {
             unreachable!("tools required while parsing attributes");
         };
 
@@ -292,7 +306,7 @@ impl AttributeParser for NakedParser {
                 if other_attr.word_is(sym::target_feature) {
                     if !cx.features().naked_functions_target_feature() {
                         feature_err(
-                            &cx.sess(),
+                            cx.sess(),
                             sym::naked_functions_target_feature,
                             other_attr.span(),
                             "`#[target_feature(/* ... */)]` is currently unstable on `#[naked]` functions",
@@ -318,7 +332,7 @@ pub(crate) struct TrackCallerParser;
 impl NoArgsAttributeParser for TrackCallerParser {
     const PATH: &[Symbol] = &[sym::track_caller];
     const ON_DUPLICATE: OnDuplicate = OnDuplicate::Warn;
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Method(MethodKind::Inherent)),
         Allow(Target::Method(MethodKind::Trait { body: true })),
@@ -331,15 +345,38 @@ impl NoArgsAttributeParser for TrackCallerParser {
         Warn(Target::Field),
         Warn(Target::MacroCall),
     ]);
+    const STABILITY: AttributeStability = AttributeStability::Stable;
     const CREATE: fn(Span) -> AttributeKind = AttributeKind::TrackCaller;
+
+    fn finalize_check(cx: &FinalizeCheckContext<'_, '_>, attr_span: Span) {
+        match cx.target {
+            Target::Fn => {
+                // `#[track_caller]` is not valid on weak lang items because they are called via
+                // `extern` declarations and `#[track_caller]` would alter their ABI.
+                if let Some(item) = find_attr!(cx.parsed_attrs, Lang(item) => item)
+                    && item.is_weak()
+                {
+                    cx.emit_err(TrackCallerOnLangItem {
+                        attr_span,
+                        name: item.name(),
+                        sig_span: cx.target_span,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) struct NoMangleParser;
 impl NoArgsAttributeParser for NoMangleParser {
     const PATH: &[Symbol] = &[sym::no_mangle];
     const ON_DUPLICATE: OnDuplicate = OnDuplicate::Warn;
-    const SAFETY: AttributeSafety = AttributeSafety::Unsafe { unsafe_since: Some(Edition2024) };
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowListWarnRest(&[
+    const SAFETY: AttributeSafety = AttributeSafety::Unsafe {
+        note: "the linker's behavior with multiple libraries exporting duplicate symbol names is undefined and Rust cannot provide guarantees when you manually override them",
+        unsafe_since: Some(Edition2024),
+    };
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowListWarnRest(&[
         Allow(Target::Fn),
         Allow(Target::Static),
         Allow(Target::Method(MethodKind::Inherent)),
@@ -347,6 +384,7 @@ impl NoArgsAttributeParser for NoMangleParser {
         AllowSilent(Target::Const), // Handled in the `InvalidNoMangleItems` pass
         Error(Target::Closure),
     ]);
+    const STABILITY: AttributeStability = AttributeStability::Stable;
     const CREATE: fn(Span) -> AttributeKind = AttributeKind::NoMangle;
 }
 
@@ -365,6 +403,7 @@ impl AttributeParser for UsedParser {
     const ATTRIBUTES: AcceptMapping<Self> = &[(
         &[sym::used],
         template!(Word, List: &["compiler", "linker"]),
+        AttributeStability::Stable,
         |group: &mut Self, cx, args| {
             let used_by = match args {
                 ArgParser::NoArgs => UsedBy::Default,
@@ -373,11 +412,11 @@ impl AttributeParser for UsedParser {
                         return;
                     };
 
-                    match l.meta_item().and_then(|i| i.path().word_sym()) {
+                    match l.meta_item_no_args().and_then(|i| i.path().word_sym()) {
                         Some(sym::compiler) => {
                             if !cx.features().used_with_arg() {
                                 feature_err(
-                                    &cx.sess(),
+                                    cx.sess(),
                                     sym::used_with_arg,
                                     cx.attr_span,
                                     "`#[used(compiler)]` is currently unstable",
@@ -389,7 +428,7 @@ impl AttributeParser for UsedParser {
                         Some(sym::linker) => {
                             if !cx.features().used_with_arg() {
                                 feature_err(
-                                    &cx.sess(),
+                                    cx.sess(),
                                     sym::used_with_arg,
                                     cx.attr_span,
                                     "`#[used(linker)]` is currently unstable",
@@ -440,7 +479,7 @@ impl AttributeParser for UsedParser {
             }
         },
     )];
-    const ALLOWED_TARGETS: AllowedTargets =
+    const ALLOWED_TARGETS: AllowedTargets<'_> =
         AllowedTargets::AllowList(&[Allow(Target::Static), Warn(Target::MacroCall)]);
 
     fn finalize(self, _cx: &FinalizeContext<'_, '_>) -> Option<AttributeKind> {
@@ -484,7 +523,7 @@ fn parse_tf_attribute(
         let Some(value_str) = cx.expect_string_literal(value) else {
             return features;
         };
-        for feature in value_str.as_str().split(",") {
+        for feature in value_str.as_str().split(',') {
             features.push((Symbol::intern(feature), item.span()));
         }
     }
@@ -502,15 +541,7 @@ impl CombineAttributeParser for TargetFeatureParser {
         was_forced: false,
     };
     const TEMPLATE: AttributeTemplate = template!(List: &["enable = \"feat1, feat2\""]);
-
-    fn extend(
-        cx: &mut AcceptContext<'_, '_>,
-        args: &ArgParser,
-    ) -> impl IntoIterator<Item = Self::Item> {
-        parse_tf_attribute(cx, args)
-    }
-
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Method(MethodKind::Inherent)),
         Allow(Target::Method(MethodKind::Trait { body: true })),
@@ -521,6 +552,29 @@ impl CombineAttributeParser for TargetFeatureParser {
         Warn(Target::MacroDef),
         Warn(Target::MacroCall),
     ]);
+    const STABILITY: AttributeStability = AttributeStability::Stable;
+
+    fn extend(
+        cx: &mut AcceptContext<'_, '_>,
+        args: &ArgParser,
+    ) -> impl IntoIterator<Item = Self::Item> {
+        parse_tf_attribute(cx, args)
+    }
+
+    fn finalize_check(cx: &FinalizeCheckContext<'_, '_>, attr_span: Span) {
+        // `#[target_feature]` is incompatible with lang item functions,
+        // except on WASM where calling target-feature functions is safe (see #84988).
+        if !cx.sess().target.is_like_wasm && !cx.sess().opts.actually_rustdoc {
+            // `#[panic_handler]` is checked first so it takes priority in the diagnostic.
+            let lang_kind = cx
+                .all_attrs
+                .iter()
+                .find_map(|a| [sym::panic_handler, sym::lang].into_iter().find(|&s| a.word_is(s)));
+            if let Some(kind) = lang_kind {
+                cx.emit_err(TargetFeatureOnLangItem { attr_span, kind, item_span: cx.target_span });
+            }
+        }
+    }
 }
 
 pub(crate) struct ForceTargetFeatureParser;
@@ -528,19 +582,23 @@ pub(crate) struct ForceTargetFeatureParser;
 impl CombineAttributeParser for ForceTargetFeatureParser {
     type Item = (Symbol, Span);
     const PATH: &[Symbol] = &[sym::force_target_feature];
-    const SAFETY: AttributeSafety = AttributeSafety::Unsafe { unsafe_since: None };
+    const SAFETY: AttributeSafety = AttributeSafety::Unsafe {
+        note: "a function with the signature of the function the attribute is applied to must only be callable if the force-enabled features are guaranteed to be present",
+        unsafe_since: None,
+    };
     const CONVERT: ConvertFn<Self::Item> = |items, span| AttributeKind::TargetFeature {
         features: items,
         attr_span: span,
         was_forced: true,
     };
     const TEMPLATE: AttributeTemplate = template!(List: &["enable = \"feat1, feat2\""]);
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Method(MethodKind::Inherent)),
         Allow(Target::Method(MethodKind::Trait { body: true })),
         Allow(Target::Method(MethodKind::TraitImpl)),
     ]);
+    const STABILITY: AttributeStability = unstable!(effective_target_features);
 
     fn extend(
         cx: &mut AcceptContext<'_, '_>,
@@ -550,14 +608,59 @@ impl CombineAttributeParser for ForceTargetFeatureParser {
     }
 }
 
+pub(crate) struct InstrumentFnParser;
+
+impl SingleAttributeParser for InstrumentFnParser {
+    const PATH: &[Symbol] = &[sym::instrument_fn];
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
+        Allow(Target::Fn),
+        Allow(Target::Method(MethodKind::Inherent)),
+        Allow(Target::Method(MethodKind::Trait { body: true })),
+        Allow(Target::Method(MethodKind::TraitImpl)),
+    ]);
+    const TEMPLATE: AttributeTemplate = template!(NameValueStr: "on|off");
+    const STABILITY: AttributeStability = unstable!(instrument_fn);
+
+    fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
+        match args {
+            ArgParser::NameValue(nv) => match nv.value_as_str() {
+                Some(sym::on) => Some(AttributeKind::InstrumentFn(InstrumentFnAttr::On)),
+                Some(sym::off) => Some(AttributeKind::InstrumentFn(InstrumentFnAttr::Off)),
+                _ => {
+                    cx.adcx()
+                        .expected_specific_argument_strings(nv.value_span, &[sym::on, sym::off]);
+                    None
+                }
+            },
+            ArgParser::List(l) => {
+                cx.adcx().expected_single_argument(l.span, l.len());
+                None
+            }
+            ArgParser::NoArgs => {
+                let span = cx.attr_span;
+                cx.adcx().expected_specific_argument_strings(span, &[sym::on, sym::off]);
+                None
+            }
+        }
+    }
+}
+
 pub(crate) struct SanitizeParser;
 
 impl SingleAttributeParser for SanitizeParser {
     const PATH: &[Symbol] = &[sym::sanitize];
-
-    // FIXME: still checked in check_attrs.rs
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(ALL_TARGETS);
-
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
+        Allow(Target::Fn),
+        Allow(Target::Closure),
+        Allow(Target::Method(MethodKind::Inherent)),
+        Allow(Target::Method(MethodKind::Trait { body: true })),
+        Allow(Target::Method(MethodKind::TraitImpl)),
+        Allow(Target::Impl { of_trait: false }),
+        Allow(Target::Impl { of_trait: true }),
+        Allow(Target::Mod),
+        Allow(Target::Crate),
+        Allow(Target::Static),
+    ]);
     const TEMPLATE: AttributeTemplate = template!(List: &[
         r#"address = "on|off""#,
         r#"kernel_address = "on|off""#,
@@ -571,6 +674,7 @@ impl SingleAttributeParser for SanitizeParser {
         r#"thread = "on|off""#,
         r#"realtime = "nonblocking|blocking|caller""#,
     ]);
+    const STABILITY: AttributeStability = unstable!(sanitize);
 
     fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         let list = cx.expect_list(args, cx.attr_span)?;
@@ -588,14 +692,7 @@ impl SingleAttributeParser for SanitizeParser {
                 let is_on = match value.value_as_str() {
                     Some(sym::on) => true,
                     Some(sym::off) => false,
-                    Some(_) => {
-                        cx.adcx().expected_specific_argument_strings(
-                            value.value_span,
-                            &[sym::on, sym::off],
-                        );
-                        return;
-                    }
-                    None => {
+                    _ => {
                         cx.adcx().expected_specific_argument_strings(
                             value.value_span,
                             &[sym::on, sym::off],
@@ -652,9 +749,20 @@ impl SingleAttributeParser for SanitizeParser {
                             sym::realtime,
                         ],
                     );
-                    continue;
                 }
             }
+        }
+
+        // The sanitizer attribute is only allowed on statics, if only address bits are set
+        let all_set_except_address =
+            (on_set | off_set) & !(SanitizerSet::ADDRESS | SanitizerSet::KERNELADDRESS);
+        if cx.target == Target::Static
+            && let Some(set) = all_set_except_address.iter().next()
+        {
+            cx.emit_err(SanitizeInvalidStatic {
+                span: cx.attr_span,
+                field: set.as_str().expect("Since this `SanitizerSet` is returned from an iterator, exactly one field is set")
+            });
         }
 
         Some(AttributeKind::Sanitize { on_set, off_set, rtsan, span: cx.attr_span })
@@ -665,8 +773,9 @@ pub(crate) struct ThreadLocalParser;
 
 impl NoArgsAttributeParser for ThreadLocalParser {
     const PATH: &[Symbol] = &[sym::thread_local];
-    const ALLOWED_TARGETS: AllowedTargets =
+    const ALLOWED_TARGETS: AllowedTargets<'_> =
         AllowedTargets::AllowList(&[Allow(Target::Static), Allow(Target::ForeignStatic)]);
+    const STABILITY: AttributeStability = unstable!(thread_local);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::ThreadLocal;
 }
 
@@ -674,7 +783,8 @@ pub(crate) struct RustcPassIndirectlyInNonRusticAbisParser;
 
 impl NoArgsAttributeParser for RustcPassIndirectlyInNonRusticAbisParser {
     const PATH: &[Symbol] = &[sym::rustc_pass_indirectly_in_non_rustic_abis];
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Struct)]);
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[Allow(Target::Struct)]);
+    const STABILITY: AttributeStability = unstable!(rustc_attrs);
     const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcPassIndirectlyInNonRusticAbis;
 }
 
@@ -682,8 +792,9 @@ pub(crate) struct RustcEiiForeignItemParser;
 
 impl NoArgsAttributeParser for RustcEiiForeignItemParser {
     const PATH: &[Symbol] = &[sym::rustc_eii_foreign_item];
-    const ALLOWED_TARGETS: AllowedTargets =
+    const ALLOWED_TARGETS: AllowedTargets<'_> =
         AllowedTargets::AllowList(&[Allow(Target::ForeignFn), Allow(Target::ForeignStatic)]);
+    const STABILITY: AttributeStability = unstable!(eii_internals);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcEiiForeignItem;
 }
 
@@ -691,82 +802,93 @@ pub(crate) struct PatchableFunctionEntryParser;
 
 impl SingleAttributeParser for PatchableFunctionEntryParser {
     const PATH: &[Symbol] = &[sym::patchable_function_entry];
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Fn)]);
-    const TEMPLATE: AttributeTemplate = template!(List: &["prefix_nops = m, entry_nops = n"]);
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[Allow(Target::Fn)]);
+    const TEMPLATE: AttributeTemplate =
+        template!(List: &["prefix_nops = m, entry_nops = n, section = \"section\""]);
+    const STABILITY: AttributeStability = unstable!(patchable_function_entry);
 
     fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         let meta_item_list = cx.expect_list(args, cx.attr_span)?;
 
         let mut prefix = None;
         let mut entry = None;
+        let mut section = None;
 
         if meta_item_list.len() == 0 {
             cx.adcx().expected_at_least_one_argument(meta_item_list.span);
             return None;
         }
 
-        let mut errored = false;
-
         for item in meta_item_list.mixed() {
-            let Some((ident, value)) = cx.expect_name_value(item, item.span(), None) else {
-                continue;
-            };
+            let (ident, value) = cx.expect_name_value(item, item.span(), None)?;
 
             let attrib_to_write = match ident.name {
                 sym::prefix_nops => {
                     // Duplicate prefixes are not allowed
                     if prefix.is_some() {
-                        errored = true;
                         cx.adcx().duplicate_key(ident.span, sym::prefix_nops);
-                        continue;
+                        return None;
                     }
                     &mut prefix
                 }
                 sym::entry_nops => {
                     // Duplicate entries are not allowed
                     if entry.is_some() {
-                        errored = true;
                         cx.adcx().duplicate_key(ident.span, sym::entry_nops);
-                        continue;
+                        return None;
                     }
                     &mut entry
                 }
+                sym::section => {
+                    // Duplicate entries are not allowed
+                    if section.is_some() {
+                        cx.adcx().duplicate_key(ident.span, sym::section);
+                        return None;
+                    }
+                    // Only a string type value is allowed.
+                    let Some(value_str) = value.value_as_str() else {
+                        cx.adcx().expect_string_literal(value);
+                        return None;
+                    };
+                    // The section name does not allow null characters.
+                    if value_str.as_str().contains('\0') {
+                        cx.emit_err(NullOnSection { span: value.value_span });
+                    }
+                    // The section name is not allowed to be empty, LLVM does
+                    // not allow them.
+                    if value_str.is_empty() {
+                        cx.emit_err(EmptySection { span: value.value_span });
+                    }
+                    section = Some(value_str);
+                    // Integer parsing is not needed, process next item.
+                    continue;
+                }
                 _ => {
-                    errored = true;
                     cx.adcx().expected_specific_argument(
                         ident.span,
                         &[sym::prefix_nops, sym::entry_nops],
                     );
-                    continue;
+                    return None;
                 }
             };
 
             let rustc_ast::LitKind::Int(val, _) = value.value_as_lit().kind else {
-                errored = true;
                 cx.adcx().expected_integer_literal(value.value_span);
-                continue;
+                return None;
             };
 
             let Ok(val) = val.get().try_into() else {
-                errored = true;
                 cx.adcx().expected_integer_literal_in_range(
                     value.value_span,
                     u8::MIN as isize,
                     u8::MAX as isize,
                 );
-                continue;
+                return None;
             };
 
             *attrib_to_write = Some(val);
         }
 
-        if errored {
-            None
-        } else {
-            Some(AttributeKind::PatchableFunctionEntry {
-                prefix: prefix.unwrap_or(0),
-                entry: entry.unwrap_or(0),
-            })
-        }
+        Some(AttributeKind::PatchableFunctionEntry { prefix, entry, section })
     }
 }

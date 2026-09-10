@@ -21,6 +21,7 @@
 #![feature(const_alloc_error)]
 #![feature(const_cmp)]
 #![feature(const_convert)]
+#![feature(const_default)]
 #![feature(const_destruct)]
 #![feature(const_heap)]
 #![feature(const_option_ops)]
@@ -37,6 +38,7 @@
 #![feature(iter_next_chunk)]
 #![feature(maybe_uninit_uninit_array_transpose)]
 #![feature(ptr_alignment_type)]
+#![feature(ptr_cast_slice)]
 #![feature(ptr_internals)]
 #![feature(rev_into_inner)]
 #![feature(sized_type_properties)]
@@ -51,6 +53,7 @@
 #![feature(trusted_random_access)]
 #![feature(try_reserve_kind)]
 #![feature(try_trait_v2)]
+#![feature(unwrap_infallible)]
 #![feature(wtf8_internals)]
 // tidy-alphabetical-end
 //

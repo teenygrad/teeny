@@ -23,7 +23,6 @@
 //! considering here as at that point, everything is monomorphic.
 
 use hir::def_id::LocalDefIdSet;
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir as hir;
 use rustc_hir::Node;
 use rustc_hir::def::{DefKind, Res};
@@ -145,7 +144,7 @@ impl<'tcx> ReachableContext<'tcx> {
                 _ => false,
             },
             Node::TraitItem(trait_method) => match trait_method.kind {
-                hir::TraitItemKind::Const(_, ref default, _) => default.is_some(),
+                hir::TraitItemKind::Const(_, ref default) => default.is_some(),
                 hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(_)) => true,
                 hir::TraitItemKind::Fn(_, hir::TraitFn::Required(_))
                 | hir::TraitItemKind::Type(..) => false,
@@ -266,11 +265,11 @@ impl<'tcx> ReachableContext<'tcx> {
             }
             Node::TraitItem(trait_method) => {
                 match trait_method.kind {
-                    hir::TraitItemKind::Const(_, None, _)
+                    hir::TraitItemKind::Const(_, None)
                     | hir::TraitItemKind::Fn(_, hir::TraitFn::Required(_)) => {
                         // Keep going, nothing to get exported
                     }
-                    hir::TraitItemKind::Const(_, Some(rhs), _) => self.visit_const_item_rhs(rhs),
+                    hir::TraitItemKind::Const(_, Some(rhs)) => self.visit_const_item_rhs(rhs),
                     hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(body_id)) => {
                         self.visit_nested_body(body_id);
                     }
@@ -362,7 +361,7 @@ impl<'tcx> ReachableContext<'tcx> {
                         // become recursive, are also not infinitely recursing, because of the
                         // `reachable_symbols` check above.
                         // We still need to protect against stack overflow due to deeply nested statics.
-                        ensure_sufficient_stack(|| self.propagate_from_alloc(alloc));
+                        self.propagate_from_alloc(alloc);
                     }
                 }
             }
@@ -444,6 +443,8 @@ fn has_custom_linkage(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
         // FIXME(nbdd0121): `#[used]` are marked as reachable here so it's picked up by
         // `linked_symbols` in cg_ssa. They won't be exported in binary or cdylib due to their
         // `SymbolExportLevel::Rust` export level but may end up being exported in dylibs.
+        // Also note that Miri is relying on this to be able to find private `link_section` statics
+        // across all crates.
         || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_COMPILER)
         || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER)
         // Right now, the only way to get "foreign item symbol aliases" is by being an EII-implementation.

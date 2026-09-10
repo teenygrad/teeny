@@ -1,12 +1,10 @@
 //! Deeply normalize types using the old trait solver.
 
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::msg;
-use rustc_hir::def::DefKind;
 use rustc_infer::infer::at::At;
 use rustc_infer::infer::{InferCtxt, InferOk};
 use rustc_infer::traits::{
-    FromSolverError, Normalized, Obligation, PredicateObligations, TraitEngine,
+    FromSolverError, Normalized, Obligation, PredicateObligations, TraitEngine, TraitErrors,
 };
 use rustc_macros::extension;
 use rustc_middle::span_bug;
@@ -15,6 +13,7 @@ use rustc_middle::ty::{
     self, AliasTerm, Term, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitable,
     TypeVisitableExt, TypingMode, Unnormalized,
 };
+use thin_vec::ThinVec;
 use tracing::{debug, instrument};
 
 use super::{BoundVarReplacer, PlaceholderReplacer, SelectionContext, project};
@@ -36,7 +35,6 @@ impl<'tcx> At<'_, 'tcx> {
             let Normalized { value, obligations } = crate::solve::normalize(*self, value);
             InferOk { value, obligations }
         } else {
-            let value = value.skip_normalization();
             let mut selcx = SelectionContext::new(self.infcx);
             let Normalized { value, obligations } =
                 normalize_with_depth(&mut selcx, self.param_env, self.cause.clone(), 0, value);
@@ -60,7 +58,7 @@ impl<'tcx> At<'_, 'tcx> {
         self,
         value: Unnormalized<'tcx, T>,
         fulfill_cx: &mut dyn TraitEngine<'tcx, E>,
-    ) -> Result<T, Vec<E>>
+    ) -> Result<T, ThinVec<E>>
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
         E: FromSolverError<'tcx, NextSolverError<'tcx>>,
@@ -81,14 +79,15 @@ impl<'tcx> At<'_, 'tcx> {
                 .into_value_registering_obligations(self.infcx, &mut *fulfill_cx);
             let errors = fulfill_cx.evaluate_obligations_error_on_ambiguity(self.infcx);
             let value = self.infcx.resolve_vars_if_possible(value);
-            if errors.is_empty() {
-                Ok(value)
-            } else {
-                // Drop pending obligations, since deep normalization may happen
-                // in a loop and we don't want to trigger the assertion on the next
-                // iteration due to pending ambiguous obligations we've left over.
-                let _ = fulfill_cx.collect_remaining_errors(self.infcx);
-                Err(errors)
+            match errors {
+                TraitErrors::NoErrors => Ok(value),
+                TraitErrors::HasErrors(errors) => {
+                    // Drop pending obligations, since deep normalization may happen
+                    // in a loop and we don't want to trigger the assertion on the next
+                    // iteration due to pending ambiguous obligations we've left over.
+                    let _ = fulfill_cx.collect_remaining_errors(self.infcx);
+                    Err(errors)
+                }
             }
         }
     }
@@ -100,7 +99,7 @@ pub(crate) fn normalize_with_depth<'a, 'b, 'tcx, T>(
     param_env: ty::ParamEnv<'tcx>,
     cause: ObligationCause<'tcx>,
     depth: usize,
-    value: T,
+    value: Unnormalized<'tcx, T>,
 ) -> Normalized<'tcx, T>
 where
     T: TypeFoldable<TyCtxt<'tcx>>,
@@ -116,7 +115,7 @@ pub(crate) fn normalize_with_depth_to<'a, 'b, 'tcx, T>(
     param_env: ty::ParamEnv<'tcx>,
     cause: ObligationCause<'tcx>,
     depth: usize,
-    value: T,
+    value: Unnormalized<'tcx, T>,
     obligations: &mut PredicateObligations<'tcx>,
 ) -> T
 where
@@ -124,7 +123,7 @@ where
 {
     debug!(obligations.len = obligations.len());
     let mut normalizer = AssocTypeNormalizer::new(selcx, param_env, cause, depth, obligations);
-    let result = ensure_sufficient_stack(|| AssocTypeNormalizer::fold(&mut normalizer, value));
+    let result = AssocTypeNormalizer::fold(&mut normalizer, value.skip_normalization());
     debug!(?result, obligations.len = normalizer.obligations.len());
     debug!(?normalizer.obligations,);
     result
@@ -141,10 +140,10 @@ pub(super) fn needs_normalization<'tcx, T: TypeVisitable<TyCtxt<'tcx>>>(
     match infcx.typing_mode_raw().assert_not_erased() {
         // FIXME(#132279): We likely want to reveal opaques during post borrowck analysis
         TypingMode::Coherence
-        | TypingMode::Analysis { .. }
-        | TypingMode::Borrowck { .. }
-        | TypingMode::PostBorrowckAnalysis { .. } => flags.remove(ty::TypeFlags::HAS_TY_OPAQUE),
-        TypingMode::PostAnalysis => {}
+        | TypingMode::Typeck { .. }
+        | TypingMode::PostTypeckUntilBorrowck { .. }
+        | TypingMode::PostBorrowck { .. } => flags.remove(ty::TypeFlags::HAS_TY_OPAQUE),
+        TypingMode::Reflection | TypingMode::PostAnalysis | TypingMode::Codegen => {}
     }
 
     value.has_type_flags(flags)
@@ -230,7 +229,7 @@ impl<'a, 'b, 'tcx> AssocTypeNormalizer<'a, 'b, 'tcx> {
             )
             .ok()
             .flatten()
-            .unwrap_or_else(|| proj.to_term(infcx.tcx));
+            .unwrap_or_else(|| proj.to_term(infcx.tcx, ty::IsRigid::No));
 
             PlaceholderReplacer::replace_placeholders(
                 infcx,
@@ -296,7 +295,7 @@ impl<'a, 'b, 'tcx> AssocTypeNormalizer<'a, 'b, 'tcx> {
         let recursion_limit = self.cx().recursion_limit();
         if !recursion_limit.value_within_limit(self.depth) {
             self.selcx.infcx.err_ctxt().report_overflow_error(
-                OverflowCause::DeeplyNormalize(free.into()),
+                OverflowCause::DeeplyNormalize(free),
                 self.cause.span,
                 false,
                 |diag| {
@@ -304,6 +303,8 @@ impl<'a, 'b, 'tcx> AssocTypeNormalizer<'a, 'b, 'tcx> {
                 },
             );
         }
+
+        let def_id = free.expect_free_def_id();
 
         // We don't replace bound vars in the generic arguments of the free alias with
         // placeholders. This doesn't cause any issues as instantiating parameters with
@@ -314,7 +315,7 @@ impl<'a, 'b, 'tcx> AssocTypeNormalizer<'a, 'b, 'tcx> {
         // placeholders as the trait solver does not expect to encounter escaping bound
         // vars in obligations.
         //
-        // FIXME(lazy_type_alias): Check how much this actually matters for perf before
+        // FIXME(checked_type_alias): Check how much this actually matters for perf before
         // stabilization. This is a bit weird and generally not how we handle binders in
         // the compiler so ideally we'd do the same boundvar->placeholder->boundvar dance
         // that other kinds of normalization do.
@@ -322,28 +323,27 @@ impl<'a, 'b, 'tcx> AssocTypeNormalizer<'a, 'b, 'tcx> {
         self.obligations.extend(
             infcx
                 .tcx
-                .predicates_of(free.def_id())
+                .clauses_of(def_id)
                 .instantiate_own(infcx.tcx, free.args)
-                .map(|(pred, span)| (pred.skip_norm_wip(), span))
-                .map(|(mut predicate, span)| {
+                .map(|(clause, span)| (clause.skip_norm_wip(), span))
+                .map(|(mut clause, span)| {
                     if free.has_escaping_bound_vars() {
-                        (predicate, ..) = BoundVarReplacer::replace_bound_vars(
+                        (clause, ..) = BoundVarReplacer::replace_bound_vars(
                             infcx,
                             &mut self.universes,
-                            predicate,
+                            clause,
                         );
                     }
                     let mut cause = self.cause.clone();
-                    cause
-                        .map_code(|code| ObligationCauseCode::TypeAlias(code, span, free.def_id()));
-                    Obligation::new(infcx.tcx, cause, self.param_env, predicate)
+                    cause.map_code(|code| ObligationCauseCode::TypeAlias(code, span, def_id));
+                    Obligation::new(infcx.tcx, cause, self.param_env, clause)
                 }),
         );
         self.depth += 1;
-        let res = if free.kind(infcx.tcx).is_type() {
+        let res: ty::Term<'tcx> = if free.kind.is_type() {
             infcx
                 .tcx
-                .type_of(free.def_id())
+                .type_of(def_id)
                 .instantiate(infcx.tcx, free.args)
                 .skip_norm_wip()
                 .fold_with(self)
@@ -351,12 +351,25 @@ impl<'a, 'b, 'tcx> AssocTypeNormalizer<'a, 'b, 'tcx> {
         } else {
             infcx
                 .tcx
-                .const_of_item(free.def_id())
+                .const_of_item(def_id)
                 .instantiate(infcx.tcx, free.args)
                 .skip_norm_wip()
                 .fold_with(self)
                 .into()
         };
+        // When normalizing a free const alias, register a `ConstArgHasType`
+        // obligation to ensure the const value's type matches the declared type.
+        if let Some(ct) = res.as_const() {
+            let expected_ty =
+                infcx.tcx.type_of(def_id).instantiate(infcx.tcx, free.args).skip_norm_wip();
+            self.obligations.push(Obligation::with_depth(
+                infcx.tcx,
+                self.cause.clone(),
+                self.depth,
+                self.param_env,
+                ty::ClauseKind::ConstArgHasType(ct, expected_ty),
+            ));
+        }
         self.depth -= 1;
         res
     }
@@ -378,11 +391,14 @@ impl<'a, 'b, 'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTypeNormalizer<'a, 'b, 'tcx
     }
 
     fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
+        // We don't use the rigid marker in old solver.
+        debug_assert!(!ty.has_rigid_aliases());
+
         if !needs_normalization(self.selcx.infcx, &ty) {
             return ty;
         }
 
-        let ty::Alias(data) = *ty.kind() else { return ty.super_fold_with(self) };
+        let ty::Alias(_, data) = *ty.kind() else { return ty.super_fold_with(self) };
 
         // We try to be a little clever here as a performance optimization in
         // cases where there are nested projections under binders.
@@ -413,10 +429,10 @@ impl<'a, 'b, 'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTypeNormalizer<'a, 'b, 'tcx
                 match self.selcx.typing_mode() {
                     // FIXME(#132279): We likely want to reveal opaques during post borrowck analysis
                     TypingMode::Coherence
-                    | TypingMode::Analysis { .. }
-                    | TypingMode::Borrowck { .. }
-                    | TypingMode::PostBorrowckAnalysis { .. } => ty.super_fold_with(self),
-                    TypingMode::PostAnalysis => {
+                    | TypingMode::Typeck { .. }
+                    | TypingMode::PostTypeckUntilBorrowck { .. }
+                    | TypingMode::PostBorrowck { .. } => ty.super_fold_with(self),
+                    TypingMode::Reflection | TypingMode::PostAnalysis | TypingMode::Codegen => {
                         let recursion_limit = self.cx().recursion_limit();
                         if !recursion_limit.value_within_limit(self.depth) {
                             self.selcx.infcx.err_ctxt().report_overflow_error(
@@ -446,45 +462,42 @@ impl<'a, 'b, 'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTypeNormalizer<'a, 'b, 'tcx
 
     #[instrument(skip(self), level = "debug")]
     fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
+        // We don't use the rigid marker in old solver.
+        debug_assert!(!ct.has_rigid_aliases());
+
         let tcx = self.selcx.tcx();
 
         if tcx.features().generic_const_exprs()
             // Normalize type_const items even with feature `generic_const_exprs`.
-            && !matches!(ct.kind(), ty::ConstKind::Unevaluated(uv) if tcx.is_type_const(uv.def))
+            && !matches!(ct.kind(), ty::ConstKind::Alias(_, alias_const) if alias_const.kind.is_type_const(tcx))
             || !needs_normalization(self.selcx.infcx, &ct)
         {
             return ct;
         }
 
-        let uv = match ct.kind() {
-            ty::ConstKind::Unevaluated(uv) => uv,
+        let alias_const = match ct.kind() {
+            ty::ConstKind::Alias(_, alias_const) => alias_const,
             _ => return ct.super_fold_with(self),
         };
 
-        // Note that the AssocConst and Const cases are unreachable on stable,
+        // Note that the Projection/Inherent/Free cases are unreachable on stable,
         // unless a `min_generic_const_args` feature gate error has already
         // been emitted earlier in compilation.
         //
-        // That's because we can only end up with an Unevaluated ty::Const for a const item
+        // That's because we can only end up with an Alias ty::Const for a const item
         // if it was marked with `type const`. Using this attribute without the mgca
         // feature gate causes a parse error.
-        let ct = match tcx.def_kind(uv.def) {
-            DefKind::AssocConst { .. } => match tcx.def_kind(tcx.parent(uv.def)) {
-                DefKind::Trait => self
-                    .normalize_trait_projection(ty::AliasTerm::from_unevaluated_const(tcx, uv))
-                    .expect_const(),
-                DefKind::Impl { of_trait: false } => self
-                    .normalize_inherent_projection(ty::AliasTerm::from_unevaluated_const(tcx, uv))
-                    .expect_const(),
-                kind => unreachable!(
-                    "unexpected `DefKind` for const alias' resolution's parent def: {:?}",
-                    kind
-                ),
-            },
-            DefKind::Const { .. } => self
-                .normalize_free_alias(ty::AliasTerm::from_unevaluated_const(tcx, uv))
-                .expect_const(),
-            DefKind::AnonConst => {
+        let ct = match alias_const.kind {
+            ty::AliasConstKind::Projection { .. } => {
+                self.normalize_trait_projection(alias_const.into()).expect_const()
+            }
+            ty::AliasConstKind::Inherent { .. } => {
+                self.normalize_inherent_projection(alias_const.into()).expect_const()
+            }
+            ty::AliasConstKind::Free { .. } => {
+                self.normalize_free_alias(alias_const.into()).expect_const()
+            }
+            ty::AliasConstKind::Anon { .. } => {
                 let ct = ct.super_fold_with(self);
                 super::with_replaced_escaping_bound_vars(
                     self.selcx.infcx,
@@ -492,9 +505,6 @@ impl<'a, 'b, 'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTypeNormalizer<'a, 'b, 'tcx
                     ct,
                     |ct| super::evaluate_const(self.selcx.infcx, ct, self.param_env),
                 )
-            }
-            kind => {
-                unreachable!("unexpected `DefKind` for const alias to resolve to: {:?}", kind)
             }
         };
 

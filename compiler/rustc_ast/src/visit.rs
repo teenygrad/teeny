@@ -323,7 +323,7 @@ macro_rules! common_visitor_and_walkers {
             Closure(&'a $($mut)? ClosureBinder, &'a $($mut)? Option<CoroutineKind>, &'a $($mut)? Box<FnDecl>, &'a $($mut)? Box<Expr>),
         }
 
-        impl<'a> FnKind<'a> {
+        impl<'a> FnKind<'_> {
             pub fn header(&'a $($mut)? self) -> Option<&'a $($mut)? FnHeader> {
                 match *self {
                     FnKind::Fn(_, _, Fn { sig, .. }) => Some(&$($mut)? sig.header),
@@ -365,7 +365,6 @@ macro_rules! common_visitor_and_walkers {
             crate::token::LitKind,
             crate::tokenstream::LazyAttrTokenStream,
             crate::tokenstream::TokenStream,
-            EarlyParsedAttribute,
             Movability,
             Mutability,
             Pinnedness,
@@ -374,6 +373,7 @@ macro_rules! common_visitor_and_walkers {
             rustc_span::ErrorGuaranteed,
             std::borrow::Cow<'_, str>,
             Symbol,
+            SyntheticAttr,
             u8,
             usize,
         );
@@ -386,6 +386,8 @@ macro_rules! common_visitor_and_walkers {
         impl_visitable_list!(<$($lt)? $($mut)?>
             ThinVec<AngleBracketedArg>,
             ThinVec<Attribute>,
+            ThinVec<GenericBound>,
+            ThinVec<Ident>,
             ThinVec<(Ident, Option<Ident>)>,
             ThinVec<(NodeId, Path)>,
             ThinVec<PathSegment>,
@@ -416,7 +418,6 @@ macro_rules! common_visitor_and_walkers {
             UnsafeBinderCastKind,
             BinOpKind,
             BlockCheckMode,
-            MgcaDisambiguation,
             BorrowKind,
             BoundAsyncness,
             BoundConstness,
@@ -426,7 +427,6 @@ macro_rules! common_visitor_and_walkers {
             Const,
             ConstBlockItem,
             ConstItem,
-            ConstItemRhsKind,
             Defaultness,
             Delegation,
             DelegationMac,
@@ -460,7 +460,6 @@ macro_rules! common_visitor_and_walkers {
             ModSpans,
             MutTy,
             NormalAttr,
-            AttrItemKind,
             Parens,
             ParenthesizedArgs,
             PatFieldsRest,
@@ -570,6 +569,7 @@ macro_rules! common_visitor_and_walkers {
                 fn visit_expr(Expr);
                 fn visit_expr_field(ExprField);
                 fn visit_field_def(FieldDef);
+                fn visit_field_def_extras(FieldDefExtras);
                 fn visit_fn_decl(FnDecl);
                 fn visit_fn_header(FnHeader);
                 fn visit_fn_ret_ty(FnRetTy);
@@ -582,12 +582,14 @@ macro_rules! common_visitor_and_walkers {
                 fn visit_generics(Generics);
                 fn visit_inline_asm(InlineAsm);
                 fn visit_inline_asm_sym(InlineAsmSym);
+                fn visit_impl_restriction(ImplRestriction);
                 //fn visit_item(Item);
                 fn visit_label(Label);
                 fn visit_lifetime(Lifetime, _ctxt: LifetimeCtxt);
                 fn visit_local(Local);
                 fn visit_mac_call(MacCall);
                 fn visit_macro_def(MacroDef);
+                fn visit_mut_restriction(MutRestriction);
                 fn visit_param_bound(GenericBound, _ctxt: BoundKind);
                 fn visit_param(Param);
                 fn visit_pat_field(PatField);
@@ -597,7 +599,6 @@ macro_rules! common_visitor_and_walkers {
                 fn visit_poly_trait_ref(PolyTraitRef);
                 fn visit_precise_capturing_arg(PreciseCapturingArg);
                 fn visit_qself(QSelf);
-                fn visit_impl_restriction(ImplRestriction);
                 fn visit_trait_ref(TraitRef);
                 fn visit_ty_pat(TyPat);
                 fn visit_ty(Ty);
@@ -932,12 +933,12 @@ macro_rules! common_visitor_and_walkers {
                     _ctxt,
                     // Visibility is visited as a part of the item.
                     _vis,
-                    Fn { defaultness, ident, sig, generics, contract, body, define_opaque, eii_impls },
+                    Fn { defaultness, ident, sig, generics, contract, body, define_opaque, eii_impl },
                 ) => {
                     let FnSig { header, decl, span } = sig;
                     visit_visitable!($($mut)? vis,
                         defaultness, ident, header, generics, decl,
-                        contract, body, span, define_opaque, eii_impls
+                        contract, body, span, define_opaque, eii_impl
                     );
                 }
                 FnKind::Closure(binder, coroutine_kind, decl, body) =>
@@ -998,7 +999,7 @@ macro_rules! common_visitor_and_walkers {
                     visit_visitable!($($mut)? vis, head_expression, if_block, optional_else),
                 ExprKind::While(subexpression, block, opt_label) =>
                     visit_visitable!($($mut)? vis, subexpression, block, opt_label),
-                ExprKind::ForLoop { pat, iter, body, label, kind } =>
+                ExprKind::ForLoop(ForLoop { pat, iter, body, label, kind }) =>
                     visit_visitable!($($mut)? vis, pat, iter, body, label, kind),
                 ExprKind::Loop(block, opt_label, span) =>
                     visit_visitable!($($mut)? vis, block, opt_label, span),
@@ -1071,6 +1072,8 @@ macro_rules! common_visitor_and_walkers {
                     visit_visitable!($($mut)? vis, bytes),
                 ExprKind::UnsafeBinderCast(kind, expr, ty) =>
                     visit_visitable!($($mut)? vis, kind, expr, ty),
+                ExprKind::DirectConstArg(expr) =>
+                    visit_visitable!($($mut)? vis, expr),
                 ExprKind::Err(_guar) => {}
                 ExprKind::Dummy => {}
             }
@@ -1094,6 +1097,7 @@ macro_rules! common_visitor_and_walkers {
             pub fn walk_expr(Expr);
             pub fn walk_expr_field(ExprField);
             pub fn walk_field_def(FieldDef);
+            pub fn walk_field_def_extras(FieldDefExtras);
             pub fn walk_fn_decl(FnDecl);
             pub fn walk_fn_header(FnHeader);
             pub fn walk_fn_ret_ty(FnRetTy);
@@ -1106,12 +1110,14 @@ macro_rules! common_visitor_and_walkers {
             pub fn walk_generics(Generics);
             pub fn walk_inline_asm(InlineAsm);
             pub fn walk_inline_asm_sym(InlineAsmSym);
+            pub fn walk_impl_restriction(ImplRestriction);
             //pub fn walk_item(Item);
             pub fn walk_label(Label);
             pub fn walk_lifetime(Lifetime);
             pub fn walk_local(Local);
             pub fn walk_mac(MacCall);
             pub fn walk_macro_def(MacroDef);
+            pub fn walk_mut_restriction(MutRestriction);
             pub fn walk_param_bound(GenericBound);
             pub fn walk_param(Param);
             pub fn walk_pat_field(PatField);
@@ -1121,7 +1127,6 @@ macro_rules! common_visitor_and_walkers {
             pub fn walk_poly_trait_ref(PolyTraitRef);
             pub fn walk_precise_capturing_arg(PreciseCapturingArg);
             pub fn walk_qself(QSelf);
-            pub fn walk_impl_restriction(ImplRestriction);
             pub fn walk_trait_ref(TraitRef);
             pub fn walk_ty_pat(TyPat);
             pub fn walk_ty(Ty);

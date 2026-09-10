@@ -1,4 +1,5 @@
 //! base_db defines basic database traits. The concrete DB is defined by ide.
+// FIXME: Rename this crate, base db is non descriptive
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
@@ -7,8 +8,8 @@ extern crate rustc_driver as _;
 
 pub use salsa;
 pub use salsa_macros;
+use span::TextSize;
 
-// FIXME: Rename this crate, base db is non descriptive
 mod change;
 mod editioned_file_id;
 mod input;
@@ -32,7 +33,6 @@ pub use crate::{
     },
 };
 use dashmap::{DashMap, mapref::entry::Entry};
-pub use query_group;
 use rustc_hash::{FxHashSet, FxHasher};
 use salsa::{Durability, Setter};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
@@ -46,9 +46,10 @@ pub type FxIndexMap<K, V> =
 #[macro_export]
 macro_rules! impl_intern_key {
     ($id:ident, $loc:ident) => {
-        #[salsa_macros::interned(no_lifetime, revisions = usize::MAX)]
+        #[salsa::interned(unsafe(no_lifetime), revisions = usize::MAX)]
         #[derive(PartialOrd, Ord)]
         pub struct $id {
+            #[returns(ref)]
             pub loc: $loc,
         }
 
@@ -61,28 +62,6 @@ macro_rules! impl_intern_key {
             }
         }
     };
-}
-
-/// # SAFETY
-///
-/// `old_pointer` must be valid for unique writes
-pub unsafe fn unsafe_update_eq<T>(old_pointer: *mut T, new_value: T) -> bool
-where
-    T: PartialEq,
-{
-    // SAFETY: Caller obligation
-    let old_ref: &mut T = unsafe { &mut *old_pointer };
-
-    if *old_ref != new_value {
-        *old_ref = new_value;
-        true
-    } else {
-        // Subtle but important: Eq impls can be buggy or define equality
-        // in surprising ways. If it says that the value has not changed,
-        // we do not modify the existing value, and thus do not have to
-        // update the revision, as downstream code will not see the new value.
-        false
-    }
 }
 
 pub const DEFAULT_FILE_TEXT_LRU_CAP: u16 = 16;
@@ -168,14 +147,30 @@ impl Files {
         };
     }
 
-    pub fn file_source_root(&self, id: vfs::FileId) -> FileSourceRootInput {
+    pub fn file_source_root(
+        &self,
+        db: &dyn SourceDatabase,
+        id: vfs::FileId,
+    ) -> FileSourceRootInput {
         let file_source_root = match self.file_source_roots.get(&id) {
             Some(file_source_root) => file_source_root,
             None => panic!(
-                "Unable to get `FileSourceRootInput` with `vfs::FileId` ({id:?}); this is a bug",
+                "Unable to get `FileSourceRootInput` with `vfs::FileId` ({id:?}, path: {}); this is a bug",
+                self.path_for_file(db, id)
+                    .map_or_else(|| "<unknown>".to_owned(), |path| path.to_string()),
             ),
         };
         *file_source_root
+    }
+
+    fn path_for_file(&self, db: &dyn SourceDatabase, id: vfs::FileId) -> Option<vfs::VfsPath> {
+        for source_root in &*self.source_roots {
+            let source_root = *source_root.value();
+            if let Some(path) = source_root.source_root(db).path_for_file(&id) {
+                return Some(path.clone());
+            }
+        }
+        None
     }
 
     pub fn set_file_source_root_with_durability(
@@ -218,25 +213,27 @@ pub struct LocalRoots {
     pub roots: FxHashSet<SourceRootId>,
 }
 
-#[salsa_macros::input(debug)]
+#[salsa::input(debug)]
 pub struct FileText {
     #[returns(ref)]
     pub text: Arc<str>,
     pub file_id: vfs::FileId,
 }
 
-#[salsa_macros::input(debug)]
+#[salsa::input(debug)]
 pub struct FileSourceRootInput {
+    #[returns(copy)]
     pub source_root_id: SourceRootId,
 }
 
-#[salsa_macros::input(debug)]
+#[salsa::input(debug)]
 pub struct SourceRootInput {
+    #[returns(clone)]
     pub source_root: Arc<SourceRoot>,
 }
 
-#[salsa_macros::db]
-pub trait SourceDatabase: salsa::Database {
+#[salsa::db]
+pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     /// Text of the file.
     fn file_text(&self, file_id: vfs::FileId) -> FileText;
 
@@ -280,6 +277,8 @@ pub trait SourceDatabase: salsa::Database {
     fn crates_map(&self) -> Arc<CratesMap>;
 
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision);
+
+    fn line_column(&self, file: FileId, offset: TextSize) -> Result<(u32, u32), ()>;
 }
 
 static NEXT_NONCE: AtomicUsize = AtomicUsize::new(0);
@@ -295,6 +294,11 @@ impl Default for Nonce {
 }
 
 impl Nonce {
+    #[inline]
+    pub const fn invalid() -> Nonce {
+        Nonce(usize::MAX)
+    }
+
     #[inline]
     pub fn new() -> Nonce {
         Nonce(NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
@@ -328,6 +332,7 @@ pub fn toolchain_channel(db: &dyn salsa::Database, krate: Crate) -> Option<Relea
 
 #[salsa::input(singleton, debug)]
 struct AllCrates {
+    #[returns(clone)]
     crates: std::sync::Arc<[Crate]>,
 }
 
@@ -354,6 +359,7 @@ pub fn all_crates(db: &dyn salsa::Database) -> std::sync::Arc<[Crate]> {
 #[doc(hidden)]
 #[salsa::interned]
 pub struct InternedSourceRootId {
+    #[returns(copy)]
     pub id: SourceRootId,
 }
 

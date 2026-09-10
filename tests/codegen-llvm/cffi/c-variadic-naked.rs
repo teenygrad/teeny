@@ -1,10 +1,9 @@
 //@ needs-asm-support
-//@ needs-asm-mnemonic: ret
+//@ needs-asm-ret
 
 // tests that `va_start` is not injected into naked functions
 
 #![crate_type = "lib"]
-#![feature(c_variadic)]
 #![no_std]
 
 #[unsafe(naked)]

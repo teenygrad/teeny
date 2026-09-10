@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use base_db::SourceDatabase;
 use intern::{Symbol, sym};
 use span::{Edition, SyntaxContext};
 use syntax::utils::is_raw_identifier;
@@ -180,7 +181,7 @@ impl Name {
     #[inline]
     pub fn display<'a>(
         &'a self,
-        db: &dyn crate::db::ExpandDatabase,
+        db: &dyn SourceDatabase,
         edition: Edition,
     ) -> impl fmt::Display + 'a {
         _ = db;
@@ -201,8 +202,13 @@ impl Name {
 
     #[inline]
     pub fn is_generated(&self) -> bool {
-        self.as_str().starts_with("<ra@gennew>")
+        is_generated(self.as_str())
     }
+}
+
+#[inline]
+pub fn is_generated(name: &str) -> bool {
+    name.starts_with("<ra@gennew>")
 }
 
 struct Display<'a> {
@@ -240,14 +246,14 @@ impl AsName for ast::NameRef {
     fn as_name(&self) -> Name {
         match self.as_tuple_field() {
             Some(idx) => Name::new_tuple_field(idx),
-            None => Name::new_root(&self.text()),
+            None => Name::new_root(self.text()),
         }
     }
 }
 
 impl AsName for ast::Name {
     fn as_name(&self) -> Name {
-        Name::new_root(&self.text())
+        Name::new_root(self.text())
     }
 }
 

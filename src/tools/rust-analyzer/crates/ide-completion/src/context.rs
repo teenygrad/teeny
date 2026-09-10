@@ -273,7 +273,7 @@ pub(crate) enum Qualified<'db> {
     No,
     With {
         path: ast::Path,
-        resolution: Option<PathResolution>,
+        resolution: Option<PathResolution<'db>>,
         /// How many `super` segments are present in the path
         ///
         /// This would be None, if path is not solely made of
@@ -491,7 +491,7 @@ pub(crate) struct CompletionContext<'a, 'db> {
 
     pub(crate) qualifier_ctx: QualifierCtx,
 
-    pub(crate) locals: FxHashMap<Name, Local>,
+    pub(crate) locals: FxHashMap<Name, Local<'db>>,
 
     /// The module depth of the current module of the cursor position.
     /// - crate-root
@@ -545,7 +545,7 @@ impl<'db> CompletionContext<'_, 'db> {
     }
 
     /// Checks if an item is visible and not `doc(hidden)` at the completion site.
-    pub(crate) fn def_is_visible(&self, item: &ScopeDef) -> Visible {
+    pub(crate) fn def_is_visible(&self, item: &ScopeDef<'db>) -> Visible {
         match item {
             ScopeDef::ModuleDef(def) => match def {
                 hir::ModuleDef::Module(it) => self.is_visible(it),
@@ -611,7 +611,7 @@ impl<'db> CompletionContext<'_, 'db> {
         let Some(unstable_feature) = attrs.unstable_feature(self.db) else {
             return true;
         };
-        !INTERNAL_FEATURES.contains(&unstable_feature)
+        !is_internal_feature(&unstable_feature)
             || self.krate.is_unstable_feature_enabled(self.db, &unstable_feature)
     }
 
@@ -664,7 +664,7 @@ impl<'db> CompletionContext<'_, 'db> {
 
     /// A version of [`SemanticsScope::process_all_names`] that filters out `#[doc(hidden)]` items and
     /// passes all doc-aliases along, to funnel it into `Completions::add_path_resolution`.
-    pub(crate) fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef, Vec<SmolStr>)) {
+    pub(crate) fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef<'db>, Vec<SmolStr>)) {
         let _p = tracing::info_span!("CompletionContext::process_all_names").entered();
         self.scope.process_all_names(&mut |name, def| {
             if self.is_scope_def_hidden(def) {
@@ -675,12 +675,12 @@ impl<'db> CompletionContext<'_, 'db> {
         });
     }
 
-    pub(crate) fn process_all_names_raw(&self, f: &mut dyn FnMut(Name, ScopeDef)) {
+    pub(crate) fn process_all_names_raw(&self, f: &mut dyn FnMut(Name, ScopeDef<'db>)) {
         let _p = tracing::info_span!("CompletionContext::process_all_names_raw").entered();
         self.scope.process_all_names(f);
     }
 
-    fn is_scope_def_hidden(&self, scope_def: ScopeDef) -> bool {
+    fn is_scope_def_hidden(&self, scope_def: ScopeDef<'db>) -> bool {
         if let (Some(attrs), Some(krate)) = (scope_def.attrs(self.db), scope_def.krate(self.db)) {
             return self.is_doc_hidden(&attrs, krate);
         }
@@ -722,12 +722,19 @@ impl<'db> CompletionContext<'_, 'db> {
         self.krate != defining_crate && attrs.is_doc_hidden()
     }
 
-    pub(crate) fn doc_aliases_in_scope(&self, scope_def: ScopeDef) -> Vec<SmolStr> {
+    pub(crate) fn doc_aliases_in_scope(&self, scope_def: ScopeDef<'db>) -> Vec<SmolStr> {
         if let Some(attrs) = scope_def.attrs(self.db) {
             attrs.doc_aliases(self.db).iter().map(|it| it.as_str().into()).collect()
         } else {
             vec![]
         }
+    }
+
+    pub(crate) fn rebase_ty(&self, ty: &hir::Type<'db>) -> hir::Type<'db> {
+        self.scope
+            .generic_def()
+            .and_then(|def| ty.try_rebase_into_owner(self.db, def))
+            .unwrap_or_else(|| ty.instantiate_with_errors())
     }
 }
 
@@ -848,8 +855,35 @@ impl<'a, 'db> CompletionContext<'a, 'db> {
                     .map(|it| (it.into_module_def(), *kind))
             })
             .collect();
+        let exclude_subitems = exclude_flyimport
+            .iter()
+            .flat_map(|it| match it {
+                (ModuleDef::Module(module), AutoImportExclusionType::SubItems) => {
+                    module.scope(db, None)
+                }
+                _ => vec![],
+            })
+            .filter_map(|(_, def)| match def {
+                ScopeDef::ModuleDef(module_def) => Some(module_def),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let exclude_variants = exclude_flyimport
+            .iter()
+            .flat_map(|it| match it {
+                (ModuleDef::Adt(hir::Adt::Enum(enum_)), AutoImportExclusionType::Variants) => {
+                    enum_.variants(db)
+                }
+                _ => vec![],
+            })
+            .collect::<Vec<_>>();
         exclude_flyimport
             .extend(exclude_traits.iter().map(|&t| (t.into(), AutoImportExclusionType::Always)));
+        exclude_flyimport
+            .extend(exclude_subitems.into_iter().map(|it| (it, AutoImportExclusionType::Always)));
+        exclude_flyimport.extend(
+            exclude_variants.into_iter().map(|it| (it.into(), AutoImportExclusionType::Always)),
+        );
 
         // FIXME: This should be part of `CompletionAnalysis` / `expand_and_analyze`
         let complete_semicolon = if !config.add_semicolon_to_unit {
@@ -858,7 +892,13 @@ impl<'a, 'db> CompletionContext<'a, 'db> {
             sema.token_ancestors_with_macros(token.clone()).find(|node| {
                 matches!(
                     node.kind(),
-                    BLOCK_EXPR | MATCH_ARM | CLOSURE_EXPR | ARG_LIST | PAREN_EXPR | ARRAY_EXPR
+                    BLOCK_EXPR
+                        | MATCH_ARM
+                        | CLOSURE_EXPR
+                        | ARG_LIST
+                        | PAREN_EXPR
+                        | ARRAY_EXPR
+                        | MATCH_EXPR
                 )
             })
         {
@@ -949,6 +989,7 @@ const INTERNAL_FEATURES_LIST: &[Symbol] = &[
     sym::eii_internals,
     sym::field_representing_type_raw,
     sym::intrinsics,
+    sym::core_intrinsics,
     sym::lang_items,
     sym::link_cfg,
     sym::more_maybe_bounds,
@@ -972,3 +1013,12 @@ const INTERNAL_FEATURES_LIST: &[Symbol] = &[
 
 static INTERNAL_FEATURES: LazyLock<FxHashSet<Symbol>> =
     LazyLock::new(|| INTERNAL_FEATURES_LIST.iter().cloned().collect());
+
+fn is_internal_feature(feature: &Symbol) -> bool {
+    if INTERNAL_FEATURES.contains(feature) {
+        return true;
+    }
+    // Libs features are internal if they end in `_internal` or `_internals`.
+    let feature = feature.as_str();
+    feature.ends_with("_internal") || feature.ends_with("_internals")
+}

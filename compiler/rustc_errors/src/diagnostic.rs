@@ -7,7 +7,7 @@ use std::panic;
 use std::path::PathBuf;
 use std::thread::panicking;
 
-use rustc_data_structures::sync::{DynSend, DynSync};
+use rustc_ast::attr::version::RustcVersion;
 use rustc_error_messages::{DiagArgMap, DiagArgName, DiagArgValue, IntoDiagArg};
 use rustc_lint_defs::{Applicability, LintExpectationId};
 use rustc_macros::{Decodable, Encodable};
@@ -101,7 +101,6 @@ impl EmissionGuarantee for rustc_span::fatal_error::FatalError {
 ///   rather than the `Diagnostic` impl.
 /// - Derived impls are always generic, and it's good for the hand-written
 ///   impls to be consistent with them.
-#[rustc_diagnostic_item = "Diagnostic"]
 pub trait Diagnostic<'a, G: EmissionGuarantee = ErrorGuaranteed> {
     /// Write out as a diagnostic out of `DiagCtxt`.
     #[must_use]
@@ -119,16 +118,6 @@ where
     }
 }
 
-impl<'a> Diagnostic<'a, ()>
-    for Box<
-        dyn for<'b> FnOnce(DiagCtxtHandle<'b>, Level) -> Diag<'b, ()> + DynSync + DynSend + 'static,
-    >
-{
-    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
-        self(dcx, level)
-    }
-}
-
 /// Type used to emit diagnostic through a closure instead of implementing the `Diagnostic` trait.
 pub struct DiagDecorator<F: FnOnce(&mut Diag<'_, ()>)>(pub F);
 
@@ -142,7 +131,6 @@ impl<'a, F: FnOnce(&mut Diag<'_, ()>)> Diagnostic<'a, ()> for DiagDecorator<F> {
 
 /// Trait implemented by error types. This should not be implemented manually. Instead, use
 /// `#[derive(Subdiagnostic)]` -- see [rustc_macros::Subdiagnostic].
-#[rustc_diagnostic_item = "Subdiagnostic"]
 pub trait Subdiagnostic {
     /// Add a subdiagnostic to an existing diagnostic.
     fn add_to_diag<G: EmissionGuarantee>(self, diag: &mut Diag<'_, G>);
@@ -175,6 +163,8 @@ pub struct IsLint {
     pub(crate) name: String,
     /// Indicates whether this lint should show up in cargo's future breakage report.
     has_future_breakage: bool,
+    /// Indicates the minimum rust version this lint applies to
+    rust_version: Option<RustcVersion>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -207,6 +197,43 @@ impl DiagStyledString {
 
     pub fn content(&self) -> String {
         self.0.iter().map(|x| x.content.as_str()).collect::<String>()
+    }
+
+    /// Merge segments of the same style.
+    pub fn compact(&mut self) {
+        let segments = std::mem::take(&mut self.0);
+        let mut iter = segments.into_iter();
+        let Some(mut prev) = iter.next() else { return };
+        while let Some(segment) = iter.next() {
+            if prev.style == segment.style {
+                prev.content.push_str(&segment.content);
+            } else {
+                self.0.push(prev);
+                prev = segment;
+            }
+        }
+        self.0.push(prev);
+    }
+
+    /// Remove the middle of all long segments for shorter rendering.
+    pub fn shorten(&mut self) {
+        self.compact();
+        /// The marker for removed text.
+        const ELLIPSIS: &str = "...";
+        /// How many chars at the start and end will remain.
+        const PADDING: usize = 6;
+        /// The distance after which it is not worth it to reduce the text.
+        const DELTA: usize = 3;
+
+        for segment in self.0.iter_mut() {
+            let char_len = segment.content.chars().count();
+            if char_len > PADDING * 2 + ELLIPSIS.chars().count() + DELTA
+                && let Some((left, _)) = segment.content.char_indices().nth(PADDING)
+                && let Some((right, _)) = segment.content.char_indices().nth(char_len - PADDING)
+            {
+                segment.content.replace_range(left..right, ELLIPSIS);
+            }
+        }
     }
 }
 
@@ -306,6 +333,11 @@ impl DiagInner {
     /// Indicates whether this diagnostic should show up in cargo's future breakage report.
     pub(crate) fn has_future_breakage(&self) -> bool {
         matches!(self.is_lint, Some(IsLint { has_future_breakage: true, .. }))
+    }
+
+    /// Indicates the minimum rust version this lint applies to.
+    pub(crate) fn rust_version(&self) -> Option<RustcVersion> {
+        self.is_lint.as_ref().and_then(|is| is.rust_version)
     }
 
     pub(crate) fn is_force_warn(&self) -> bool {
@@ -1152,8 +1184,13 @@ impl<'a, G: EmissionGuarantee> Diag<'a, G> {
         self
     } }
 
-    pub fn is_lint(&mut self, name: String, has_future_breakage: bool) -> &mut Self {
-        self.is_lint = Some(IsLint { name, has_future_breakage });
+    pub fn is_lint(
+        &mut self,
+        name: String,
+        has_future_breakage: bool,
+        rust_version: Option<RustcVersion>,
+    ) -> &mut Self {
+        self.is_lint = Some(IsLint { name, has_future_breakage, rust_version });
         self
     }
 

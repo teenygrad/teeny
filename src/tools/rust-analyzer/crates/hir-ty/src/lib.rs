@@ -61,13 +61,13 @@ mod tests;
 
 use std::{hash::Hash, ops::ControlFlow};
 
+use base_db::SourceDatabase;
 use hir_def::{
     CallableDefId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, FunctionId,
     GenericDefId, HasModule, LifetimeParamId, ModuleId, StaticId, TypeAliasId, TypeOrConstParamId,
     TypeParamId,
-    db::DefDatabase,
     expr_store::{Body, ExpressionStore},
-    hir::{BindingId, ExprId, ExprOrPatId, PatId},
+    hir::{BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, PatId},
     resolver::{HasResolver, Resolver, TypeNs},
     type_ref::{Rawness, TypeRefId},
 };
@@ -81,6 +81,7 @@ use rustc_type_ir::{
     BoundVarIndexKind, TypeSuperVisitable, TypeVisitableExt,
     inherent::{IntoKind, Ty as _},
 };
+use salsa::SalsaValue;
 use stdx::impl_from;
 use syntax::ast::{ConstArg, make};
 use traits::FnTrait;
@@ -104,14 +105,15 @@ use crate::{
 
 pub use autoderef::autoderef;
 pub use infer::{
-    Adjust, Adjustment, AutoBorrow, BindingMode, ByRef, InferenceDiagnostic, InferenceResult,
-    InferenceTyDiagnosticSource, OverloadedDeref, PointerCast, cast::CastError, could_coerce,
-    could_unify, could_unify_deeply, infer_query_with_inspect,
+    Adjust, Adjustment, AutoBorrow, BindingMode, ByRef, ExplicitDropMethodUseKind,
+    InferenceDiagnostic, InferenceResult, InferenceTyDiagnosticSource, OverloadedDeref,
+    PointerCast, ReturnKind, cast::CastError, could_coerce, could_unify, could_unify_deeply,
+    infer_query_with_inspect,
 };
 pub use lower::{
-    GenericDefaults, GenericDefaultsRef, GenericPredicates, ImplTraits, LifetimeElisionKind,
-    TyDefId, TyLoweringContext, TyLoweringInferVarsCtx, TyLoweringResult, ValueTyDefId,
-    diagnostics::*,
+    FieldType, GenericDefaults, GenericDefaultsRef, GenericPredicates, LifetimeElisionKind,
+    LifetimeLoweringMode, LoweringMode, TyDefId, TyLoweringContext, TyLoweringInferVarsCtx,
+    TyLoweringResult, ValueTyDefId, diagnostics::*,
 };
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
 pub use target_feature::TargetFeatures;
@@ -164,7 +166,7 @@ impl ComplexMemoryMap<'_> {
 }
 
 impl<'db> MemoryMap<'db> {
-    pub fn vtable_ty(&self, id: usize) -> Result<Ty<'db>, MirEvalError> {
+    pub fn vtable_ty(&self, id: usize) -> Result<Ty<'db>, MirEvalError<'db>> {
         match self {
             MemoryMap::Empty | MemoryMap::Simple(_) => Err(MirEvalError::InvalidVTableId(id)),
             MemoryMap::Complex(cm) => cm.vtable.ty(id),
@@ -180,8 +182,8 @@ impl<'db> MemoryMap<'db> {
     /// allocator function as `f` and it will return a mapping of old addresses to new addresses.
     fn transform_addresses(
         &self,
-        mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError>,
-    ) -> Result<FxHashMap<usize, usize>, MirEvalError> {
+        mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError<'db>>,
+    ) -> Result<FxHashMap<usize, usize>, MirEvalError<'db>> {
         let mut transform = |(addr, val): (&usize, &[u8])| {
             let addr = *addr;
             let align = if addr == 0 { 64 } else { (addr - (addr & (addr - 1))).min(64) };
@@ -214,13 +216,13 @@ impl<'db> MemoryMap<'db> {
     }
 }
 
-/// Return an index of a parameter in the generic type parameter list by it's id.
+/// Returns the index of a parameter in the generic type parameter list by its id.
 pub fn type_or_const_param_idx(db: &dyn HirDatabase, id: TypeOrConstParamId) -> u32 {
     generics::generics(db, id.parent).type_or_const_param_idx(id)
 }
 
 pub fn lifetime_param_idx(db: &dyn HirDatabase, id: LifetimeParamId) -> u32 {
-    generics::generics(db, id.parent).lifetime_param_idx(id)
+    generics::generics(db, id.parent).lifetime_param_idx(id, false).0
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
@@ -384,7 +386,7 @@ pub fn associated_type_shorthand_candidates(
     let mut dedup_map = FxHashSet::default();
     let param_ty = Ty::new_param(interner, param, type_or_const_param_idx(db, param.into()));
     // We use the ParamEnv and not the predicates because the ParamEnv elaborates bounds.
-    let param_env = db.trait_environment(ExpressionStoreOwnerId::from(def));
+    let param_env = db.trait_environment(def);
     for clause in param_env.clauses {
         let ClauseKind::Trait(trait_clause) = clause.kind().skip_binder() else { continue };
         if trait_clause.self_ty() != param_ty {
@@ -463,6 +465,7 @@ pub fn callable_sig_from_fn_trait<'db>(
         args.tuple_fields(),
         ret,
         false,
+        // FIXME(splat): handle splatted arguments
         Safety::Safe,
         ExternAbi::Rust,
     ));
@@ -529,9 +532,9 @@ pub enum Span {
 }
 impl_from!(ExprId, PatId, BindingId, TypeRefId for Span);
 
-impl From<ExprOrPatId> for Span {
-    fn from(value: ExprOrPatId) -> Self {
-        match value {
+impl From<ExprOrPatIdPacked> for Span {
+    fn from(value: ExprOrPatIdPacked) -> Self {
+        match value.unpack() {
             ExprOrPatId::ExprId(idx) => idx.into(),
             ExprOrPatId::PatId(idx) => idx.into(),
         }
@@ -551,20 +554,27 @@ impl Span {
 }
 
 /// A [`DefWithBodyId`], or an anon const.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::Supertype)]
-pub enum InferBodyId {
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::Supertype, SalsaValue,
+)]
+pub enum InferBodyId<'db> {
     DefWithBodyId(DefWithBodyId),
-    AnonConstId(AnonConstId),
+    AnonConstId(AnonConstId<'db>),
 }
-impl_from!(DefWithBodyId(FunctionId, ConstId, StaticId), AnonConstId for InferBodyId);
-impl From<EnumVariantId> for InferBodyId {
+impl_from!(
+    impl<'db>
+    DefWithBodyId(FunctionId, ConstId, StaticId),
+    AnonConstId<'db>
+    for InferBodyId<'db>
+);
+impl<'db> From<EnumVariantId> for InferBodyId<'db> {
     fn from(id: EnumVariantId) -> Self {
         InferBodyId::DefWithBodyId(DefWithBodyId::VariantId(id))
     }
 }
 
-impl HasModule for InferBodyId {
-    fn module(&self, db: &dyn DefDatabase) -> ModuleId {
+impl HasModule for InferBodyId<'_> {
+    fn module(&self, db: &dyn SourceDatabase) -> ModuleId {
         match self {
             InferBodyId::DefWithBodyId(id) => id.module(db),
             InferBodyId::AnonConstId(id) => id.module(db),
@@ -572,8 +582,8 @@ impl HasModule for InferBodyId {
     }
 }
 
-impl HasResolver for InferBodyId {
-    fn resolver(self, db: &dyn DefDatabase) -> Resolver<'_> {
+impl HasResolver for InferBodyId<'_> {
+    fn resolver(self, db: &dyn SourceDatabase) -> Resolver<'_> {
         match self {
             InferBodyId::DefWithBodyId(id) => id.resolver(db),
             InferBodyId::AnonConstId(id) => id.resolver(db),
@@ -581,7 +591,7 @@ impl HasResolver for InferBodyId {
     }
 }
 
-impl InferBodyId {
+impl InferBodyId<'_> {
     pub fn expression_store_owner(self, db: &dyn HirDatabase) -> ExpressionStoreOwnerId {
         match self {
             InferBodyId::DefWithBodyId(id) => id.into(),
@@ -629,17 +639,11 @@ impl InferBodyId {
 
 pub fn setup_tracing() -> Option<tracing::subscriber::DefaultGuard> {
     use std::env;
-    use std::sync::LazyLock;
     use tracing_subscriber::{Registry, layer::SubscriberExt};
     use tracing_tree::HierarchicalLayer;
 
-    static ENABLE: LazyLock<bool> = LazyLock::new(|| env::var("CHALK_DEBUG").is_ok());
-    if !*ENABLE {
-        return None;
-    }
-
     let filter: tracing_subscriber::filter::Targets =
-        env::var("CHALK_DEBUG").ok().and_then(|it| it.parse().ok()).unwrap_or_default();
+        env::var("SOLVER_DEBUG").ok().and_then(|it| it.parse().ok()).unwrap_or_default();
     let layer = HierarchicalLayer::default()
         .with_indent_lines(true)
         .with_ansi(false)

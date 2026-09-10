@@ -29,13 +29,19 @@
 extern crate rustc_driver as _;
 
 mod handlers {
+    pub(crate) mod array_pattern_without_fixed_length;
     pub(crate) mod await_outside_of_async;
     pub(crate) mod bad_rtn;
     pub(crate) mod break_outside_of_loop;
+    pub(crate) mod cannot_be_dereferenced;
+    pub(crate) mod cannot_implicitly_deref_trait_object;
+    pub(crate) mod cannot_index_into;
     pub(crate) mod duplicate_field;
     pub(crate) mod elided_lifetimes_in_path;
     pub(crate) mod expected_array_or_slice_pat;
     pub(crate) mod expected_function;
+    pub(crate) mod explicit_drop_method_use;
+    pub(crate) mod fru_in_destructuring_assignment;
     pub(crate) mod functional_record_update_on_non_struct;
     pub(crate) mod generic_args_prohibited;
     pub(crate) mod generic_default_refers_to_self;
@@ -44,22 +50,26 @@ mod handlers {
     pub(crate) mod incorrect_case;
     pub(crate) mod incorrect_generics_len;
     pub(crate) mod incorrect_generics_order;
+    pub(crate) mod infer_vars_not_allowed;
     pub(crate) mod invalid_cast;
     pub(crate) mod invalid_derive_target;
     pub(crate) mod invalid_lhs_of_assignment;
+    pub(crate) mod invalid_range_pat_type;
     pub(crate) mod macro_error;
     pub(crate) mod malformed_derive;
+    pub(crate) mod method_call_illegal_sized_bound;
     pub(crate) mod mismatched_arg_count;
     pub(crate) mod mismatched_array_pat_len;
     pub(crate) mod missing_fields;
     pub(crate) mod missing_lifetime;
     pub(crate) mod missing_match_arms;
     pub(crate) mod missing_unsafe;
-    pub(crate) mod moved_out_of_ref;
-    pub(crate) mod mutability_errors;
+    pub(crate) mod mut_ref_in_imm_ref_pat;
+    pub(crate) mod mutable_ref;
     pub(crate) mod no_such_field;
     pub(crate) mod non_exhaustive_let;
     pub(crate) mod non_exhaustive_record_expr;
+    pub(crate) mod non_exhaustive_record_pat;
     pub(crate) mod parenthesized_generic_args_without_fn_trait;
     pub(crate) mod pattern_arg_in_extern_fn;
     pub(crate) mod private_assoc_item;
@@ -67,6 +77,7 @@ mod handlers {
     pub(crate) mod remove_trailing_return;
     pub(crate) mod remove_unnecessary_else;
     pub(crate) mod replace_filter_map_next_with_find_map;
+    pub(crate) mod return_outside_function;
     pub(crate) mod trait_impl_incorrect_safety;
     pub(crate) mod trait_impl_missing_assoc_item;
     pub(crate) mod trait_impl_orphan;
@@ -78,6 +89,8 @@ mod handlers {
     pub(crate) mod unimplemented_builtin_macro;
     pub(crate) mod unimplemented_trait;
     pub(crate) mod union_expr_must_have_exactly_one_field;
+    pub(crate) mod union_pat_has_rest;
+    pub(crate) mod union_pat_must_have_exactly_one_field;
     pub(crate) mod unreachable_label;
     pub(crate) mod unresolved_assoc_item;
     pub(crate) mod unresolved_extern_crate;
@@ -88,7 +101,7 @@ mod handlers {
     pub(crate) mod unresolved_method;
     pub(crate) mod unresolved_module;
     pub(crate) mod unused_must_use;
-    pub(crate) mod unused_variables;
+    pub(crate) mod yield_outside_coroutine;
 
     // The handlers below are unusual, the implement the diagnostics as well.
     pub(crate) mod field_shorthand;
@@ -102,10 +115,7 @@ mod tests;
 
 use std::sync::LazyLock;
 
-use hir::{
-    Crate, DisplayTarget, InFile, MacroCallIdExt, Semantics, db::ExpandDatabase,
-    diagnostics::AnyDiagnostic,
-};
+use hir::{Crate, DisplayTarget, InFile, MacroCallIdExt, Semantics, diagnostics::AnyDiagnostic};
 use ide_db::{
     FileId, FileRange, FxHashMap, FxHashSet, RootDatabase, Severity, SnippetCap,
     assists::{Assist, AssistId, AssistResolveStrategy, ExprFillDefaultMode},
@@ -116,9 +126,11 @@ use ide_db::{
     rename::RenameConfig,
     source_change::SourceChange,
 };
+use smallvec::{SmallVec, smallvec};
 use syntax::{
     AstPtr, Edition, SmolStr, SyntaxNode, SyntaxNodePtr, TextRange,
     ast::{self, AstNode},
+    format_smolstr,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -128,6 +140,7 @@ pub enum DiagnosticCode {
     RustcLint(&'static str),
     Clippy(&'static str),
     Ra(&'static str, Severity),
+    RaLint(&'static str, Severity),
 }
 
 impl DiagnosticCode {
@@ -145,7 +158,7 @@ impl DiagnosticCode {
             DiagnosticCode::Clippy(e) => {
                 format!("https://rust-lang.github.io/rust-clippy/master/#/{e}")
             }
-            DiagnosticCode::Ra(e, _) => {
+            DiagnosticCode::Ra(e, _) | DiagnosticCode::RaLint(e, _) => {
                 format!("https://rust-analyzer.github.io/book/diagnostics.html#{e}")
             }
         }
@@ -156,7 +169,8 @@ impl DiagnosticCode {
             DiagnosticCode::RustcHardError(r)
             | DiagnosticCode::RustcLint(r)
             | DiagnosticCode::Clippy(r)
-            | DiagnosticCode::Ra(r, _) => r,
+            | DiagnosticCode::Ra(r, _)
+            | DiagnosticCode::RaLint(r, _) => r,
             DiagnosticCode::SyntaxError => "syntax-error",
         }
     }
@@ -193,7 +207,7 @@ impl Diagnostic {
                 // FIXME: We can make this configurable, and if the user uses `cargo clippy` on flycheck, we can
                 // make it normal warning.
                 DiagnosticCode::Clippy(_) => Severity::WeakWarning,
-                DiagnosticCode::Ra(_, s) => s,
+                DiagnosticCode::Ra(_, s) | DiagnosticCode::RaLint(_, s) => s,
             },
             unused: false,
             experimental: true,
@@ -269,7 +283,6 @@ pub struct DiagnosticsConfig {
     pub prefer_prelude: bool,
     pub prefer_absolute: bool,
     pub term_search_fuel: u64,
-    pub term_search_borrowck: bool,
     pub show_rename_conflicts: bool,
 }
 
@@ -298,7 +311,6 @@ impl DiagnosticsConfig {
             prefer_prelude: true,
             prefer_absolute: false,
             term_search_fuel: 400,
-            term_search_borrowck: true,
             show_rename_conflicts: true,
         }
     }
@@ -418,15 +430,22 @@ pub fn semantic_diagnostics(
                 m.diagnostics(db, &mut diags, config.style_lints);
             }
         }
-        None => {
-            handlers::unlinked_file::unlinked_file(&ctx, &mut res, editioned_file_id.file_id(db))
-        }
+        None => handlers::unlinked_file::unlinked_file(&ctx, &mut res, editioned_file_id),
     }
 
     for diag in diags {
         let d = match diag {
             AnyDiagnostic::AwaitOutsideOfAsync(d) => handlers::await_outside_of_async::await_outside_of_async(&ctx, &d),
+            AnyDiagnostic::CannotBeDereferenced(d) => handlers::cannot_be_dereferenced::cannot_be_dereferenced(&ctx, &d),
+            AnyDiagnostic::CannotImplicitlyDerefTraitObject(d) => handlers::cannot_implicitly_deref_trait_object::cannot_implicitly_deref_trait_object(&ctx, &d),
+            AnyDiagnostic::CannotIndexInto(d) => handlers::cannot_index_into::cannot_index_into(&ctx, &d),
             AnyDiagnostic::CastToUnsized(d) => handlers::invalid_cast::cast_to_unsized(&ctx, &d),
+            AnyDiagnostic::InferVarsNotAllowed(d) => handlers::infer_vars_not_allowed::infer_vars_not_allowed(&ctx, &d),
+            AnyDiagnostic::ArrayPatternWithoutFixedLength(d) => {
+                handlers::array_pattern_without_fixed_length::array_pattern_without_fixed_length(
+                    &ctx, &d,
+                )
+            }
             AnyDiagnostic::ExpectedArrayOrSlicePat(d) => handlers::expected_array_or_slice_pat::expected_array_or_slice_pat(&ctx, &d),
             AnyDiagnostic::ExpectedFunction(d) => handlers::expected_function::expected_function(&ctx, &d),
             AnyDiagnostic::FunctionalRecordUpdateOnNonStruct(d) => handlers::functional_record_update_on_non_struct::functional_record_update_on_non_struct(&ctx, &d),
@@ -452,19 +471,20 @@ pub fn semantic_diagnostics(
                 continue;
             },
             AnyDiagnostic::MalformedDerive(d) => handlers::malformed_derive::malformed_derive(&ctx, &d),
+            AnyDiagnostic::MethodCallIllegalSizedBound(d) => handlers::method_call_illegal_sized_bound::method_call_illegal_sized_bound(&ctx, &d),
             AnyDiagnostic::MismatchedArgCount(d) => handlers::mismatched_arg_count::mismatched_arg_count(&ctx, &d),
             AnyDiagnostic::MismatchedArrayPatLen(d) => handlers::mismatched_array_pat_len::mismatched_array_pat_len(&ctx, &d),
             AnyDiagnostic::MissingFields(d) => handlers::missing_fields::missing_fields(&ctx, &d),
             AnyDiagnostic::MissingMatchArms(d) => handlers::missing_match_arms::missing_match_arms(&ctx, &d),
             AnyDiagnostic::MissingUnsafe(d) => handlers::missing_unsafe::missing_unsafe(&ctx, &d),
-            AnyDiagnostic::MovedOutOfRef(d) => handlers::moved_out_of_ref::moved_out_of_ref(&ctx, &d),
-            AnyDiagnostic::NeedMut(d) => match handlers::mutability_errors::need_mut(&ctx, &d) {
-                Some(it) => it,
-                None => continue,
-            },
+            AnyDiagnostic::MutRefInImmRefPat(d) => handlers::mut_ref_in_imm_ref_pat::mut_ref_in_imm_ref_pat(&ctx, &d),
+            AnyDiagnostic::MutableRefBinding(d) => handlers::mutable_ref::mutable_ref_binding(&ctx, &d),
             AnyDiagnostic::NonExhaustiveLet(d) => handlers::non_exhaustive_let::non_exhaustive_let(&ctx, &d),
             AnyDiagnostic::NonExhaustiveRecordExpr(d) => {
                 handlers::non_exhaustive_record_expr::non_exhaustive_record_expr(&ctx, &d)
+            }
+            AnyDiagnostic::NonExhaustiveRecordPat(d) => {
+                handlers::non_exhaustive_record_pat::non_exhaustive_record_pat(&ctx, &d)
             }
             AnyDiagnostic::NoSuchField(d) => handlers::no_such_field::no_such_field(&ctx, &d),
             AnyDiagnostic::DuplicateField(d) => handlers::duplicate_field::duplicate_field(&ctx, &d),
@@ -492,14 +512,6 @@ pub fn semantic_diagnostics(
             AnyDiagnostic::UnresolvedMethodCall(d) => handlers::unresolved_method::unresolved_method(&ctx, &d),
             AnyDiagnostic::UnresolvedModule(d) => handlers::unresolved_module::unresolved_module(&ctx, &d),
             AnyDiagnostic::UnusedMustUse(d) => handlers::unused_must_use::unused_must_use(&ctx, &d),
-            AnyDiagnostic::UnusedMut(d) => match handlers::mutability_errors::unused_mut(&ctx, &d) {
-                Some(it) => it,
-                None => continue,
-            },
-            AnyDiagnostic::UnusedVariable(d) => match handlers::unused_variables::unused_variables(&ctx, &d) {
-                Some(it) => it,
-                None => continue,
-            },
             AnyDiagnostic::BreakOutsideOfLoop(d) => handlers::break_outside_of_loop::break_outside_of_loop(&ctx, &d),
             AnyDiagnostic::MismatchedTupleStructPatArgCount(d) => handlers::mismatched_arg_count::mismatched_tuple_struct_pat_arg_count(&ctx, &d),
             AnyDiagnostic::RemoveTrailingReturn(d) => match handlers::remove_trailing_return::remove_trailing_return(&ctx, &d) {
@@ -519,10 +531,21 @@ pub fn semantic_diagnostics(
             AnyDiagnostic::ElidedLifetimesInPath(d) => handlers::elided_lifetimes_in_path::elided_lifetimes_in_path(&ctx, &d),
             AnyDiagnostic::GenericDefaultRefersToSelf(d) => handlers::generic_default_refers_to_self::generic_default_refers_to_self(&ctx, &d),
             AnyDiagnostic::InvalidLhsOfAssignment(d) => handlers::invalid_lhs_of_assignment::invalid_lhs_of_assignment(&ctx, &d),
+            AnyDiagnostic::InvalidRangePatType(d) => handlers::invalid_range_pat_type::invalid_range_pat_type(&ctx, &d),
             AnyDiagnostic::TypeMustBeKnown(d) => handlers::type_must_be_known::type_must_be_known(&ctx, &d),
             AnyDiagnostic::PatternArgInExternFn(d) => handlers::pattern_arg_in_extern_fn::pattern_arg_in_extern_fn(&ctx, &d),
             AnyDiagnostic::UnionExprMustHaveExactlyOneField(d) => handlers::union_expr_must_have_exactly_one_field::union_expr_must_have_exactly_one_field(&ctx, &d),
+            AnyDiagnostic::UnionPatMustHaveExactlyOneField(d) => {
+                handlers::union_pat_must_have_exactly_one_field::union_pat_must_have_exactly_one_field(&ctx, &d)
+            }
+            AnyDiagnostic::UnionPatHasRest(d) => {
+                handlers::union_pat_has_rest::union_pat_has_rest(&ctx, &d)
+            }
             AnyDiagnostic::UnimplementedTrait(d) => handlers::unimplemented_trait::unimplemented_trait(&ctx, &d),
+            AnyDiagnostic::FruInDestructuringAssignment(d) => handlers::fru_in_destructuring_assignment::fru_in_destructuring_assignment(&ctx, &d),
+            AnyDiagnostic::ExplicitDropMethodUse(d) => handlers::explicit_drop_method_use::explicit_drop_method_use(&ctx, &d),
+            AnyDiagnostic::YieldOutsideCoroutine(d) => handlers::yield_outside_coroutine::yield_outside_coroutine(&ctx, &d),
+            AnyDiagnostic::ReturnOutsideFunction(d) => handlers::return_outside_function::return_outside_function(&ctx, &d),
         };
         res.push(d)
     }
@@ -534,7 +557,14 @@ pub fn semantic_diagnostics(
 
     let mut lints = res
         .iter_mut()
-        .filter(|it| matches!(it.code, DiagnosticCode::Clippy(_) | DiagnosticCode::RustcLint(_)))
+        .filter(|it| {
+            matches!(
+                it.code,
+                DiagnosticCode::Clippy(_)
+                    | DiagnosticCode::RustcLint(_)
+                    | DiagnosticCode::RaLint(..)
+            )
+        })
         .filter_map(|it| Some((it.main_node(&ctx.sema)?, it)))
         .collect::<Vec<_>>();
 
@@ -578,7 +608,7 @@ fn handle_diag_from_macros(
     node: &InFile<SyntaxNode>,
 ) -> bool {
     let Some(macro_file) = node.file_id.macro_file() else { return true };
-    let span_map = sema.db.expansion_span_map(macro_file);
+    let span_map = macro_file.expansion_span_map(sema.db);
     let mut spans = span_map.spans_for_range(node.text_range());
     if spans.any(|span| {
         span.ctx.outer_expn(sema.db).is_some_and(|expansion| {
@@ -607,7 +637,7 @@ fn handle_diag_from_macros(
 
 struct BuiltLint {
     lint: &'static Lint,
-    groups: Vec<&'static str>,
+    groups: SmallVec<[SmolStr; 5]>,
 }
 
 static RUSTC_LINTS: LazyLock<FxHashMap<&str, BuiltLint>> =
@@ -628,12 +658,17 @@ fn build_lints_map(
 ) -> FxHashMap<&'static str, BuiltLint> {
     let mut map_with_prefixes: FxHashMap<_, _> = lints
         .iter()
-        .map(|lint| (lint.label, BuiltLint { lint, groups: vec![lint.label, "__RA_EVERY_LINT"] }))
+        .map(|lint| {
+            (
+                lint.label,
+                BuiltLint { lint, groups: smallvec![lint.label.into(), "__RA_EVERY_LINT".into()] },
+            )
+        })
         .collect();
     for g in lint_group {
         let mut add_children = |label: &'static str| {
             for child in g.children {
-                map_with_prefixes.get_mut(child).unwrap().groups.push(label);
+                map_with_prefixes.get_mut(child).unwrap().groups.push(label.into());
             }
         };
         add_children(g.lint.label);
@@ -654,12 +689,15 @@ fn handle_lints(
     edition: Edition,
 ) {
     for (node, diag) in diagnostics {
-        let lint = match diag.code {
-            DiagnosticCode::RustcLint(lint) => RUSTC_LINTS[lint].lint,
-            DiagnosticCode::Clippy(lint) => CLIPPY_LINTS[lint].lint,
-            _ => panic!("non-lint passed to `handle_lints()`"),
+        let default_severity = 'find_severity: {
+            let lint = match diag.code {
+                DiagnosticCode::RustcLint(lint) => RUSTC_LINTS[lint].lint,
+                DiagnosticCode::Clippy(lint) => CLIPPY_LINTS[lint].lint,
+                DiagnosticCode::RaLint(_, severity) => break 'find_severity severity,
+                _ => panic!("non-lint passed to `handle_lints()`"),
+            };
+            default_lint_severity(lint, edition)
         };
-        let default_severity = default_lint_severity(lint, edition);
         if !(default_severity == Severity::Allow && diag.severity == Severity::WeakWarning) {
             diag.severity = default_severity;
         }
@@ -759,13 +797,13 @@ fn lint_attrs(
 
 #[derive(Debug)]
 struct LintGroups {
-    groups: &'static [&'static str],
+    groups: SmallVec<[SmolStr; 5]>,
     inside_warnings: bool,
 }
 
 impl LintGroups {
     fn contains(&self, group: &str) -> bool {
-        self.groups.contains(&group) || (self.inside_warnings && group == "warnings")
+        self.groups.iter().any(|g| g == group) || (self.inside_warnings && group == "warnings")
     }
 }
 
@@ -774,12 +812,15 @@ fn lint_groups(lint: &DiagnosticCode, edition: Edition) -> LintGroups {
         DiagnosticCode::RustcLint(name) => {
             let lint = &RUSTC_LINTS[name];
             let inside_warnings = default_lint_severity(lint.lint, edition) == Severity::Warning;
-            (&lint.groups, inside_warnings)
+            (lint.groups.clone(), inside_warnings)
         }
         DiagnosticCode::Clippy(name) => {
             let lint = &CLIPPY_LINTS[name];
             let inside_warnings = default_lint_severity(lint.lint, edition) == Severity::Warning;
-            (&lint.groups, inside_warnings)
+            (lint.groups.clone(), inside_warnings)
+        }
+        DiagnosticCode::RaLint(name, severity) => {
+            (smallvec![format_smolstr!("rust_analyzer::{name}")], *severity == Severity::Warning)
         }
         _ => panic!("non-lint passed to `handle_lints()`"),
     };

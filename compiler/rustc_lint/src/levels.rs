@@ -31,17 +31,14 @@ use tracing::{debug, instrument};
 
 use crate::builtin::MISSING_DOCS;
 use crate::context::{CheckLintNameResult, LintStore};
-use crate::errors::{
-    CheckNameUnknownTool, MalformedAttribute, MalformedAttributeSub, OverruledAttribute,
-    OverruledAttributeSub, RequestedLevel, UnknownToolInScopedLint, UnsupportedGroup,
+use crate::diagnostics::{
+    CheckNameUnknownTool, DeprecatedLintName, DeprecatedLintNameFromCommandLine,
+    IgnoredUnlessCrateSpecified, MalformedAttribute, MalformedAttributeSub, OverruledAttribute,
+    OverruledAttributeLint, OverruledAttributeSub, RemovedLint, RemovedLintFromCommandLine,
+    RenamedLint, RenamedLintFromCommandLine, RenamedLintSuggestion, RequestedLevel, UnknownLint,
+    UnknownLintFromCommandLine, UnknownLintSuggestion, UnknownToolInScopedLint, UnsupportedGroup,
 };
 use crate::late::unerased_lint_store;
-use crate::lints::{
-    DeprecatedLintName, DeprecatedLintNameFromCommandLine, IgnoredUnlessCrateSpecified,
-    OverruledAttributeLint, RemovedLint, RemovedLintFromCommandLine, RenamedLint,
-    RenamedLintFromCommandLine, RenamedLintSuggestion, UnknownLint, UnknownLintFromCommandLine,
-    UnknownLintSuggestion,
-};
 
 /// Collection of lint levels for the whole crate.
 /// This is used by AST-based lints, which do not
@@ -114,11 +111,11 @@ impl LintLevelSets {
     }
 }
 
-fn lints_that_dont_need_to_run(tcx: TyCtxt<'_>, (): ()) -> UnordSet<LintId> {
+fn skippable_lints(tcx: TyCtxt<'_>, (): ()) -> UnordSet<LintId> {
     let store = unerased_lint_store(&tcx.sess);
     let root_map = tcx.shallow_lint_levels_on(hir::CRATE_OWNER_ID);
 
-    let mut dont_need_to_run: FxHashSet<LintId> = store
+    let mut skippable: FxHashSet<LintId> = store
         .get_lints()
         .into_iter()
         .filter(|lint| {
@@ -145,13 +142,13 @@ fn lints_that_dont_need_to_run(tcx: TyCtxt<'_>, (): ()) -> UnordSet<LintId> {
         for (_, specs) in map.specs.iter() {
             for (lint, level_spec) in specs.iter() {
                 if !level_spec.is_allow() {
-                    dont_need_to_run.remove(lint);
+                    skippable.remove(lint);
                 }
             }
         }
     }
 
-    dont_need_to_run.into()
+    skippable.into()
 }
 
 #[instrument(level = "trace", skip(tcx), ret)]
@@ -171,7 +168,7 @@ fn shallow_lint_levels_on(tcx: TyCtxt<'_>, owner: hir::OwnerId) -> ShallowLintLe
         },
         lint_added_lints: false,
         store,
-        registered_tools: tcx.registered_tools(()),
+        registered_lint_tools: tcx.registered_lint_tools(()),
     };
 
     if owner == hir::CRATE_OWNER_ID {
@@ -233,7 +230,7 @@ pub trait LintLevelsProvider {
         &self,
         attr_id: AttrId,
         attr_index: usize,
-        lint_index: Option<u16>,
+        lint_index: u16,
     ) -> Self::LintExpectationId;
 }
 
@@ -258,7 +255,7 @@ impl LintLevelsProvider for TopDown {
         &self,
         attr_id: AttrId,
         _attr_index: usize,
-        lint_index: Option<u16>,
+        lint_index: u16,
     ) -> Self::LintExpectationId {
         UnstableLintExpectationId { attr_id, lint_index }
     }
@@ -296,7 +293,7 @@ impl LintLevelsProvider for LintLevelQueryMap<'_> {
         &self,
         _attr_id: AttrId,
         attr_index: usize,
-        lint_index: Option<u16>,
+        lint_index: u16,
     ) -> Self::LintExpectationId {
         let attr_index = attr_index.try_into().unwrap();
         StableLintExpectationId { hir_id: self.cur, attr_index, lint_index }
@@ -389,7 +386,7 @@ pub struct LintLevelsBuilder<'s, P> {
     provider: P,
     lint_added_lints: bool,
     store: &'s LintStore,
-    registered_tools: &'s RegisteredTools,
+    registered_lint_tools: &'s RegisteredTools,
 }
 
 pub(crate) struct BuilderPush {
@@ -402,7 +399,7 @@ impl<'s> LintLevelsBuilder<'s, TopDown> {
         features: &'s Features,
         lint_added_lints: bool,
         store: &'s LintStore,
-        registered_tools: &'s RegisteredTools,
+        registered_lint_tools: &'s RegisteredTools,
     ) -> Self {
         let mut builder = LintLevelsBuilder {
             sess,
@@ -410,7 +407,7 @@ impl<'s> LintLevelsBuilder<'s, TopDown> {
             provider: TopDown { sets: LintLevelSets::new(), cur: COMMAND_LINE },
             lint_added_lints,
             store,
-            registered_tools,
+            registered_lint_tools,
         };
         builder.process_command_line();
         assert_eq!(builder.provider.sets.list.len(), 1);
@@ -422,10 +419,10 @@ impl<'s> LintLevelsBuilder<'s, TopDown> {
         features: &'s Features,
         lint_added_lints: bool,
         store: &'s LintStore,
-        registered_tools: &'s RegisteredTools,
+        registered_lint_tools: &'s RegisteredTools,
         crate_attrs: &[ast::Attribute],
     ) -> Self {
-        let mut builder = Self::new(sess, features, lint_added_lints, store, registered_tools);
+        let mut builder = Self::new(sess, features, lint_added_lints, store, registered_lint_tools);
         builder.add(crate_attrs, true);
         builder
     }
@@ -503,7 +500,8 @@ where
                     .dcx()
                     .emit_err(UnsupportedGroup { lint_group: crate::WARNINGS.name_lower() });
             }
-            match self.store.check_lint_name(lint_name_only, tool_name, self.registered_tools) {
+            match self.store.check_lint_name(lint_name_only, tool_name, self.registered_lint_tools)
+            {
                 CheckLintNameResult::Renamed(ref replace) => {
                     let name = lint_name.as_str();
                     let suggestion = RenamedLintSuggestion::WithoutSpan { replace };
@@ -740,11 +738,7 @@ where
                 // `Expect` is the only lint level with a `LintExpectationId` that can be created
                 // from an attribute.
                 let lint_id = (level == Level::Expect).then(|| {
-                    self.provider.mk_lint_expectation_id(
-                        attr.id(),
-                        attr_index,
-                        Some(lint_index as u16),
-                    )
+                    self.provider.mk_lint_expectation_id(attr.id(), attr_index, lint_index as u16)
                 });
 
                 let sp = li.span();
@@ -772,7 +766,7 @@ where
                 let tool_name = tool_ident.map(|ident| ident.name);
                 let name = pprust::path_to_string(&meta_item.path);
                 let lint_result =
-                    self.store.check_lint_name(&name, tool_name, self.registered_tools);
+                    self.store.check_lint_name(&name, tool_name, self.registered_lint_tools);
 
                 let (ids, name) = match lint_result {
                     CheckLintNameResult::Ok(ids) => {
@@ -841,7 +835,7 @@ where
                         // NOTE: `new_name` already includes the tool name, so we don't
                         // have to add it again.
                         let CheckLintNameResult::Ok(ids) =
-                            self.store.check_lint_name(replace, None, self.registered_tools)
+                            self.store.check_lint_name(replace, None, self.registered_lint_tools)
                         else {
                             panic!("renamed lint does not exist: {replace}");
                         };
@@ -975,7 +969,7 @@ where
                 let mut lint = Diag::new(dcx, level, msg!("unknown lint: `{$name}`"))
                     .with_arg("name", lint_id.lint.name_lower())
                     .with_note(msg!("the `{$name}` lint is unstable"));
-                rustc_session::errors::add_feature_diagnostics_for_issue(
+                rustc_session::diagnostics::add_feature_diagnostics_for_issue(
                     &mut lint,
                     sess,
                     feature,
@@ -1039,7 +1033,7 @@ where
 }
 
 pub(crate) fn provide(providers: &mut Providers) {
-    *providers = Providers { shallow_lint_levels_on, lints_that_dont_need_to_run, ..*providers };
+    *providers = Providers { shallow_lint_levels_on, skippable_lints, ..*providers };
 }
 
 pub(crate) fn parse_lint_and_tool_name(lint_name: &str) -> (Option<Symbol>, &str) {

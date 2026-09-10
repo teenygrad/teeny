@@ -5,7 +5,7 @@ mod tests;
 
 use base_db::Crate;
 use hir_def::{
-    ConstId, EnumVariantId, ExpressionStoreOwnerId, GenericDefId, HasModule, StaticId,
+    ConstId, EnumVariantId, ExpressionStoreOwnerId, HasModule, StaticId,
     attrs::AttrFlags,
     expr_store::{Body, ExpressionStore, HygieneId, path::Path},
     hir::{Expr, ExprId, Literal},
@@ -16,13 +16,14 @@ use rustc_abi::Size;
 use rustc_apfloat::Float;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _};
-use stdx::never;
+use salsa::SalsaValue;
 
 use crate::{
     ParamEnvAndCrate, Span,
     db::{AnonConstId, AnonConstLoc, GeneralConstId, HirDatabase},
     display::DisplayTarget,
     generics::Generics,
+    lower::LoweringMode,
     mir::{MirEvalError, MirLowerError, pad16},
     next_solver::{
         Allocation, Const, ConstKind, Consts, DbInterner, DefaultAny, GenericArgs, ParamConst,
@@ -34,13 +35,13 @@ use crate::{
 
 use super::mir::interpret_mir;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConstEvalError {
-    MirLowerError(MirLowerError),
-    MirEvalError(MirEvalError),
+#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+pub enum ConstEvalError<'db> {
+    MirLowerError(MirLowerError<'db>),
+    MirEvalError(MirEvalError<'db>),
 }
 
-impl ConstEvalError {
+impl ConstEvalError<'_> {
     pub fn pretty_print(
         &self,
         f: &mut String,
@@ -59,8 +60,8 @@ impl ConstEvalError {
     }
 }
 
-impl From<MirLowerError> for ConstEvalError {
-    fn from(value: MirLowerError) -> Self {
+impl<'db> From<MirLowerError<'db>> for ConstEvalError<'db> {
+    fn from(value: MirLowerError<'db>) -> Self {
         match value {
             MirLowerError::ConstEvalError(_, e) => *e,
             _ => ConstEvalError::MirLowerError(value),
@@ -68,8 +69,8 @@ impl From<MirLowerError> for ConstEvalError {
     }
 }
 
-impl From<MirEvalError> for ConstEvalError {
-    fn from(value: MirEvalError) -> Self {
+impl<'db> From<MirEvalError<'db>> for ConstEvalError<'db> {
+    fn from(value: MirEvalError<'db>) -> Self {
         ConstEvalError::MirEvalError(value)
     }
 }
@@ -79,25 +80,31 @@ fn intern_const_ref<'db>(
     interner: DbInterner<'db>,
     value: &Literal,
     ty: Ty<'db>,
-) -> Result<Const<'db>, CreateConstError<'db>> {
+) -> Option<Result<Const<'db>, CreateConstError<'db>>> {
     let Ok(data_layout) = interner.db.target_data_layout(interner.expect_crate()) else {
-        return Ok(Const::error(interner));
+        return Some(Ok(Const::error(interner)));
     };
     let valtree = match (ty.kind(), value) {
         (TyKind::Uint(uint), Literal::Uint(value, _)) => {
             let size = uint.bit_width().map(Size::from_bits).unwrap_or(data_layout.pointer_size());
-            let scalar = ScalarInt::try_from_uint(*value, size).unwrap();
+            let Some(scalar) = ScalarInt::try_from_uint(*value, size) else {
+                return Some(Ok(Const::error(interner)));
+            };
             ValTreeKind::Leaf(scalar)
         }
         (TyKind::Uint(uint), Literal::Int(value, _)) => {
             // `Literal::Int` is the default, so we also need to account for the type being uint.
             let size = uint.bit_width().map(Size::from_bits).unwrap_or(data_layout.pointer_size());
-            let scalar = ScalarInt::try_from_uint(*value as u128, size).unwrap();
+            let Some(scalar) = ScalarInt::try_from_uint(*value as u128, size) else {
+                return Some(Ok(Const::error(interner)));
+            };
             ValTreeKind::Leaf(scalar)
         }
         (TyKind::Int(int), Literal::Int(value, _)) => {
             let size = int.bit_width().map(Size::from_bits).unwrap_or(data_layout.pointer_size());
-            let scalar = ScalarInt::try_from_int(*value, size).unwrap();
+            let Some(scalar) = ScalarInt::try_from_int(*value, size) else {
+                return Some(Ok(Const::error(interner)));
+            };
             ValTreeKind::Leaf(scalar)
         }
         (TyKind::Bool, Literal::Bool(value)) => ValTreeKind::Leaf(ScalarInt::from(*value)),
@@ -113,26 +120,21 @@ fn intern_const_ref<'db>(
             let scalar = ScalarInt::try_from_uint(value, size).unwrap();
             ValTreeKind::Leaf(scalar)
         }
-        (_, Literal::String(value)) => {
+        (TyKind::Ref(_, inner_ty, _), Literal::String(value))
+            if matches!(inner_ty.kind(), TyKind::Str) =>
+        {
             let u8_values = &interner.default_types().consts.u8_values;
             ValTreeKind::Branch(Consts::new_from_iter(
                 interner,
                 value.as_str().as_bytes().iter().map(|&byte| u8_values[usize::from(byte)]),
             ))
         }
-        (_, Literal::ByteString(value)) => {
-            let u8_values = &interner.default_types().consts.u8_values;
-            ValTreeKind::Branch(Consts::new_from_iter(
-                interner,
-                value.iter().map(|&byte| u8_values[usize::from(byte)]),
-            ))
-        }
-        (_, Literal::CString(_)) => {
-            // FIXME:
-            return Ok(Const::error(interner));
+        (_, Literal::ByteString(_) | Literal::CString(_)) => {
+            // This literals are complicated to construct and/or are possible to coerce.
+            // So we just allocate an anon const for them, they should be rare so it's not a problem.
+            return None;
         }
         _ => {
-            never!("mismatching type for literal");
             let actual = literal_ty(
                 interner,
                 value,
@@ -140,10 +142,10 @@ fn intern_const_ref<'db>(
                 |types| types.types.u32,
                 |types| types.types.f64,
             );
-            return Err(CreateConstError::TypeMismatch { actual });
+            return Some(Err(CreateConstError::TypeMismatch { actual }));
         }
     };
-    Ok(Const::new_valtree(interner, ty, valtree))
+    Some(Ok(Const::new_valtree(interner, ty, valtree)))
 }
 
 pub(crate) fn literal_ty<'db>(
@@ -218,7 +220,9 @@ pub fn usize_const<'db>(db: &'db dyn HirDatabase, value: Option<u128>, krate: Cr
         return Const::error(interner);
     };
     let usize_ty = interner.default_types().types.usize;
-    let scalar = ScalarInt::try_from_uint(value, data_layout.pointer_size()).unwrap();
+    let Some(scalar) = ScalarInt::try_from_uint(value, data_layout.pointer_size()) else {
+        return Const::error(interner);
+    };
     Const::new_valtree(interner, usize_ty, ValTreeKind::Leaf(scalar))
 }
 
@@ -303,7 +307,9 @@ pub(crate) enum CreateConstError<'db> {
     UsedForbiddenParam,
     ResolveToNonConst,
     DoesNotResolve,
+    ConstHasGenerics,
     UnderscoreExpr,
+    AnonConstInterningDisabled,
     TypeMismatch {
         #[expect(unused, reason = "will need this for diagnostics")]
         actual: Ty<'db>,
@@ -321,9 +327,11 @@ pub(crate) fn path_to_const<'a, 'db>(
     let resolution = resolver
         .resolve_path_in_value_ns_fully(db, path, HygieneId::ROOT)
         .ok_or(CreateConstError::DoesNotResolve)?;
+    let no_generics = |def| crate::generics::generics(db, def).has_no_params();
     let konst = match resolution {
-        ValueNs::ConstId(id) => GeneralConstId::ConstId(id),
+        ValueNs::ConstId(id) if no_generics(id.into()) => GeneralConstId::ConstId(id),
         ValueNs::StaticId(id) => GeneralConstId::StaticId(id),
+        ValueNs::ConstId(_) => return Err(CreateConstError::ConstHasGenerics),
         ValueNs::GenericParam(param) => {
             let index = generics().type_or_const_param_idx(param.into());
             if forbid_params_after.is_some_and(|forbid_after| index >= forbid_after) {
@@ -347,36 +355,58 @@ pub(crate) fn create_anon_const<'a, 'db>(
     interner: DbInterner<'db>,
     owner: ExpressionStoreOwnerId,
     store: &ExpressionStore,
-    expr: ExprId,
+    expr_id: ExprId,
     resolver: &Resolver<'db>,
     expected_ty: Ty<'db>,
     generics: &dyn Fn() -> &'a Generics<'db>,
     create_var: Option<&mut dyn FnMut(Span) -> Const<'db>>,
+    lowering_mode: LoweringMode,
     forbid_params_after: Option<u32>,
 ) -> Result<Const<'db>, CreateConstError<'db>> {
-    match &store[expr] {
-        Expr::Literal(literal) => intern_const_ref(interner, literal, expected_ty),
+    let mut expr = &store[expr_id];
+    if let Expr::Block { statements, tail: Some(tail), .. } = expr
+        && statements.is_empty()
+    {
+        // rustc unwraps *one* layer of blocks, so we do too (this impacts whether the const can use generic parameters.
+        // Anon consts sometimes cannot while bare paths can). mGCA allows arbitrarily many blocks, but we don't implement
+        // it yet.
+        expr = &store[*tail];
+    }
+    match expr {
+        Expr::Literal(literal)
+            if let Some(literal) = intern_const_ref(interner, literal, expected_ty) =>
+        {
+            literal
+        }
         Expr::Underscore => match create_var {
-            Some(create_var) => Ok(create_var(expr.into())),
+            Some(create_var) => Ok(create_var(expr_id.into())),
             None => Err(CreateConstError::UnderscoreExpr),
         },
         Expr::Path(path)
             if let konst =
                 path_to_const(interner.db, resolver, generics, forbid_params_after, path)
-                && !matches!(konst, Err(CreateConstError::DoesNotResolve)) =>
+                && !matches!(
+                    konst,
+                    Err(CreateConstError::DoesNotResolve | CreateConstError::ConstHasGenerics)
+                ) =>
         {
             konst
         }
         _ => {
+            let Some(token) = lowering_mode.allow_tracked_structs() else {
+                return Err(CreateConstError::AnonConstInterningDisabled);
+            };
+
             let allow_using_generic_params = forbid_params_after.is_none();
             let konst = AnonConstId::new(
                 interner.db,
                 AnonConstLoc {
                     owner,
-                    expr,
+                    expr: expr_id,
                     ty: StoredEarlyBinder::bind(expected_ty.store()),
                     allow_using_generic_params,
                 },
+                token,
             );
             let args = if allow_using_generic_params {
                 GenericArgs::identity_for_item(interner, owner.generic_def(interner.db).into())
@@ -391,21 +421,20 @@ pub(crate) fn create_anon_const<'a, 'db>(
     }
 }
 
-pub(crate) fn const_eval_discriminant_variant(
-    db: &dyn HirDatabase,
+#[salsa::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone))]
+pub(crate) fn const_eval_discriminant_variant<'db>(
+    db: &'db dyn HirDatabase,
     variant_id: EnumVariantId,
-) -> Result<i128, ConstEvalError> {
+) -> Result<i128, ConstEvalError<'db>> {
     let interner = DbInterner::new_no_crate(db);
     let def = variant_id.into();
     let body = Body::of(db, def);
     let loc = variant_id.lookup(db);
     if matches!(body[body.root_expr()], Expr::Missing) {
-        let prev_idx = loc.index.checked_sub(1);
+        let prev_idx = loc.index(db).checked_sub(1);
         let value = match prev_idx {
             Some(prev_idx) => {
-                1 + db.const_eval_discriminant(
-                    loc.parent.enum_variants(db).variants[prev_idx as usize].0,
-                )?
+                1 + db.const_eval_discriminant(loc.parent.enum_variants(db).variants[prev_idx].0)?
             }
             _ => 0,
         };
@@ -418,19 +447,22 @@ pub(crate) fn const_eval_discriminant_variant(
     let mir_body = db.monomorphized_mir_body(
         def.into(),
         GenericArgs::empty(interner).store(),
-        ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
-            .store(),
+        ParamEnvAndCrate {
+            param_env: db.trait_environment(def.generic_def(db)),
+            krate: def.krate(db),
+        }
+        .store(),
     )?;
     let c = interpret_mir(db, mir_body, false, None)?.0?;
     let c = if is_signed { allocation_as_isize(c) } else { allocation_as_usize(c) as i128 };
     Ok(c)
 }
 
-pub(crate) fn const_eval_discriminant_cycle_result(
-    _: &dyn HirDatabase,
+fn const_eval_discriminant_cycle_result<'db>(
+    _: &'db dyn HirDatabase,
     _: salsa::Id,
     _: EnumVariantId,
-) -> Result<i128, ConstEvalError> {
+) -> Result<i128, ConstEvalError<'db>> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
 }
 
@@ -439,82 +471,78 @@ pub(crate) fn const_eval<'db>(
     def: ConstId,
     subst: GenericArgs<'db>,
     trait_env: Option<ParamEnvAndCrate<'db>>,
-) -> Result<Allocation<'db>, ConstEvalError> {
+) -> Result<Allocation<'db>, ConstEvalError<'db>> {
     return match const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
         Ok(konst) => Ok(konst.as_ref()),
         Err(err) => Err(err.clone()),
     };
 
     #[salsa::tracked(returns(ref), cycle_result = const_eval_cycle_result)]
-    pub(crate) fn const_eval_query(
-        db: &dyn HirDatabase,
+    pub(crate) fn const_eval_query<'db>(
+        db: &'db dyn HirDatabase,
         def: ConstId,
         subst: StoredGenericArgs,
         trait_env: Option<StoredParamEnvAndCrate>,
-    ) -> Result<StoredAllocation, ConstEvalError> {
+    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
         let body = db.monomorphized_mir_body(
             def.into(),
             subst,
-            ParamEnvAndCrate {
-                param_env: db
-                    .trait_environment(ExpressionStoreOwnerId::from(GenericDefId::from(def))),
-                krate: def.krate(db),
-            }
-            .store(),
+            ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
+                .store(),
         )?;
-        let c = interpret_mir(db, body, false, trait_env.as_ref().map(|env| env.as_ref()))?.0?;
+        let c = interpret_mir(db, body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?.0?;
         Ok(c.store())
     }
 
-    pub(crate) fn const_eval_cycle_result(
-        _: &dyn HirDatabase,
+    pub(crate) fn const_eval_cycle_result<'db>(
+        _: &'db dyn HirDatabase,
         _: salsa::Id,
         _: ConstId,
         _: StoredGenericArgs,
         _: Option<StoredParamEnvAndCrate>,
-    ) -> Result<StoredAllocation, ConstEvalError> {
+    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
         Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
     }
 }
 
 pub(crate) fn anon_const_eval<'db>(
     db: &'db dyn HirDatabase,
-    def: AnonConstId,
+    def: AnonConstId<'db>,
     subst: GenericArgs<'db>,
     trait_env: Option<ParamEnvAndCrate<'db>>,
-) -> Result<Allocation<'db>, ConstEvalError> {
+) -> Result<Allocation<'db>, ConstEvalError<'db>> {
     return match anon_const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
         Ok(konst) => Ok(konst.as_ref()),
         Err(err) => Err(err.clone()),
     };
 
     #[salsa::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result)]
-    pub(crate) fn anon_const_eval_query(
-        db: &dyn HirDatabase,
-        def: AnonConstId,
+    pub(crate) fn anon_const_eval_query<'db>(
+        db: &'db dyn HirDatabase,
+        def: AnonConstId<'db>,
         subst: StoredGenericArgs,
         trait_env: Option<StoredParamEnvAndCrate>,
-    ) -> Result<StoredAllocation, ConstEvalError> {
+    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
         let body = db.monomorphized_mir_body(
             def.into(),
             subst,
             ParamEnvAndCrate {
-                param_env: db.trait_environment(def.loc(db).owner),
+                param_env: db.trait_environment(def.loc(db).owner.generic_def(db)),
                 krate: def.krate(db),
             }
             .store(),
         )?;
-        let c = interpret_mir(db, body, false, trait_env.as_ref().map(|env| env.as_ref()))?.0?;
+        let c = interpret_mir(db, body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?.0?;
         Ok(c.store())
     }
 
-    pub(crate) fn anon_const_eval_cycle_result(
-        _: &dyn HirDatabase,
+    pub(crate) fn anon_const_eval_cycle_result<'db>(
+        _: &'db dyn HirDatabase,
         _: salsa::Id,
-        _: AnonConstId,
+        _: AnonConstId<'db>,
         _: StoredGenericArgs,
         _: Option<StoredParamEnvAndCrate>,
-    ) -> Result<StoredAllocation, ConstEvalError> {
+    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
         Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
     }
 }
@@ -522,37 +550,33 @@ pub(crate) fn anon_const_eval<'db>(
 pub(crate) fn const_eval_static<'db>(
     db: &'db dyn HirDatabase,
     def: StaticId,
-) -> Result<Allocation<'db>, ConstEvalError> {
+) -> Result<Allocation<'db>, ConstEvalError<'db>> {
     return match const_eval_static_query(db, def) {
         Ok(konst) => Ok(konst.as_ref()),
         Err(err) => Err(err.clone()),
     };
 
     #[salsa::tracked(returns(ref), cycle_result = const_eval_static_cycle_result)]
-    pub(crate) fn const_eval_static_query(
-        db: &dyn HirDatabase,
+    pub(crate) fn const_eval_static_query<'db>(
+        db: &'db dyn HirDatabase,
         def: StaticId,
-    ) -> Result<StoredAllocation, ConstEvalError> {
+    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
         let interner = DbInterner::new_no_crate(db);
         let body = db.monomorphized_mir_body(
             def.into(),
             GenericArgs::empty(interner).store(),
-            ParamEnvAndCrate {
-                param_env: db
-                    .trait_environment(ExpressionStoreOwnerId::from(GenericDefId::from(def))),
-                krate: def.krate(db),
-            }
-            .store(),
+            ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
+                .store(),
         )?;
         let c = interpret_mir(db, body, false, None)?.0?;
         Ok(c.store())
     }
 
-    pub(crate) fn const_eval_static_cycle_result(
-        _: &dyn HirDatabase,
+    pub(crate) fn const_eval_static_cycle_result<'db>(
+        _: &'db dyn HirDatabase,
         _: salsa::Id,
         _: StaticId,
-    ) -> Result<StoredAllocation, ConstEvalError> {
+    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
         Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
     }
 }

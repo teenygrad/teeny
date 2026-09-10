@@ -9,7 +9,7 @@ use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_span::{Ident, Span, Symbol, kw, sym};
 use thin_vec::{ThinVec, thin_vec};
 
-use crate::errors;
+use crate::diagnostics;
 use crate::util::check_builtin_macro_attribute;
 
 pub(crate) fn expand(
@@ -34,13 +34,14 @@ pub(crate) fn expand(
     {
         (item, *ident, true, ecx.with_def_site_ctxt(ty.span))
     } else {
-        ecx.dcx().emit_err(errors::AllocMustStatics { span: item.span() });
+        ecx.dcx().emit_err(diagnostics::AllocMustStatics { span: item.span() });
         return vec![orig_item];
     };
 
     // Forbid `#[thread_local]` attributes on the item
     if let Some(attr) = item.attrs.iter().find(|x| x.has_name(sym::thread_local)) {
-        ecx.dcx().emit_err(errors::AllocCannotThreadLocal { span: item.span, attr: attr.span });
+        ecx.dcx()
+            .emit_err(diagnostics::AllocCannotThreadLocal { span: item.span, attr: attr.span });
         return vec![orig_item];
     }
 
@@ -53,8 +54,14 @@ pub(crate) fn expand(
 
     // Generate anonymous constant serving as container for the allocator methods.
     let const_ty = ecx.ty(ty_span, TyKind::Tup(ThinVec::new()));
-    let const_body = ast::ConstItemRhsKind::new_body(ecx.expr_block(ecx.block(span, stmts)));
-    let const_item = ecx.item_const(span, Ident::new(kw::Underscore, span), const_ty, const_body);
+    let const_body = ecx.expr_block(ecx.block(span, stmts));
+    let const_item = ecx.item_const(
+        span,
+        Ident::new(kw::Underscore, span),
+        const_ty,
+        Some(const_body),
+        ast::ConstItemKind::Body,
+    );
     let const_item = if is_stmt {
         Annotatable::Stmt(Box::new(ecx.stmt_item(span, const_item)))
     } else {
@@ -90,7 +97,7 @@ impl AllocFnFactory<'_, '_> {
             contract: None,
             body,
             define_opaque: None,
-            eii_impls: ThinVec::new(),
+            eii_impl: None,
         }));
         let item = self.cx.item(self.span, self.attrs(method), kind);
         self.cx.stmt_item(self.ty_span, item)

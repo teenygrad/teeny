@@ -229,7 +229,7 @@ guarantee that anything will have the same ID as it had before.
 As a consequence we cannot represent the data in our on-disk cache the same
 way it is represented in memory.
 For example, if we just stored a piece
-of type information like `TyKind::FnDef(DefId, &'tcx Substs<'tcx>)` (as we do
+of type information like `TyKind::FnDef(DefId, GenericArgsRef<'tcx>)` (as we do
 in memory) and then the contained `DefId` points to a different function in
 a new compilation session we'd be in trouble.
 
@@ -484,6 +484,12 @@ respect to incremental compilation:
    If the `separate_provide_extern` modifier is also present, values will only
    be cached to disk for "local" keys, because values for external crates should
    be loadable from crate metadata instead.
+
+ - `feedable` - The query is not actually a function, but its own arena type.
+   This is done to declare an arena, "feed" the information
+   to store at a later point in the compilation (for example, when we actually have a
+   `Crate` object available), and then retrieve it as any other crate.
+   Thus, function definitions for these queries do not exist.
 
 [mod]: ../query.html#adding-a-new-kind-of-query
 

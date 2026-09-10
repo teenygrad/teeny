@@ -4,19 +4,19 @@
 
 use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::{AttrStyle, token};
+use rustc_attr_ir::target::Target;
+use rustc_attr_ir::{AttrPath, CfgEntry};
 use rustc_attr_parsing::parser::{AllowExprMetavar, MetaItemOrLitParser};
 use rustc_attr_parsing::{
     self as attr, AttributeParser, AttributeSafety, CFG_TEMPLATE, ParsedDescription, ShouldEmit,
     parse_cfg_entry,
 };
 use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacEager, MacroExpanderResult};
-use rustc_hir::attrs::CfgEntry;
-use rustc_hir::{AttrPath, Target};
 use rustc_parse::exp;
 use rustc_parse::parser::Recovery;
 use rustc_span::{ErrorGuaranteed, Span, sym};
 
-use crate::errors;
+use crate::diagnostics;
 
 pub(crate) fn expand_cfg(
     cx: &mut ExtCtxt<'_>,
@@ -38,7 +38,7 @@ pub(crate) fn expand_cfg(
 fn parse_cfg(cx: &ExtCtxt<'_>, span: Span, tts: TokenStream) -> Result<CfgEntry, ErrorGuaranteed> {
     let mut parser = cx.new_parser_from_tts(tts);
     if parser.token == token::Eof {
-        return Err(cx.dcx().emit_err(errors::RequiresCfgPattern { span }));
+        return Err(cx.dcx().emit_err(diagnostics::RequiresCfgPattern { span }));
     }
 
     let meta = MetaItemOrLitParser::parse_single(
@@ -70,7 +70,7 @@ fn parse_cfg(cx: &ExtCtxt<'_>, span: Span, tts: TokenStream) -> Result<CfgEntry,
     let _ = parser.eat(exp!(Comma));
 
     if !parser.eat(exp!(Eof)) {
-        return Err(cx.dcx().emit_err(errors::OneCfgPattern { span }));
+        return Err(cx.dcx().emit_err(diagnostics::OneCfgPattern { span }));
     }
 
     Ok(cfg)

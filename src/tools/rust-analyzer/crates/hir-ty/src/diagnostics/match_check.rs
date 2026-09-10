@@ -97,7 +97,7 @@ pub(crate) enum PatKind<'db> {
 
 pub(crate) struct PatCtxt<'a, 'db> {
     db: &'db dyn HirDatabase,
-    infer: &'db InferenceResult,
+    infer: &'db InferenceResult<'db>,
     body: &'a Body,
     pub(crate) errors: Vec<PatternError>,
 }
@@ -105,7 +105,7 @@ pub(crate) struct PatCtxt<'a, 'db> {
 impl<'a, 'db> PatCtxt<'a, 'db> {
     pub(crate) fn new(
         db: &'db dyn HirDatabase,
-        infer: &'db InferenceResult,
+        infer: &'db InferenceResult<'db>,
         body: &'a Body,
     ) -> Self {
         Self { db, infer, body, errors: Vec::new() }
@@ -330,13 +330,7 @@ impl<'db> HirDisplay<'db> for Pat<'db> {
                     match variant {
                         VariantId::EnumVariantId(v) => {
                             let loc = v.lookup(f.db);
-                            write!(
-                                f,
-                                "{}",
-                                loc.parent.enum_variants(f.db).variants[loc.index as usize]
-                                    .1
-                                    .display(f.db, f.edition())
-                            )?;
+                            write!(f, "{}", loc.name.display(f.db, f.edition()))?;
                         }
                         VariantId::StructId(s) => write!(
                             f,

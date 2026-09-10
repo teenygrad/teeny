@@ -21,7 +21,6 @@ pub(crate) fn target() -> Target {
             vendor: "nvidia".into(),
             linker_flavor: LinkerFlavor::Llbc,
 
-            // With `ptx-linker` approach, it can be later overridden via link flags.
             cpu: "sm_70".into(),
 
             // No longer supported architectures
@@ -29,6 +28,9 @@ pub(crate) fn target() -> Target {
                 "sm_20", "sm_21", "sm_30", "sm_32", "sm_35", "sm_37", "sm_50", "sm_52", "sm_53",
                 "sm_60", "sm_61", "sm_62"
             ),
+
+            // crates with different `target-cpu`s are not link-compatible for NVPTX
+            requires_consistent_cpu: true,
 
             // FIXME: create tests for the atomics.
             max_atomic_width: Some(64),

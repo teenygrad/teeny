@@ -2,6 +2,13 @@ use test_utils::skip_slow_tests;
 
 use crate::support::Project;
 
+fn message_contains(message: &lsp_types::Message, p: &str) -> bool {
+    match message {
+        lsp_types::Message::String(s) => s.contains(p),
+        lsp_types::Message::MarkupContent(mc) => mc.value.contains(p),
+    }
+}
+
 #[test]
 fn test_flycheck_diagnostics_for_unused_variable() {
     if skip_slow_tests() {
@@ -29,7 +36,7 @@ fn main() {
 
     let diagnostics = server.wait_for_diagnostics();
     assert!(
-        diagnostics.diagnostics.iter().any(|d| d.message.contains("unused variable")),
+        diagnostics.diagnostics.iter().any(|d| message_contains(&d.message, "unused variable")),
         "expected unused variable diagnostic, got: {:?}",
         diagnostics.diagnostics,
     );
@@ -63,7 +70,7 @@ fn main() {
     // Wait for the unused variable diagnostic to appear.
     let diagnostics = server.wait_for_diagnostics();
     assert!(
-        diagnostics.diagnostics.iter().any(|d| d.message.contains("unused variable")),
+        diagnostics.diagnostics.iter().any(|d| message_contains(&d.message, "unused variable")),
         "expected unused variable diagnostic, got: {:?}",
         diagnostics.diagnostics,
     );
@@ -76,7 +83,6 @@ fn main() {
 }
 
 #[test]
-#[ignore = "this test tends to stuck, FIXME: investigate that"]
 fn test_flycheck_diagnostic_with_override_command() {
     if skip_slow_tests() {
         return;
@@ -106,14 +112,13 @@ fn main() {}
 
     let diagnostics = server.wait_for_diagnostics();
     assert!(
-        diagnostics.diagnostics.iter().any(|d| d.message.contains("unused variable")),
+        diagnostics.diagnostics.iter().any(|d| message_contains(&d.message, "unused variable")),
         "expected unused variable diagnostic, got: {:?}",
         diagnostics.diagnostics,
     );
 }
 
 #[test]
-#[ignore = "this test tends to stuck, FIXME: investigate that"]
 fn test_flycheck_diagnostics_with_override_command_cleared_after_fix() {
     if skip_slow_tests() {
         return;
@@ -145,7 +150,7 @@ fn main() {}
 
     let diags = server.wait_for_diagnostics();
     assert!(
-        diags.diagnostics.iter().any(|d| d.message.contains("unused variable")),
+        diags.diagnostics.iter().any(|d| message_contains(&d.message, "unused variable")),
         "expected unused variable diagnostic, got: {:?}",
         diags.diagnostics,
     );

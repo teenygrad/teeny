@@ -7,7 +7,7 @@ use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
 
-use crate::lints::{ImproperGpuKernelArg, MissingGpuKernelExportName};
+use crate::diagnostics::{ImproperGpuKernelArg, MissingGpuKernelExportName};
 use crate::{LateContext, LateLintPass, LintContext};
 
 declare_lint! {
@@ -115,7 +115,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for CheckGpuKernelTypes<'tcx> {
             }
 
             ty::Adt(_, _)
-            | ty::Alias(_)
+            | ty::Alias(_, _)
             | ty::Array(_, _)
             | ty::Bound(_, _)
             | ty::Closure(_, _)

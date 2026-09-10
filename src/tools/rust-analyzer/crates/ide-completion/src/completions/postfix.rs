@@ -8,6 +8,7 @@ use ide_db::{
     RootDatabase, SnippetCap,
     documentation::{Documentation, HasDocs},
     imports::insert_use::ImportScope,
+    source_change::SnippetEdit,
     syntax_helpers::suggest_name::NameGenerator,
     text_edit::TextEdit,
     ty_filter::TryEnum,
@@ -259,7 +260,7 @@ pub(crate) fn complete_postfix(
                     postfix_snippet(
                         "lete",
                         "let Ok else {}",
-                        format!("let Ok({placeholder}) = {receiver_text} else {{\n    $2\n}};\n$0"),
+                        format!("let Ok({placeholder}) = {receiver_text} else {{\n    $2\n}};$0"),
                     )
                     .add_to(acc, ctx.db);
 
@@ -281,9 +282,7 @@ pub(crate) fn complete_postfix(
                     postfix_snippet(
                         "lete",
                         "let Some else {}",
-                        format!(
-                            "let Some({placeholder}) = {receiver_text} else {{\n    $2\n}};\n$0"
-                        ),
+                        format!("let Some({placeholder}) = {receiver_text} else {{\n    $2\n}};$0"),
                     )
                     .add_to(acc, ctx.db);
 
@@ -366,7 +365,7 @@ fn suggest_receiver_name(
     match receiver {
         ast::Expr::PathExpr(path) => {
             if let Some(name) = path.path().and_then(|it| it.as_single_name_ref()) {
-                return placeholder(name.text().as_str());
+                return placeholder(name.text());
             }
         }
         ast::Expr::RefExpr(it) => {
@@ -403,7 +402,7 @@ fn get_receiver_text(
 
     // The receiver texts should be interpreted as-is, as they are expected to be
     // normal Rust expressions.
-    escape_snippet_bits(&mut text);
+    SnippetEdit::escape_snippet_bits(&mut text);
     return text;
 
     fn indent_of_tail_line(text: &str) -> usize {
@@ -411,15 +410,6 @@ fn get_receiver_text(
         let trimmed = tail_line.trim_start_matches(' ');
         tail_line.len() - trimmed.len()
     }
-}
-
-/// Escapes `\` and `$` so that they don't get interpreted as snippet-specific constructs.
-///
-/// Note that we don't need to escape the other characters that can be escaped,
-/// because they wouldn't be treated as snippet-specific constructs without '$'.
-fn escape_snippet_bits(text: &mut String) {
-    stdx::replace(text, '\\', "\\\\");
-    stdx::replace(text, '$', "\\$");
 }
 
 fn receiver_accessor(receiver: &ast::Expr) -> ast::Expr {
@@ -1101,8 +1091,28 @@ fn main() {
     let bar = Some(true);
     let Some(${1:bar}) = bar else {
     $2
-};
-$0
+};$0
+}
+"#,
+        );
+
+        check_edit(
+            "lete",
+            r#"
+//- minicore: option
+fn main() {
+    let bar = Some(true);
+    bar.$0
+    other();
+}
+"#,
+            r#"
+fn main() {
+    let bar = Some(true);
+    let Some(${1:bar}) = bar else {
+    $2
+};$0
+    other();
 }
 "#,
         );

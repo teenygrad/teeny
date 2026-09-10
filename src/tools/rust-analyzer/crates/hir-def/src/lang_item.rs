@@ -2,15 +2,15 @@
 //!
 //! This attribute to tell the compiler about semi built-in std library
 //! features, such as Fn family of traits.
+use base_db::SourceDatabase;
 use hir_expand::name::Name;
 use intern::{Symbol, sym};
 use stdx::impl_from;
 
 use crate::{
-    AdtId, AssocItemId, AttrDefId, Crate, EnumId, EnumVariantId, FunctionId, ImplId,
+    AdtId, AssocItemId, AttrDefId, ConstId, Crate, EnumId, EnumVariantId, FunctionId, ImplId,
     ItemContainerId, MacroId, ModuleDefId, StaticId, StructId, TraitId, TypeAliasId, UnionId,
     attrs::AttrFlags,
-    db::DefDatabase,
     nameres::{DefMap, assoc::TraitItems, crate_def_map, crate_local_def_map},
 };
 
@@ -25,15 +25,17 @@ pub enum LangItemTarget {
     TypeAliasId(TypeAliasId),
     TraitId(TraitId),
     EnumVariantId(EnumVariantId),
+    ConstId(ConstId),
+    MacroId(MacroId),
 }
 
 impl_from!(
-    EnumId, FunctionId, ImplId, StaticId, StructId, UnionId, TypeAliasId, TraitId, EnumVariantId for LangItemTarget
+    EnumId, FunctionId, ImplId, StaticId, StructId, UnionId, TypeAliasId, TraitId, EnumVariantId, ConstId, MacroId for LangItemTarget
 );
 
 /// Salsa query. This will look for lang items in a specific crate.
-#[salsa_macros::tracked(returns(as_deref))]
-pub fn crate_lang_items(db: &dyn DefDatabase, krate: Crate) -> Option<Box<LangItems>> {
+#[salsa::tracked(returns(as_deref))]
+pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<LangItems>> {
     let _p = tracing::info_span!("crate_lang_items_query").entered();
 
     let mut lang_items = LangItems::default();
@@ -51,7 +53,7 @@ pub fn crate_lang_items(db: &dyn DefDatabase, krate: Crate) -> Option<Box<LangIt
                 match assoc {
                     AssocItemId::FunctionId(f) => lang_items.collect_lang_item(db, f),
                     AssocItemId::TypeAliasId(t) => lang_items.collect_lang_item(db, t),
-                    AssocItemId::ConstId(_) => (),
+                    AssocItemId::ConstId(c) => lang_items.collect_lang_item(db, c),
                 }
             }
         }
@@ -68,13 +70,13 @@ pub fn crate_lang_items(db: &dyn DefDatabase, krate: Crate) -> Option<Box<LangIt
                             AssocItemId::TypeAliasId(alias) => {
                                 lang_items.collect_lang_item(db, alias)
                             }
-                            AssocItemId::ConstId(_) => {}
+                            AssocItemId::ConstId(c) => lang_items.collect_lang_item(db, c),
                         }
                     });
                 }
                 ModuleDefId::AdtId(AdtId::EnumId(e)) => {
                     lang_items.collect_lang_item(db, e);
-                    e.enum_variants(db).variants.iter().for_each(|&(id, _, _)| {
+                    e.enum_variants(db).variants.values().for_each(|&(id, _)| {
                         lang_items.collect_lang_item(db, id);
                     });
                 }
@@ -93,6 +95,7 @@ pub fn crate_lang_items(db: &dyn DefDatabase, krate: Crate) -> Option<Box<LangIt
                 ModuleDefId::TypeAliasId(t) => {
                     lang_items.collect_lang_item(db, t);
                 }
+                ModuleDefId::ConstId(c) => lang_items.collect_lang_item(db, c),
                 _ => {}
             }
         }
@@ -109,8 +112,8 @@ pub fn crate_lang_items(db: &dyn DefDatabase, krate: Crate) -> Option<Box<LangIt
 
 /// Salsa query. Look for a lang items, starting from the specified crate and recursively
 /// traversing its dependencies.
-#[salsa_macros::tracked(returns(ref))]
-pub fn lang_items(db: &dyn DefDatabase, start_crate: Crate) -> LangItems {
+#[salsa::tracked(returns(ref))]
+pub fn lang_items(db: &dyn SourceDatabase, start_crate: Crate) -> LangItems {
     let _p = tracing::info_span!("lang_items_query").entered();
 
     let mut result = crate_lang_items(db, start_crate).cloned().unwrap_or_default();
@@ -135,7 +138,7 @@ pub fn lang_items(db: &dyn DefDatabase, start_crate: Crate) -> LangItems {
 }
 
 impl LangItems {
-    fn collect_lang_item<T>(&mut self, db: &dyn DefDatabase, item: T)
+    fn collect_lang_item<T>(&mut self, db: &dyn SourceDatabase, item: T)
     where
         T: Into<AttrDefId> + Into<LangItemTarget> + Copy,
     {
@@ -147,7 +150,7 @@ impl LangItems {
 }
 
 fn resolve_core_trait(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     core_def_map: &DefMap,
     modules: &[Symbol],
     name: Symbol,
@@ -172,7 +175,7 @@ fn resolve_core_trait(
 }
 
 fn resolve_core_macro(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     core_def_map: &DefMap,
     modules: &[Symbol],
     name: Symbol,
@@ -193,7 +196,7 @@ fn resolve_core_macro(
 }
 
 impl LangItems {
-    fn resolve_manually(&mut self, db: &dyn DefDatabase) {
+    fn resolve_manually(&mut self, db: &dyn SourceDatabase) {
         let parent_trait =
             |lang_item: &mut Option<TraitId>, def: Option<FunctionId>| match def?.loc(db).container
             {
@@ -274,7 +277,6 @@ impl LangItems {
             (self.BitXorAssign, &mut self.BitXorAssign_bitxor_assign, sym::bitxor_assign),
             (self.BitOrAssign, &mut self.BitOrAssign_bitor_assign, sym::bitor_assign),
             (self.BitAndAssign, &mut self.BitAndAssign_bitand_assign, sym::bitand_assign),
-            (self.Drop, &mut self.Drop_drop, sym::drop),
             (self.Debug, &mut self.Debug_fmt, sym::fmt),
             (self.Deref, &mut self.Deref_deref, sym::deref),
             (self.DerefMut, &mut self.DerefMut_deref_mut, sym::deref_mut),
@@ -305,11 +307,18 @@ impl LangItems {
             );
             Some(())
         })();
+        (|| {
+            methods(
+                self.Drop?,
+                &mut [(&mut self.Drop_drop, sym::drop), (&mut self.Drop_pin_drop, sym::pin_drop)],
+            );
+            Some(())
+        })();
     }
 }
 
 #[salsa::tracked(returns(as_deref))]
-pub(crate) fn crate_notable_traits(db: &dyn DefDatabase, krate: Crate) -> Option<Box<[TraitId]>> {
+pub fn crate_notable_traits(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<[TraitId]>> {
     let mut traits = Vec::new();
 
     let crate_def_map = crate_def_map(db, krate);
@@ -388,18 +397,22 @@ macro_rules! language_item_table {
                 }
             }
 
-            fn fill_non_lang_core_items(&mut self, db: &dyn DefDatabase, core_def_map: &DefMap) {
+            fn fill_non_lang_core_items(&mut self, db: &dyn SourceDatabase, core_def_map: &DefMap) {
                 $( self.$non_lang_trait = resolve_core_trait(db, core_def_map, &[ $(sym::$non_lang_trait_module),* ], sym::$non_lang_trait); )*
                 $( self.$non_lang_macro_field = resolve_core_macro(db, core_def_map, &[ $(sym::$non_lang_macro_module),* ], sym::$non_lang_macro); )*
             }
         }
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[allow(non_camel_case_types)]
         pub enum LangItemEnum {
             $(
                 $(#[$attr])*
                 $lang_item,
             )*
+            $( $non_lang_trait, )*
+            $( $non_lang_macro_field, )*
+            $( $resolve_manually, )*
         }
 
         impl LangItemEnum {
@@ -407,6 +420,9 @@ macro_rules! language_item_table {
             pub fn from_lang_items(self, lang_items: &LangItems) -> Option<LangItemTarget> {
                 match self {
                     $( LangItemEnum::$lang_item => lang_items.$lang_item.map(Into::into), )*
+                    $( LangItemEnum::$non_lang_trait => lang_items.$non_lang_trait.map(Into::into), )*
+                    $( LangItemEnum::$non_lang_macro_field => lang_items.$non_lang_macro_field.map(Into::into), )*
+                    $( LangItemEnum::$resolve_manually => lang_items.$resolve_manually.map(Into::into), )*
                 }
             }
 
@@ -646,6 +662,10 @@ language_item_table! { LangItems =>
     FieldBase,               sym::field_base,          TypeAliasId;
     FieldType,               sym::field_type,          TypeAliasId;
 
+    RangeMin,                sym::RangeMin,            ConstId;
+    RangeMax,                sym::RangeMax,            ConstId;
+    RangeSub,                sym::RangeSub,            FunctionId;
+
     @non_lang_core_traits:
     core::default, Default;
     core::fmt, Debug;
@@ -710,6 +730,7 @@ language_item_table! { LangItems =>
     PartialOrd_ge,                 FunctionId;
     PartialOrd_gt,                 FunctionId;
     Drop_drop,                     FunctionId;
+    Drop_pin_drop,                     FunctionId;
     Debug_fmt,                     FunctionId;
     Deref_deref,                   FunctionId;
     DerefMut_deref_mut,            FunctionId;

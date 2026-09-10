@@ -19,6 +19,6 @@
 #![recursion_limit = "512"] // For rustdoc
 // tidy-alphabetical-end
 
-mod errors;
+mod diagnostics;
 pub mod infer;
 pub mod traits;

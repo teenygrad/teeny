@@ -8,6 +8,7 @@ use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Ty};
 use rustc_middle::{bug, mir};
+use rustc_span::DUMMY_SP;
 use tracing::{debug, instrument};
 
 use super::operand::OperandValue;
@@ -111,7 +112,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         bx: &mut Bx,
         layout: TyAndLayout<'tcx>,
     ) -> Self {
-        if layout.deref().is_scalable_vector() {
+        if layout.peel_transparent_wrappers(bx).deref().is_scalable_vector() {
             Self::alloca_scalable(bx, layout)
         } else {
             Self::alloca_size(bx, layout.size, layout)
@@ -157,7 +158,11 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         bx: &mut Bx,
         layout: TyAndLayout<'tcx>,
     ) -> Self {
-        PlaceValue::new_sized(bx.alloca_with_ty(layout), layout.align.abi).with_type(layout)
+        PlaceValue::new_sized(
+            bx.alloca_with_ty(layout.peel_transparent_wrappers(bx)),
+            layout.align.abi,
+        )
+        .with_type(layout)
     }
 }
 
@@ -223,8 +228,9 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
 
         let unaligned_offset = bx.cx().const_usize(offset.bytes());
 
-        // Get the alignment of the field
-        let (_, mut unsized_align) = size_of_val::size_and_align_of_dst(bx, field.ty, meta);
+        // Get the alignment of the field. No span is available here to blame a layout error on.
+        let (_, mut unsized_align) =
+            size_of_val::size_and_align_of_dst(bx, field.ty, meta, DUMMY_SP);
 
         // For packed types, we need to cap alignment.
         if let ty::Adt(def, _) = self.layout.ty.kind()
@@ -313,6 +319,13 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
 
     pub fn storage_dead<Bx: BuilderMethods<'a, 'tcx, Value = V>>(&self, bx: &mut Bx) {
         bx.lifetime_end(self.val.llval, self.layout.size);
+    }
+
+    /// The same place, but with [`PlaceValue::align`] lowered to [`Align::ONE`].
+    pub fn unaligned(self) -> Self {
+        let Self { val, layout } = self;
+        let val = PlaceValue { align: Align::ONE, ..val };
+        Self { val, layout }
     }
 }
 
@@ -466,7 +479,7 @@ pub(super) fn codegen_tag_value<'tcx, V>(
 ) -> Result<Option<(FieldIdx, V)>, UninhabitedVariantError> {
     // By checking uninhabited-ness first we don't need to worry about types
     // like `(u32, !)` which are single-variant but weird.
-    if layout.for_variant(cx, variant_index).is_uninhabited() {
+    if layout.is_variant_uninhabited(variant_index) {
         return Err(UninhabitedVariantError);
     }
 
@@ -500,7 +513,7 @@ pub(super) fn codegen_tag_value<'tcx, V>(
                 // around the `niche`'s type.
                 // The easiest way to do that is to do wrapping arithmetic on `u128` and then
                 // masking off any extra bits that occur because we did the arithmetic with too many bits.
-                let niche_value = variant_index.as_u32() - niche_variants.start().as_u32();
+                let niche_value = variant_index.as_u32() - niche_variants.start.as_u32();
                 let niche_value = (niche_value as u128).wrapping_add(niche_start);
                 let niche_value = niche_value & niche_layout.size.unsigned_int_max();
 

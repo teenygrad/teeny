@@ -7,7 +7,6 @@
 use crate::fs::{self, Metadata, OpenOptions, Permissions};
 use crate::io::BorrowedCursor;
 use crate::path::Path;
-use crate::sealed::Sealed;
 use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner};
 use crate::time::SystemTime;
 use crate::{io, sys};
@@ -32,7 +31,8 @@ pub trait FileExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs::File;
     /// use std::os::windows::prelude::*;
@@ -60,7 +60,8 @@ pub trait FileExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// #![feature(core_io_borrowed_buf)]
     /// #![feature(read_buf_at)]
     ///
@@ -84,7 +85,7 @@ pub trait FileExt {
     /// }
     /// ```
     #[unstable(feature = "read_buf_at", issue = "140771")]
-    fn seek_read_buf(&self, buf: BorrowedCursor<'_>, offset: u64) -> io::Result<()> {
+    fn seek_read_buf(&self, buf: BorrowedCursor<'_, u8>, offset: u64) -> io::Result<()> {
         io::default_read_buf(|b| self.seek_read(b, offset), buf)
     }
 
@@ -105,7 +106,8 @@ pub trait FileExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::fs::File;
     /// use std::os::windows::prelude::*;
     ///
@@ -128,7 +130,7 @@ impl FileExt for fs::File {
         self.as_inner().read_at(buf, offset)
     }
 
-    fn seek_read_buf(&self, buf: BorrowedCursor<'_>, offset: u64) -> io::Result<()> {
+    fn seek_read_buf(&self, buf: BorrowedCursor<'_, u8>, offset: u64) -> io::Result<()> {
         self.as_inner().read_buf_at(buf, offset)
     }
 
@@ -152,7 +154,8 @@ pub trait OpenOptionsExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::fs::OpenOptions;
     /// use std::os::windows::prelude::*;
     ///
@@ -177,7 +180,8 @@ pub trait OpenOptionsExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::fs::OpenOptions;
     /// use std::os::windows::prelude::*;
     ///
@@ -203,7 +207,8 @@ pub trait OpenOptionsExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// # #![allow(unexpected_cfgs)]
     /// # #[cfg(for_demonstration_only)]
     /// extern crate winapi;
@@ -241,7 +246,8 @@ pub trait OpenOptionsExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// # #![allow(unexpected_cfgs)]
     /// # #[cfg(for_demonstration_only)]
     /// extern crate winapi;
@@ -280,10 +286,11 @@ pub trait OpenOptionsExt {
     /// For information about possible values, see [Impersonation Levels] on the
     /// Windows Dev Center site. The `SECURITY_SQOS_PRESENT` flag is set
     /// automatically when using this method.
-
+    ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// # #![allow(unexpected_cfgs)]
     /// # #[cfg(for_demonstration_only)]
     /// extern crate winapi;
@@ -338,7 +345,7 @@ impl OpenOptionsExt for OpenOptions {
 }
 
 #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
-pub trait OpenOptionsExt2: Sealed {
+pub impl(self) trait OpenOptionsExt2 {
     /// If set to `true`, prevent the "last access time" of the file from being changed.
     ///
     /// Default to `false`.
@@ -351,9 +358,6 @@ pub trait OpenOptionsExt2: Sealed {
     #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
     fn freeze_last_write_time(&mut self, freeze: bool) -> &mut Self;
 }
-
-#[unstable(feature = "sealed", issue = "none")]
-impl Sealed for OpenOptions {}
 
 #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
 impl OpenOptionsExt2 for OpenOptions {
@@ -381,7 +385,8 @@ impl OpenOptionsExt2 for OpenOptions {
 ///
 /// # Example
 ///
-/// ```no_run
+#[cfg_attr(windows, doc = "```no_run")]
+#[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
 /// #![feature(windows_permissions_ext)]
 /// use std::fs::Permissions;
 /// use std::os::windows::fs::PermissionsExt;
@@ -398,7 +403,7 @@ impl OpenOptionsExt2 for OpenOptions {
 /// assert_eq!(permissions.file_attributes(), new_file_attr);
 /// ```
 #[unstable(feature = "windows_permissions_ext", issue = "152956")]
-pub trait PermissionsExt: Sealed {
+pub impl(self) trait PermissionsExt {
     /// Returns the file attribute bits.
     #[unstable(feature = "windows_permissions_ext", issue = "152956")]
     fn file_attributes(&self) -> u32;
@@ -411,9 +416,6 @@ pub trait PermissionsExt: Sealed {
     #[unstable(feature = "windows_permissions_ext", issue = "152956")]
     fn from_file_attributes(mask: u32) -> Self;
 }
-
-#[unstable(feature = "windows_permissions_ext", issue = "152956")]
-impl Sealed for fs::Permissions {}
 
 #[unstable(feature = "windows_permissions_ext", issue = "152956")]
 impl PermissionsExt for fs::Permissions {
@@ -447,7 +449,8 @@ pub trait MetadataExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs;
     /// use std::os::windows::prelude::*;
@@ -477,7 +480,8 @@ pub trait MetadataExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs;
     /// use std::os::windows::prelude::*;
@@ -512,7 +516,8 @@ pub trait MetadataExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs;
     /// use std::os::windows::prelude::*;
@@ -545,7 +550,8 @@ pub trait MetadataExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs;
     /// use std::os::windows::prelude::*;
@@ -568,7 +574,8 @@ pub trait MetadataExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs;
     /// use std::os::windows::prelude::*;
@@ -656,7 +663,7 @@ impl MetadataExt for Metadata {
 ///
 /// On Windows, a symbolic link knows whether it is a file or directory.
 #[stable(feature = "windows_file_type_ext", since = "1.64.0")]
-pub trait FileTypeExt: Sealed {
+pub impl(self) trait FileTypeExt {
     /// Returns `true` if this file type is a symbolic link that is also a directory.
     #[stable(feature = "windows_file_type_ext", since = "1.64.0")]
     fn is_symlink_dir(&self) -> bool;
@@ -664,9 +671,6 @@ pub trait FileTypeExt: Sealed {
     #[stable(feature = "windows_file_type_ext", since = "1.64.0")]
     fn is_symlink_file(&self) -> bool;
 }
-
-#[stable(feature = "windows_file_type_ext", since = "1.64.0")]
-impl Sealed for fs::FileType {}
 
 #[stable(feature = "windows_file_type_ext", since = "1.64.0")]
 impl FileTypeExt for fs::FileType {
@@ -680,7 +684,7 @@ impl FileTypeExt for fs::FileType {
 
 /// Windows-specific extensions to [`fs::FileTimes`].
 #[stable(feature = "file_set_times", since = "1.75.0")]
-pub trait FileTimesExt: Sealed {
+pub impl(self) trait FileTimesExt {
     /// Set the creation time of a file.
     #[stable(feature = "file_set_times", since = "1.75.0")]
     fn set_created(self, t: SystemTime) -> Self;
@@ -710,7 +714,8 @@ impl FileTimesExt for fs::FileTimes {
 ///
 /// # Examples
 ///
-/// ```no_run
+#[cfg_attr(windows, doc = "```no_run")]
+#[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
 /// use std::os::windows::fs;
 ///
 /// fn main() -> std::io::Result<()> {
@@ -749,7 +754,8 @@ pub fn symlink_file<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io:
 ///
 /// # Examples
 ///
-/// ```no_run
+#[cfg_attr(windows, doc = "```no_run")]
+#[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
 /// use std::os::windows::fs;
 ///
 /// fn main() -> std::io::Result<()> {

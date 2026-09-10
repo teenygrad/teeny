@@ -19,7 +19,7 @@ use rustc_span::Span;
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::symbol::{Symbol, kw, sym};
 
-use crate::errors;
+use crate::diagnostics;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum AccessKind {
@@ -175,7 +175,7 @@ fn maybe_suggest_unit_pattern_typo<'tcx>(
     name: Symbol,
     span: Span,
     ty: Ty<'tcx>,
-) -> Option<errors::PatternTypo> {
+) -> Option<diagnostics::PatternTypo> {
     if let ty::Adt(adt_def, _) = ty.peel_refs().kind() {
         let variant_names: Vec<_> = adt_def
             .variants()
@@ -189,7 +189,7 @@ fn maybe_suggest_unit_pattern_typo<'tcx>(
                 .iter()
                 .find(|v| v.name == name && matches!(v.ctor, Some((CtorKind::Const, _))))
         {
-            return Some(errors::PatternTypo {
+            return Some(diagnostics::PatternTypo {
                 span,
                 code: with_no_trimmed_paths!(tcx.def_path_str(variant.def_id)),
                 kind: tcx.def_descr(variant.def_id),
@@ -213,7 +213,7 @@ fn maybe_suggest_unit_pattern_typo<'tcx>(
         && let Some(position) = names.iter().position(|&n| n == item_name)
         && let Some(&def_id) = constants.get(position)
     {
-        return Some(errors::PatternTypo {
+        return Some(diagnostics::PatternTypo {
             span,
             code: with_no_trimmed_paths!(tcx.def_path_str(def_id)),
             kind: "constant",
@@ -235,6 +235,11 @@ fn maybe_drop_guard<'tcx>(
 ) -> bool {
     if ever_dropped.contains(index) {
         let ty = checked_places.places[index].ty(&body.local_decls, tcx).ty;
+        // FIXME(#155345): Liveness uses `TypingMode::PostAnalysis`
+        // even though it's run on `mir_promoted` which is still
+        // in an earlier `TypingMode`. This is odd and we have to
+        // manually mark aliases as non-rigid here.
+        let ty = ty::set_aliases_to_non_rigid(tcx, ty).skip_norm_wip();
         matches!(
             ty.kind(),
             ty::Closure(..)
@@ -244,7 +249,7 @@ fn maybe_drop_guard<'tcx>(
                 | ty::Dynamic(..)
                 | ty::Array(..)
                 | ty::Slice(..)
-                | ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. })
+                | ty::Alias(_, ty::AliasTy { kind: ty::Opaque { .. }, .. })
         ) && ty.needs_drop(tcx, typing_env)
     } else {
         false
@@ -275,7 +280,7 @@ fn annotate_mut_binding_to_immutable_binding<'tcx>(
     body_def_id: LocalDefId,
     assignment_span: Span,
     body: &Body<'tcx>,
-) -> Option<errors::UnusedAssignSuggestion> {
+) -> Option<diagnostics::UnusedAssignSuggestion> {
     use rustc_hir as hir;
     use rustc_hir::intravisit::{self, Visitor};
 
@@ -316,7 +321,7 @@ fn annotate_mut_binding_to_immutable_binding<'tcx>(
         Some(mut_ty.ty.span.shrink_to_lo())
     };
 
-    return Some(errors::UnusedAssignSuggestion {
+    return Some(diagnostics::UnusedAssignSuggestion {
         ty_span,
         pre,
         // Span of the `mut` before the binding.
@@ -901,6 +906,58 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
         false
     }
 
+    /// Check for source-level uses that may have been removed from reachable MIR.
+    /// For example:
+    /// ```rust
+    /// fn example() {
+    ///     let x = todo!();
+    ///     eprintln!("{x}");
+    /// }
+    /// ```
+    /// The use of x is unreachable, but we'll still want to know if x is used to correctly emit
+    /// unused variable warning.
+    fn is_local_used_in_source(&self, name: Symbol, def_span: Span) -> bool {
+        use rustc_hir as hir;
+        use rustc_hir::def::Res;
+        use rustc_hir::intravisit::{self, Visitor};
+
+        let Some(body_def_id) = self.body.source.def_id().as_local() else { return false };
+        let Some(hir_body) = self.tcx.hir_maybe_body_owned_by(body_def_id) else { return false };
+        let typeck_results = self.tcx.typeck(body_def_id);
+
+        struct LocalUseVisitor<'a, 'tcx> {
+            tcx: TyCtxt<'tcx>,
+            typeck_results: &'a ty::TypeckResults<'tcx>,
+            name: Symbol,
+            def_span: Span,
+            found: bool,
+        }
+
+        impl<'a, 'tcx> Visitor<'tcx> for LocalUseVisitor<'a, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+                if self.found {
+                    return;
+                }
+
+                if let hir::ExprKind::Path(qpath) = &expr.kind
+                    && let Res::Local(hir_id) = self.typeck_results.qpath_res(qpath, expr.hir_id)
+                    && self.tcx.hir_name(hir_id) == self.name
+                    && self.tcx.hir_span(hir_id) == self.def_span
+                {
+                    self.found = true;
+                    return;
+                }
+
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let mut visitor =
+            LocalUseVisitor { tcx: self.tcx, typeck_results, name, def_span, found: false };
+        visitor.visit_body(hir_body);
+        visitor.found
+    }
+
     /// Report fully unused locals, and forget the corresponding assignments.
     fn report_fully_unused(&mut self) {
         let tcx = self.tcx;
@@ -939,7 +996,7 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                         .split(&brace_name)
                         .any(|c| matches!(c.chars().next(), Some('}' | ':')))
                 })
-                .map(|&(lit, _)| errors::UnusedVariableStringInterp { lit })
+                .map(|&(lit, _)| diagnostics::UnusedVariableStringInterp { lit })
                 .collect::<Vec<_>>()
         };
 
@@ -990,23 +1047,37 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                 }
             };
 
+            // the is_local_used_in_source is sufficient to check if the local is used in the source code,
+            // but we keep the local_kind check for a cheap filter to avoid heavy check
+            let is_used_after_uninitialized = self.body.local_kind(local) == LocalKind::Temp
+                && matches!(binding.opt_match_place, Some((None, _)))
+                && self.is_local_used_in_source(name, def_span);
+
             let statements = &mut self.assignments[index];
             if statements.is_empty() {
+                if is_used_after_uninitialized {
+                    // A local from `let PAT = ...` normally has an assignment recorded for the
+                    // value it initializes. If no assignment was recorded in reachable MIR, the
+                    // initializer did not complete. If the local still has a source-level use,
+                    // that use was made unreachable by the diverging initializer.
+                    continue;
+                }
+
                 if !self.is_local_in_reachable_code(local) {
                     continue;
                 }
 
                 let sugg = if from_macro {
-                    errors::UnusedVariableSugg::NoSugg { span: def_span, name }
+                    diagnostics::UnusedVariableSugg::NoSugg { span: def_span, name }
                 } else {
                     let typo = maybe_suggest_typo();
-                    errors::UnusedVariableSugg::TryPrefix { spans: vec![def_span], name, typo }
+                    diagnostics::UnusedVariableSugg::TryPrefix { spans: vec![def_span], name, typo }
                 };
                 tcx.emit_node_span_lint(
                     lint::builtin::UNUSED_VARIABLES,
                     hir_id,
                     def_span,
-                    errors::UnusedVariable {
+                    diagnostics::UnusedVariable {
                         name,
                         string_interp: maybe_suggest_literal_matching_name(name),
                         sugg,
@@ -1056,7 +1127,7 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                     lint::builtin::UNUSED_VARIABLES,
                     hir_id,
                     def_span,
-                    errors::UnusedVarAssignedOnly { name, typo },
+                    diagnostics::UnusedVarAssignedOnly { name, typo },
                 );
                 continue;
             }
@@ -1067,8 +1138,8 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
             let any_shorthand = introductions.iter().any(|intro| intro.is_shorthand);
 
             let sugg = if any_shorthand {
-                errors::UnusedVariableSugg::TryIgnore {
-                    name,
+                diagnostics::UnusedVariableSugg::TryIgnore {
+                    name: name.to_ident_string(),
                     shorthands: introductions
                         .iter()
                         .filter_map(
@@ -1085,20 +1156,20 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                         .collect(),
                 }
             } else if from_macro {
-                errors::UnusedVariableSugg::NoSugg { span: def_span, name }
+                diagnostics::UnusedVariableSugg::NoSugg { span: def_span, name }
             } else if !introductions.is_empty() {
                 let typo = maybe_suggest_typo();
-                errors::UnusedVariableSugg::TryPrefix { name, typo, spans: spans.clone() }
+                diagnostics::UnusedVariableSugg::TryPrefix { name, typo, spans: spans.clone() }
             } else {
                 let typo = maybe_suggest_typo();
-                errors::UnusedVariableSugg::TryPrefix { name, typo, spans: vec![def_span] }
+                diagnostics::UnusedVariableSugg::TryPrefix { name, typo, spans: vec![def_span] }
             };
 
             tcx.emit_node_span_lint(
                 lint::builtin::UNUSED_VARIABLES,
                 hir_id,
                 spans,
-                errors::UnusedVariable {
+                diagnostics::UnusedVariable {
                     name,
                     string_interp: maybe_suggest_literal_matching_name(name),
                     sugg,
@@ -1147,7 +1218,7 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                         .rfind(|(_, overwrite_location)| {
                             location.is_predecessor_of(*overwrite_location, self.body)
                         })
-                        .map(|&(overwrite_span, _)| errors::UnusedAssignOverwrite {
+                        .map(|&(overwrite_span, _)| diagnostics::UnusedAssignOverwrite {
                             assigned_span: source_info.span,
                             overwrite_span,
                             name,
@@ -1190,20 +1261,20 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                             lint::builtin::UNUSED_ASSIGNMENTS,
                             hir_id,
                             source_info.span,
-                            errors::UnusedAssign { name, overwrite, help, suggestion },
+                            diagnostics::UnusedAssign { name, overwrite, help, suggestion },
                         )
                     }
                     AccessKind::Param => tcx.emit_node_span_lint(
                         lint::builtin::UNUSED_ASSIGNMENTS,
                         hir_id,
                         source_info.span,
-                        errors::UnusedAssignPassed { name },
+                        diagnostics::UnusedAssignPassed { name },
                     ),
                     AccessKind::Capture => tcx.emit_node_span_lint(
                         lint::builtin::UNUSED_ASSIGNMENTS,
                         hir_id,
                         decl_span,
-                        errors::UnusedCaptureMaybeCaptureRef { name },
+                        diagnostics::UnusedCaptureMaybeCaptureRef { name },
                     ),
                 }
             }
@@ -1271,14 +1342,13 @@ impl<'tcx> Analysis<'tcx> for MaybeLivePlaces<'_, 'tcx> {
         self.transfer_function(trans).visit_statement(statement, location);
     }
 
-    fn apply_primary_terminator_effect<'mir>(
+    fn apply_primary_terminator_effect(
         &self,
         trans: &mut Self::Domain,
-        terminator: &'mir Terminator<'tcx>,
+        terminator: &Terminator<'tcx>,
         location: Location,
-    ) -> TerminatorEdges<'mir, 'tcx> {
+    ) {
         self.transfer_function(trans).visit_terminator(terminator, location);
-        terminator.edges()
     }
 
     fn apply_call_return_effect(
@@ -1478,8 +1548,7 @@ impl DefUse {
             PlaceContext::MutatingUse(
                 MutatingUseContext::RawBorrow
                 | MutatingUseContext::Borrow
-                | MutatingUseContext::Drop
-                | MutatingUseContext::Retag,
+                | MutatingUseContext::Drop,
             )
             | PlaceContext::NonMutatingUse(
                 NonMutatingUseContext::RawBorrow

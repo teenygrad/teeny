@@ -7,7 +7,7 @@
 use std::iter::zip;
 
 use either::Either;
-use hir::{EditionedFileId, Semantics};
+use hir::{EditionedFileId, Semantics, name};
 use ide_db::{RootDatabase, famous_defs::FamousDefs};
 
 use stdx::to_lower_snake_case;
@@ -197,13 +197,14 @@ fn should_hide_param_name_hint(
     //   parameter is a prefix/suffix of argument with _ splitting it off
     // - param starts with `ra_fixture`
     // - param is a well known name in a unary function
+    // - param is generated name
 
     let param_name = param_name.trim_matches('_');
     if param_name.is_empty() {
         return true;
     }
 
-    if param_name.starts_with("ra_fixture") {
+    if param_name.starts_with("ra_fixture") || name::is_generated(param_name) {
         return true;
     }
 
@@ -293,7 +294,8 @@ pub(super) fn is_argument_similar_to_param_name(
     debug_assert!(!argument.is_empty());
     debug_assert!(!param_name.is_empty());
     let param_name = param_name.split('_');
-    let argument = argument.iter().flat_map(|it| it.text_non_mutable().split('_'));
+    let argument = argument.iter().flat_map(|it| it.text().split('_'));
+    let argument = argument.map(|it| it.strip_prefix("r#").unwrap_or(it));
 
     let prefix_match = zip(argument.clone(), param_name.clone())
         .all(|(arg, param)| arg.eq_ignore_ascii_case(param));
@@ -311,7 +313,7 @@ pub(super) fn get_segment_representation(
             let receiver =
                 method_call_expr.receiver().and_then(|expr| get_segment_representation(&expr));
             let name_ref = method_call_expr.name_ref()?;
-            if INSIGNIFICANT_METHOD_NAMES.contains(&name_ref.text().as_str()) {
+            if INSIGNIFICANT_METHOD_NAMES.contains(&name_ref.text()) {
                 return receiver;
             }
             Some(Either::Left(match receiver {
@@ -373,16 +375,16 @@ fn is_adt_constructor_similar_to_param_name(
 ) -> bool {
     (|| match sema.resolve_path(path)? {
         hir::PathResolution::Def(hir::ModuleDef::Adt(_)) => {
-            Some(to_lower_snake_case(&path.segment()?.name_ref()?.text()) == param_name)
+            Some(to_lower_snake_case(path.segment()?.name_ref()?.text()) == param_name)
         }
         hir::PathResolution::Def(hir::ModuleDef::Function(_) | hir::ModuleDef::EnumVariant(_)) => {
-            if to_lower_snake_case(&path.segment()?.name_ref()?.text()) == param_name {
+            if to_lower_snake_case(path.segment()?.name_ref()?.text()) == param_name {
                 return Some(true);
             }
             let qual = path.qualifier()?;
             match sema.resolve_path(&qual)? {
                 hir::PathResolution::Def(hir::ModuleDef::Adt(_)) => {
-                    Some(to_lower_snake_case(&qual.segment()?.name_ref()?.text()) == param_name)
+                    Some(to_lower_snake_case(qual.segment()?.name_ref()?.text()) == param_name)
                 }
                 _ => None,
             }
@@ -608,6 +610,7 @@ impl Test {
 fn test_func(mut foo: i32, bar: i32, msg: &str, _: i32, last: i32) -> i32 {
     foo + bar
 }
+async fn test_async(foo: i32, _: i32) {}
 
 fn main() {
     let not_literal = 1;
@@ -631,6 +634,8 @@ fn main() {
         None,
       //^^^^ docs
     );
+    test_async(1, 2)
+             //^ foo
 }"#,
         );
     }
@@ -706,9 +711,12 @@ fn main() {
     let param_eter2 = 0;
     bar(param_eter2);
       //^^^^^^^^^^^ param_eter
+    let r#loop = true;
     let loop_level = 0;
     far(loop_level);
     faz(loop_level);
+    far(r#loop);
+    faz(r#loop);
 
     non_ident_pat((0, 0));
 

@@ -64,11 +64,9 @@ mod tests {
             r#"
 fn foo() {
     let var = loop {};
-     // ^^^ 💡 warn: unused variable
     var();
  // ^^^ error: type annotations needed; type must be known at this point
     let var = loop {};
-     // ^^^ 💡 warn: unused variable
     var[0];
  // ^^^ error: type annotations needed; type must be known at this point
 }
@@ -155,6 +153,19 @@ fn foo<T, U: From<T>>(_: T) -> U {
 }
 fn bar() {
     let _: () = foo(any());
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn include_bytes() {
+        check_diagnostics(
+            r#"
+//- minicore: include_bytes
+
+fn foo() {
+    include_bytes!("./foo.txt");
 }
         "#,
         );

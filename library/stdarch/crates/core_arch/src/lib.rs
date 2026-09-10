@@ -40,6 +40,7 @@
     const_eval_select,
     maybe_uninit_as_bytes,
     movrs_target_feature,
+    clflushopt_target_feature,
     min_adt_const_params
 )]
 #![cfg_attr(test, feature(test, abi_vectorcall, stdarch_internal))]
@@ -59,7 +60,9 @@
     clippy::shadow_reuse,
     clippy::similar_names,
     clippy::unusual_byte_groupings,
-    clippy::wrong_self_convention
+    clippy::wrong_self_convention,
+    clippy::zero_prefixed_literal,
+    clippy::tabs_in_doc_comments
 )]
 #![cfg_attr(test, allow(unused_imports))]
 #![no_std]

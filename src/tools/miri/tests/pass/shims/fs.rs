@@ -1,4 +1,5 @@
 //@compile-flags: -Zmiri-disable-isolation
+//@run-native
 
 #![feature(io_error_more)]
 #![feature(io_error_uncategorized)]
@@ -34,16 +35,28 @@ fn main() {
     test_file_set_len();
     test_file_sync();
     test_rename();
+    // Only these targets lower `File::set_times` to the `futimens` shim (macOS/Windows differ).
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "android"
+    )) {
+        test_file_set_times();
+    }
     // Windows file handling is very incomplete.
     if cfg!(not(windows)) {
         test_directory();
         test_canonicalize();
+        #[cfg(not(target_os = "solaris"))] // does not have flock
+        test_flock();
+        test_hard_link();
+
+        test_readv_writev();
         #[cfg(unix)]
         test_pread_pwrite();
-        #[cfg(not(any(target_os = "solaris", target_os = "android")))]
-        test_flock();
-        test_readv_writev();
-        #[cfg(all(unix, not(any(target_os = "solaris", target_os = "android"))))]
+        #[cfg(all(unix, not(target_os = "solaris")))]
         test_preadv_pwritev();
     }
 }
@@ -92,6 +105,11 @@ fn test_file() {
 }
 
 fn test_file_partial_reads_writes() {
+    if !cfg!(miri) {
+        // This test is not expected to work natively.
+        return;
+    }
+
     let path1 = utils::prepare_with_content("miri_test_fs_file1.txt", b"abcdefg");
     let path2 = utils::prepare_with_content("miri_test_fs_file2.txt", b"abcdefg");
 
@@ -221,9 +239,10 @@ fn test_file_set_len() {
     let file = OpenOptions::new().read(true).open(&path).unwrap();
     // Due to https://github.com/rust-lang/miri/issues/4457, we have to assume the failure could
     // be either of the Windows or Unix kind, no matter which platform we're on.
+    let err = file.set_len(14).unwrap_err();
     assert!(
-        [ErrorKind::PermissionDenied, ErrorKind::InvalidInput]
-            .contains(&file.set_len(14).unwrap_err().kind())
+        [ErrorKind::PermissionDenied, ErrorKind::InvalidInput].contains(&err.kind()),
+        "unexpected error: {err}"
     );
 
     remove_file(&path).unwrap();
@@ -248,6 +267,34 @@ fn test_file_sync() {
         file.sync_data().unwrap_err();
         file.sync_all().unwrap_err();
     }
+
+    remove_file(&path).unwrap();
+}
+
+fn test_file_set_times() {
+    use std::fs::FileTimes;
+    use std::time::{Duration, SystemTime};
+
+    let path = utils::prepare_with_content("miri_test_fs_set_times.txt", b"hello");
+    let file = OpenOptions::new().write(true).open(&path).unwrap();
+
+    // Use fixed, whole-second timestamps to avoid sub-second granularity differences between
+    // file systems.
+    let accessed = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_234_567_890);
+
+    // Setting both timestamps round-trips through the file's metadata.
+    file.set_times(FileTimes::new().set_accessed(accessed).set_modified(modified)).unwrap();
+    let metadata = file.metadata().unwrap();
+    assert_eq!(metadata.accessed().unwrap(), accessed);
+    assert_eq!(metadata.modified().unwrap(), modified);
+
+    // Setting only the modification time (`UTIME_OMIT` for access) leaves the access time alone.
+    let newer_modified = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+    file.set_times(FileTimes::new().set_modified(newer_modified)).unwrap();
+    let metadata = file.metadata().unwrap();
+    assert_eq!(metadata.accessed().unwrap(), accessed);
+    assert_eq!(metadata.modified().unwrap(), newer_modified);
 
     remove_file(&path).unwrap();
 }
@@ -406,31 +453,29 @@ fn test_pread_pwrite() {
     assert_eq!(&buf1, b"  m");
 }
 
-// The standard library does not support this operation on Android
-// (https://github.com/rust-lang/rust/issues/148325).
-// Miri does not support the way this is implemented on Solaris
-// (https://github.com/rust-lang/miri/issues/5038).
-#[cfg(not(any(target_os = "solaris", target_os = "android")))]
+// Solaris does not support per-handle file locking.
+#[cfg(not(target_os = "solaris"))]
 fn test_flock() {
     let bytes = b"Hello, World!\n";
     let path = utils::prepare_with_content("miri_test_fs_flock.txt", bytes);
     let file1 = OpenOptions::new().read(true).write(true).open(&path).unwrap();
     let file2 = OpenOptions::new().read(true).write(true).open(&path).unwrap();
 
-    // Test that we can apply many shared locks
+    // Test that we can apply many shared locks.
     file1.lock_shared().unwrap();
     file2.lock_shared().unwrap();
-    // Test that shared lock prevents exclusive lock
+    // Test that shared lock prevents exclusive lock.
     assert!(matches!(file1.try_lock().unwrap_err(), fs::TryLockError::WouldBlock));
-    // Unlock shared lock
+    // Unlock both files.
     file1.unlock().unwrap();
     file2.unlock().unwrap();
-    // Take exclusive lock
+
+    // Take exclusive lock.
     file1.lock().unwrap();
-    // Test that shared lock prevents exclusive and shared locks
+    // Test that shared lock prevents exclusive and shared locks.
     assert!(matches!(file2.try_lock().unwrap_err(), fs::TryLockError::WouldBlock));
     assert!(matches!(file2.try_lock_shared().unwrap_err(), fs::TryLockError::WouldBlock));
-    // Unlock exclusive lock
+    // Unlock exclusive lock.
     file1.unlock().unwrap();
 }
 
@@ -467,11 +512,9 @@ fn test_readv_writev() {
 
 /// Test vectored reads and vectored writes with byte offsets.
 ///
-/// **Note**: We skip this test on Solaris and Android targets. This is
-/// because Solaris doesn't have `preadv`/`pwritev`, and on Android the
-/// standard library uses `syscall(...)` for vectored reads/writes with
-/// offsets because older Android versions also didn't have `preadv`/`pwritev`.
-#[cfg(all(unix, not(any(target_os = "solaris", target_os = "android"))))]
+/// **Note**: We skip this test on Solaris targets because Solaris doesn't
+/// have `preadv`/`pwritev`.
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn test_preadv_pwritev() {
     use std::os::unix::fs::FileExt;
 
@@ -511,4 +554,33 @@ fn test_preadv_pwritev() {
     let mut written_bytes = vec![0u8; bytes_written];
     f.read_exact(&mut written_bytes).unwrap();
     assert_eq!(written_bytes.as_slice(), &write_buffer[0..bytes_written]);
+}
+
+fn test_hard_link() {
+    let source = utils::prepare_with_content("miri_test_fs_hard_link_source.txt", b"hello");
+    let link = utils::prepare("miri_test_fs_hard_link_link.txt");
+
+    fs::hard_link(&source, &link).unwrap();
+
+    // Verify that the hard link works:
+    // Modifications to one are visible through the other.
+    fs::write(&source, b"hello world").unwrap();
+    let contents = fs::read(&link).unwrap();
+    assert_eq!(contents, b"hello world");
+
+    // Only on Unix: verify both files have same inode
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let source_meta = std::fs::metadata(&source).unwrap();
+        let link_meta = std::fs::metadata(&link).unwrap();
+        assert_eq!(source_meta.ino(), link_meta.ino());
+    }
+
+    // Test error: link already exists
+    assert_eq!(ErrorKind::AlreadyExists, fs::hard_link(&source, &link).unwrap_err().kind());
+
+    // Cleanup after test
+    remove_file(&source).unwrap();
+    remove_file(&link).unwrap();
 }

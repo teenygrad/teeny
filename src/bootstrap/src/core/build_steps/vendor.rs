@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use crate::core::build_steps::tool::SUBMODULES_FOR_RUSTBOOK;
-use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
+use crate::core::builder::{Builder, CommandLineStep, RunConfig, ShouldRun};
 use crate::utils::exec::command;
 
 /// The name of the directory where vendored dependencies are stored.
@@ -24,6 +24,7 @@ pub fn default_paths_to_vendor(builder: &Builder<'_>) -> Vec<(PathBuf, Vec<&'sta
         ("compiler/rustc_codegen_cranelift/Cargo.toml", vec![]),
         ("compiler/rustc_codegen_gcc/Cargo.toml", vec![]),
         ("library/Cargo.toml", vec![]),
+        ("library/stdarch/Cargo.toml", vec![]),
         ("src/bootstrap/Cargo.toml", vec![]),
         ("src/tools/rustbook/Cargo.toml", SUBMODULES_FOR_RUSTBOOK.into()),
         ("src/tools/rustc-perf/Cargo.toml", vec!["src/tools/rustc-perf"]),
@@ -57,7 +58,7 @@ pub(crate) struct Vendor {
     pub(crate) only_library_workspace: bool,
 }
 
-impl Step for Vendor {
+impl CommandLineStep for Vendor {
     type Output = VendorOutput;
     const IS_HOST: bool = true;
 

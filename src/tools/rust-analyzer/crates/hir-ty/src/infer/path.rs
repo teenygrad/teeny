@@ -3,6 +3,7 @@
 use hir_def::{
     AdtId, AssocItemId, GenericDefId, ItemContainerId, Lookup,
     expr_store::path::{Path, PathSegment},
+    hir::ExprOrPatIdPacked,
     resolver::{ResolveValueResult, TypeNs, ValueNs},
     signatures::{ConstSignature, FunctionSignature},
 };
@@ -11,11 +12,11 @@ use rustc_type_ir::inherent::{SliceLike, Ty as _};
 use stdx::never;
 
 use crate::{
-    InferenceDiagnostic, Span, ValueTyDefId,
+    ExplicitDropMethodUseKind, InferenceDiagnostic, Span, ValueTyDefId,
     infer::{
         InferenceTyLoweringVarsCtx, diagnostics::InferenceTyLoweringContext as TyLoweringContext,
     },
-    lower::{GenericPredicates, LifetimeElisionKind},
+    lower::{GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode},
     method_resolution::{self, CandidateId, MethodError},
     next_solver::{
         GenericArg, GenericArgs, TraitRef, Ty, Unnormalized, infer::traits::ObligationCause,
@@ -23,15 +24,23 @@ use crate::{
     },
 };
 
-use super::{ExprOrPatId, InferenceContext, InferenceTyDiagnosticSource};
+use super::{InferenceContext, InferenceTyDiagnosticSource};
 
-impl<'db> InferenceContext<'_, 'db> {
+impl<'db> InferenceContext<'db> {
     pub(super) fn infer_path(
         &mut self,
         path: &Path,
-        id: ExprOrPatId,
+        id: ExprOrPatIdPacked,
     ) -> Option<(ValueNs, Ty<'db>)> {
         let (value, self_subst) = self.resolve_value_path_inner(path, id, false)?;
+
+        if let ValueNs::FunctionId(f) = value
+            && self.lang_items.Drop_drop.is_some_and(|drop_fn| drop_fn == f)
+        {
+            self.push_diagnostic(InferenceDiagnostic::ExplicitDropMethodUse {
+                kind: ExplicitDropMethodUseKind::Path(id),
+            });
+        }
 
         let (value_def, generic_def, substs) =
             match self.resolve_value_path(path, id, value, self_subst)? {
@@ -52,7 +61,7 @@ impl<'db> InferenceContext<'_, 'db> {
     fn resolve_value_path(
         &mut self,
         path: &Path,
-        id: ExprOrPatId,
+        id: ExprOrPatIdPacked,
         value: ValueNs,
         self_subst: Option<GenericArgs<'db>>,
     ) -> Option<ValuePathResolution<'db>> {
@@ -137,7 +146,7 @@ impl<'db> InferenceContext<'_, 'db> {
     pub(super) fn resolve_value_path_inner(
         &mut self,
         path: &Path,
-        id: ExprOrPatId,
+        id: ExprOrPatIdPacked,
         no_diagnostics: bool,
     ) -> Option<(ValueNs, Option<GenericArgs<'db>>)> {
         // Don't use `self.make_ty()` here as we need `orig_ns`.
@@ -158,6 +167,7 @@ impl<'db> InferenceContext<'_, 'db> {
             self.allow_using_generic_params,
             Some(&mut vars_ctx),
             &self.defined_anon_consts,
+            LifetimeLoweringMode::LateParam,
         );
         let mut path_ctx = if no_diagnostics {
             ctx.at_path_forget_diagnostics(path)
@@ -176,14 +186,37 @@ impl<'db> InferenceContext<'_, 'db> {
             let ty = self.table.process_user_written_ty(ty);
             self.resolve_ty_assoc_item(ty, last.name, id).map(|(it, substs)| (it, Some(substs)))?
         } else {
-            let hygiene = self.store.expr_or_pat_path_hygiene(id);
+            let hygiene = self.store.expr_or_pat_path_hygiene(id.unpack());
             // FIXME: report error, unresolved first path segment
             let value_or_partial = path_ctx.resolve_path_in_value_ns(hygiene)?;
 
             match value_or_partial {
                 ResolveValueResult::ValueNs(it) => {
                     drop_ctx(ctx, no_diagnostics);
-                    (it, None)
+
+                    let args = if let Path::LangItem(..) = path {
+                        let def_and_container = match it {
+                            ValueNs::ConstId(it) => Some((it.into(), it.loc(self.db).container)),
+                            ValueNs::FunctionId(it) => Some((it.into(), it.loc(self.db).container)),
+                            _ => None,
+                        };
+                        let def_and_container =
+                            def_and_container.and_then(|(def, container)| match container {
+                                ItemContainerId::ImplId(it) => Some((def, it.into())),
+                                ItemContainerId::TraitId(it) => Some((def, it.into())),
+                                ItemContainerId::ExternBlockId(_)
+                                | ItemContainerId::ModuleId(_) => None,
+                            });
+                        def_and_container.map(|(def, container)| {
+                            let args = self.infcx().fresh_args_for_item(id.into(), container);
+                            self.write_assoc_resolution(id, def, args);
+                            args
+                        })
+                    } else {
+                        None
+                    };
+
+                    (it, args)
                 }
                 ResolveValueResult::Partial(def, remaining_index) => {
                     // there may be more intermediate segments between the resolved one and
@@ -241,7 +274,7 @@ impl<'db> InferenceContext<'_, 'db> {
 
     pub(super) fn add_required_obligations_for_value_path(
         &mut self,
-        node: ExprOrPatId,
+        node: ExprOrPatIdPacked,
         def: GenericDefId,
         subst: GenericArgs<'db>,
     ) {
@@ -261,7 +294,7 @@ impl<'db> InferenceContext<'_, 'db> {
         &mut self,
         trait_ref: TraitRef<'db>,
         segment: PathSegment<'_>,
-        id: ExprOrPatId,
+        id: ExprOrPatIdPacked,
     ) -> Option<(ValueNs, GenericArgs<'db>)> {
         let trait_ = trait_ref.def_id.0;
         let item =
@@ -298,7 +331,7 @@ impl<'db> InferenceContext<'_, 'db> {
         &mut self,
         ty: Ty<'db>,
         name: &Name,
-        id: ExprOrPatId,
+        id: ExprOrPatIdPacked,
     ) -> Option<(ValueNs, GenericArgs<'db>)> {
         if ty.is_ty_error() {
             return None;
@@ -367,7 +400,7 @@ impl<'db> InferenceContext<'_, 'db> {
         &mut self,
         ty: Ty<'db>,
         name: &Name,
-        id: ExprOrPatId,
+        id: ExprOrPatIdPacked,
     ) -> Option<(ValueNs, GenericArgs<'db>)> {
         let ty = self.table.try_structurally_resolve_type(id.into(), ty);
         let (enum_id, subst) = match ty.as_adt() {

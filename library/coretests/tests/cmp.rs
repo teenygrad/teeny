@@ -254,13 +254,13 @@ mod const_cmp {
 
     struct S(i32);
 
-    impl const PartialEq for S {
+    const impl PartialEq for S {
         fn eq(&self, other: &Self) -> bool {
             self.0 == other.0
         }
     }
 
-    impl const PartialOrd for S {
+    const impl PartialOrd for S {
         fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
             let ret = match (self.0, other.0) {
                 (a, b) if a > b => Ordering::Greater,
@@ -279,4 +279,13 @@ mod const_cmp {
     const _: () = assert!(S(1) >= S(1));
     const _: () = assert!(S(0) < S(1));
     const _: () = assert!(S(1) > S(0));
+}
+
+mod const_splat {
+    use super::*;
+
+    const _: () = assert!(cmp::smallest(1, 2, 3, 4) == 1);
+    const _: () = assert!(cmp::smallest(4, 3, 2, 1) == 1);
+    const _: () = assert!(cmp::largest(1, 2, 3, 4) == 4);
+    const _: () = assert!(cmp::largest(4, 3, 2, 1) == 4);
 }

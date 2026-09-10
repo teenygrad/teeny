@@ -41,7 +41,7 @@ fn main() {
     epoll_ctl_add(epfd, client_sockfd, EPOLLOUT | EPOLLET | libc::EPOLLERR).unwrap();
 
     // Wait until the socket has an error.
-    check_epoll_wait::<8>(
+    check_epoll_wait(
         epfd,
         &[Ev { events: libc::EPOLLERR | EPOLLOUT | EPOLLHUP, data: client_sockfd }],
         -1,
@@ -54,7 +54,7 @@ fn main() {
     assert!(errno != 0);
 
     // Ensure that error readiness is cleared after reading SO_ERROR.
-    let readiness = current_epoll_readiness::<8>(client_sockfd, EPOLLET | EPOLLOUT | EPOLLERR);
+    let readiness = current_epoll_readiness(client_sockfd, EPOLLET | EPOLLOUT | EPOLLERR);
     assert!(readiness & EPOLLERR == 0);
 
     unsafe {

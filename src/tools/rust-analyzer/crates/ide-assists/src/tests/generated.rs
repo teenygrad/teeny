@@ -204,8 +204,8 @@ fn main() {
 "#####,
         r#####"
 fn main() {
-    ${1:'l}: loop {
-        break ${2:'l};
+    ${0:'l}: loop {
+        break ${0:'l};
         continue ${0:'l};
     }
 }
@@ -3221,6 +3221,23 @@ fn main() {
         r#####"
 fn main() {
   let x = 1.saturating_add(2);
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_replace_arith_with_strict() {
+    check_doc_test(
+        "replace_arith_with_strict",
+        r#####"
+fn main() {
+  let x = 1 $0+ 2;
+}
+"#####,
+        r#####"
+fn main() {
+  let x = 1.strict_add(2);
 }
 "#####,
     )

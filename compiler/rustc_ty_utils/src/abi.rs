@@ -2,7 +2,7 @@ use std::{assert_matches, iter};
 
 use rustc_abi::Primitive::Pointer;
 use rustc_abi::{Align, BackendRepr, ExternAbi, PointerKind, Scalar, Size};
-use rustc_hir::lang_items::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::{self as hir, find_attr};
 use rustc_middle::bug;
 use rustc_middle::middle::deduced_param_attrs::DeducedParamAttrs;
@@ -10,12 +10,10 @@ use rustc_middle::query::Providers;
 use rustc_middle::ty::layout::{
     FnAbiError, HasTyCtxt, HasTypingEnv, LayoutCx, LayoutOf, TyAndLayout, fn_can_unwind,
 };
-use rustc_middle::ty::{self, InstanceKind, Ty, TyCtxt, Unnormalized};
+use rustc_middle::ty::{self, InstanceKind, ShimKind, Ty, TyCtxt, Unnormalized};
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
-use rustc_target::callconv::{
-    AbiMap, ArgAbi, ArgAttribute, ArgAttributes, ArgExtension, FnAbi, PassMode,
-};
+use rustc_target::callconv::{AbiMap, ArgAbi, ArgAttribute, ArgAttributes, FnAbi, PassMode};
 use tracing::debug;
 
 pub(crate) fn provide(providers: &mut Providers) {
@@ -38,7 +36,7 @@ fn fn_sig_for_fn_abi<'tcx>(
     instance: ty::Instance<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
 ) -> ty::FnSig<'tcx> {
-    if let InstanceKind::ThreadLocalShim(..) = instance.def {
+    if let InstanceKind::Shim(ShimKind::ThreadLocal(..)) = instance.def {
         return tcx.mk_fn_sig_safe_rust_abi([], tcx.thread_local_ptr_ty(instance.def_id()));
     }
 
@@ -46,11 +44,11 @@ fn fn_sig_for_fn_abi<'tcx>(
     match *ty.kind() {
         ty::FnDef(def_id, args) => {
             let mut sig = tcx.instantiate_bound_regions_with_erased(
-                tcx.fn_sig(def_id).instantiate(tcx, args).skip_norm_wip(),
+                tcx.fn_sig(def_id).instantiate(tcx, args.no_bound_vars().unwrap()).skip_norm_wip(),
             );
 
             // Modify `fn(self, ...)` to `fn(self: *mut Self, ...)`.
-            if let ty::InstanceKind::VTableShim(..) = instance.def {
+            if let ty::InstanceKind::Shim(ty::ShimKind::VTable(..)) = instance.def {
                 let mut inputs_and_output = sig.inputs_and_output.to_vec();
                 inputs_and_output[0] = Ty::new_mut_ptr(tcx, inputs_and_output[0]);
                 sig.inputs_and_output = tcx.mk_type_list(&inputs_and_output);
@@ -82,22 +80,23 @@ fn fn_sig_for_fn_abi<'tcx>(
             // a separate def-id for these bodies.
             let mut coroutine_kind = args.as_coroutine_closure().kind();
 
-            let env_ty =
-                if let InstanceKind::ConstructCoroutineInClosureShim { receiver_by_ref, .. } =
-                    instance.def
-                {
-                    coroutine_kind = ty::ClosureKind::FnOnce;
+            let env_ty = if let InstanceKind::Shim(ShimKind::ConstructCoroutineInClosure {
+                receiver_by_ref,
+                ..
+            }) = instance.def
+            {
+                coroutine_kind = ty::ClosureKind::FnOnce;
 
-                    // Implementations of `FnMut` and `Fn` for coroutine-closures
-                    // still take their receiver by ref.
-                    if receiver_by_ref {
-                        Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, coroutine_ty)
-                    } else {
-                        coroutine_ty
-                    }
+                // Implementations of `FnMut` and `Fn` for coroutine-closures
+                // still take their receiver by ref.
+                if receiver_by_ref {
+                    Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, coroutine_ty)
                 } else {
-                    tcx.closure_env_ty(coroutine_ty, coroutine_kind, tcx.lifetimes.re_erased)
-                };
+                    coroutine_ty
+                }
+            } else {
+                tcx.closure_env_ty(coroutine_ty, coroutine_kind, tcx.lifetimes.re_erased)
+            };
 
             let sig = tcx.instantiate_bound_regions_with_erased(sig);
 
@@ -264,7 +263,8 @@ impl<'tcx> FnAbiDesc<'tcx> {
     ) -> Self {
         let ty::PseudoCanonicalInput { typing_env, value: (instance, extra_args) } = query;
         let is_virtual_call = matches!(instance.def, ty::InstanceKind::Virtual(..));
-        let is_tls_shim_call = matches!(instance.def, ty::InstanceKind::ThreadLocalShim(_));
+        let is_tls_shim_call =
+            matches!(instance.def, ty::InstanceKind::Shim(ty::ShimKind::ThreadLocal(_)));
         Self {
             layout_cx: LayoutCx::new(tcx, typing_env),
             sig: tcx.normalize_erasing_regions(
@@ -329,13 +329,6 @@ fn arg_attrs_for_rust_scalar<'tcx>(
 ) -> ArgAttributes {
     let mut attrs = ArgAttributes::new();
 
-    // Booleans are always a noundef i1 that needs to be zero-extended.
-    if scalar.is_bool() {
-        attrs.ext(ArgExtension::Zext);
-        attrs.set(ArgAttribute::NoUndef);
-        return attrs;
-    }
-
     if !scalar.is_uninit_valid() {
         attrs.set(ArgAttribute::NoUndef);
     }
@@ -356,24 +349,13 @@ fn arg_attrs_for_rust_scalar<'tcx>(
                 Some(pointee.align.min(cx.tcx().sess.target.max_reliable_alignment()));
         }
 
-        // LLVM dereferenceable attribute has unclear semantics on the return type,
-        // they seem to be "dereferenceable until the end of the program", which is
-        // generally, not valid for references. See
-        // <https://rust-lang.zulipchat.com/#narrow/channel/136281-t-opsem/topic/LLVM.20dereferenceable.20on.20return.20type/with/563001493>
-        if !is_return {
-            attrs.pointee_size = pointee.size;
-        };
+        attrs.pointee_size = pointee.size;
 
         if let Some(kind) = pointee.safe {
             // The aliasing rules for `Box<T>` are still not decided, but currently we emit
             // `noalias` for it. This can be turned off using an unstable flag.
             // See https://github.com/rust-lang/unsafe-code-guidelines/issues/326
             let noalias_for_box = tcx.sess.opts.unstable_opts.box_noalias;
-
-            // LLVM prior to version 12 had known miscompiles in the presence of noalias attributes
-            // (see #54878), so it was conditionally disabled, but we don't support earlier
-            // versions at all anymore. We still support turning it off using -Zmutable-noalias.
-            let noalias_mut_ref = tcx.sess.opts.unstable_opts.mutable_noalias;
 
             // `&T` where `T` contains no `UnsafeCell<U>` is immutable, and can be marked as both
             // `readonly` and `noalias`, as LLVM's definition of `noalias` is based solely on memory
@@ -383,7 +365,7 @@ fn arg_attrs_for_rust_scalar<'tcx>(
             // `&mut T` and `Box<T>` where `T: Unpin` are unique and hence `noalias`.
             let no_alias = match kind {
                 PointerKind::SharedRef { frozen } => frozen,
-                PointerKind::MutableRef { unpin } => unpin && noalias_mut_ref,
+                PointerKind::MutableRef { unpin } => unpin,
                 PointerKind::Box { unpin, global } => unpin && global && noalias_for_box,
             };
             // We can never add `noalias` in return position; that LLVM attribute has some very surprising semantics
@@ -407,6 +389,26 @@ fn arg_attrs_for_rust_scalar<'tcx>(
                 }
             }
 
+            // NoFree is not valid on return values. If it were, it would mean something like
+            // "will not be freed until the end of the program", which is generally not valid for
+            // references.
+            let no_free = !is_return
+                && match kind {
+                    // Non-frozen shared references are not necessarily dereferenceable for the
+                    // entire duration of the function
+                    // (see <https://github.com/rust-lang/rust/pull/98017>).
+                    PointerKind::SharedRef { frozen } => frozen,
+                    // Mutable references to potentially self-referential types are not necessarily
+                    // dereferenceable for the entire duration of the function
+                    // (see <https://github.com/rust-lang/unsafe-code-guidelines/issues/381>).
+                    PointerKind::MutableRef { unpin } => unpin,
+                    // Box may be deallocated during execution of the function.
+                    PointerKind::Box { .. } => false,
+                };
+            if no_free {
+                attrs.set(ArgAttribute::NoFree);
+            }
+
             if matches!(kind, PointerKind::SharedRef { frozen: true }) && !is_return {
                 attrs.set(ArgAttribute::ReadOnly);
                 attrs.set(ArgAttribute::CapturesReadOnly);
@@ -423,11 +425,17 @@ fn fn_abi_sanity_check<'tcx>(
     fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
     spec_abi: ExternAbi,
 ) {
+    fn fn_arg_attrs_sanity_check(attrs: &ArgAttributes, is_ret: bool) {
+        if attrs.regular.contains(ArgAttribute::NoFree) {
+            assert!(!is_ret, "NoFree not valid on return values");
+        }
+    }
+
     fn fn_arg_sanity_check<'tcx>(
         cx: &LayoutCx<'tcx>,
-        fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
         spec_abi: ExternAbi,
         arg: &ArgAbi<'tcx, Ty<'tcx>>,
+        is_ret: bool,
     ) {
         let tcx = cx.tcx();
 
@@ -437,8 +445,10 @@ fn fn_abi_sanity_check<'tcx>(
                 // omitted entirely in the calling convention.
                 assert!(arg.is_ignore());
             }
-            if let PassMode::Indirect { on_stack, .. } = arg.mode {
-                assert!(!on_stack, "rust abi shouldn't use on_stack");
+            if let PassMode::Indirect { on_stack, .. } = arg.mode
+                && spec_abi != ExternAbi::RustTail
+            {
+                assert!(!on_stack, "rustic abi {spec_abi:?} shouldn't use on_stack");
             }
         } else if arg.layout.pass_indirectly_in_non_rustic_abis(cx) {
             assert_matches!(
@@ -452,58 +462,52 @@ fn fn_abi_sanity_check<'tcx>(
             PassMode::Ignore => {
                 assert!(arg.layout.is_zst());
             }
-            PassMode::Direct(_) => {
+            PassMode::Direct(attrs) => {
                 // Here the Rust type is used to determine the actual ABI, so we have to be very
                 // careful. Scalar/Vector is fine, since backends will generally use
-                // `layout.backend_repr` and ignore everything else. We should just reject
-                //`Aggregate` entirely here, but some targets need to be fixed first.
+                // `layout.backend_repr` and ignore everything else.
                 match arg.layout.backend_repr {
                     BackendRepr::Scalar(_)
                     | BackendRepr::SimdVector { .. }
                     | BackendRepr::SimdScalableVector { .. } => {}
-                    BackendRepr::ScalarPair(..) => {
+                    BackendRepr::ScalarPair { .. } => {
                         panic!("`PassMode::Direct` used for ScalarPair type {}", arg.layout.ty)
                     }
-                    BackendRepr::Memory { sized } => {
-                        // For an unsized type we'd only pass the sized prefix, so there is no universe
-                        // in which we ever want to allow this.
-                        assert!(sized, "`PassMode::Direct` for unsized type in ABI: {:#?}", fn_abi);
-
-                        // This really shouldn't happen even for sized aggregates, since
-                        // `immediate_llvm_type` will use `layout.fields` to turn this Rust type into an
-                        // LLVM type. This means all sorts of Rust type details leak into the ABI.
-                        // The unadjusted ABI however uses Direct for all args. It is ill-specified,
-                        // but unfortunately we need it for calling certain LLVM intrinsics.
-                        assert!(
-                            matches!(spec_abi, ExternAbi::Unadjusted),
-                            "`PassMode::Direct` for aggregates only allowed for \"unadjusted\"\n\
+                    BackendRepr::Memory { .. } => {
+                        panic!(
+                            "`PassMode::Direct` for aggregates not allowed\n\
                              Problematic type: {:#?}",
                             arg.layout,
                         );
                     }
                 }
+                fn_arg_attrs_sanity_check(attrs, is_ret);
             }
-            PassMode::Pair(_, _) => {
+            PassMode::Pair(attrs1, attrs2) => {
                 // Similar to `Direct`, we need to make sure that backends use `layout.backend_repr`
                 // and ignore the rest of the layout.
                 assert!(
-                    matches!(arg.layout.backend_repr, BackendRepr::ScalarPair(..)),
+                    matches!(arg.layout.backend_repr, BackendRepr::ScalarPair { .. }),
                     "PassMode::Pair for type {}",
                     arg.layout.ty
                 );
+                fn_arg_attrs_sanity_check(attrs1, is_ret);
+                fn_arg_attrs_sanity_check(attrs2, is_ret);
             }
             PassMode::Cast { .. } => {
                 // `Cast` means "transmute to `CastType`"; that only makes sense for sized types.
                 assert!(arg.layout.is_sized());
             }
-            PassMode::Indirect { meta_attrs: None, .. } => {
+            PassMode::Indirect { meta_attrs: None, attrs, .. } => {
                 // No metadata, must be sized.
                 // Conceptually, unsized arguments must be copied around, which requires dynamically
                 // determining their size, which we cannot do without metadata. Consult
                 // t-opsem before removing this check.
                 assert!(arg.layout.is_sized());
+                // Indirect returns are arguments from an ABI perspective.
+                fn_arg_attrs_sanity_check(attrs, false);
             }
-            PassMode::Indirect { meta_attrs: Some(_), on_stack, .. } => {
+            PassMode::Indirect { meta_attrs: Some(meta_attrs), attrs, on_stack } => {
                 // With metadata. Must be unsized and not on the stack.
                 assert!(arg.layout.is_unsized() && !on_stack);
                 // Also, must not be `extern` type.
@@ -515,14 +519,17 @@ fn fn_abi_sanity_check<'tcx>(
                     // t-opsem before removing this check.
                     panic!("unsized arguments must not be `extern` types");
                 }
+                // Indirect returns are arguments from an ABI perspective.
+                fn_arg_attrs_sanity_check(attrs, false);
+                fn_arg_attrs_sanity_check(meta_attrs, false);
             }
         }
     }
 
     for arg in fn_abi.args.iter() {
-        fn_arg_sanity_check(cx, fn_abi, spec_abi, arg);
+        fn_arg_sanity_check(cx, spec_abi, arg, false);
     }
-    fn_arg_sanity_check(cx, fn_abi, spec_abi, &fn_abi.ret);
+    fn_arg_sanity_check(cx, spec_abi, &fn_abi.ret, true);
 }
 
 #[tracing::instrument(
@@ -579,7 +586,7 @@ fn fn_abi_new_uncached<'tcx>(
             layout
         };
 
-        Ok(ArgAbi::new(cx, layout, |scalar, offset| {
+        Ok(ArgAbi::new(layout, |scalar, offset| {
             arg_attrs_for_rust_scalar(*cx, scalar, layout, offset, is_return, determined_fn_def_id)
         }))
     };
@@ -617,26 +624,13 @@ fn fn_abi_adjust_for_abi<'tcx>(
     fn_abi: &mut FnAbi<'tcx, Ty<'tcx>>,
     abi: ExternAbi,
 ) {
-    if abi == ExternAbi::Unadjusted {
-        // The "unadjusted" ABI passes aggregates in "direct" mode. That's fragile but needed for
-        // some LLVM intrinsics.
-        fn unadjust<'tcx>(arg: &mut ArgAbi<'tcx, Ty<'tcx>>) {
-            // This still uses `PassMode::Pair` for ScalarPair types. That's unlikely to be intended,
-            // but who knows what breaks if we change this now.
-            if matches!(arg.layout.backend_repr, BackendRepr::Memory { .. }) {
-                assert!(
-                    arg.layout.backend_repr.is_sized(),
-                    "'unadjusted' ABI does not support unsized arguments"
-                );
-            }
-            arg.make_direct_deprecated();
-        }
+    assert_ne!(
+        abi,
+        ExternAbi::Unadjusted,
+        "fn_abi_of_instance should not be called on LLVM intrinsics"
+    );
 
-        unadjust(&mut fn_abi.ret);
-        for arg in fn_abi.args.iter_mut() {
-            unadjust(arg);
-        }
-    } else if abi.is_rustic_abi() {
+    if abi.is_rustic_abi() {
         fn_abi.adjust_for_rust_abi(cx);
     } else {
         fn_abi.adjust_for_foreign_abi(cx, abi);
@@ -708,7 +702,7 @@ fn make_thin_self_ptr<'tcx>(
         Ty::new_mut_ptr(tcx, layout.ty)
     } else {
         match layout.backend_repr {
-            BackendRepr::ScalarPair(..) | BackendRepr::Scalar(..) => (),
+            BackendRepr::ScalarPair { .. } | BackendRepr::Scalar(..) => (),
             _ => bug!("receiver type has unsupported layout: {:?}", layout),
         }
 

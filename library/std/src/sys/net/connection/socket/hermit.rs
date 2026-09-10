@@ -132,7 +132,7 @@ impl Socket {
         Ok(Socket(unsafe { FileDesc::from_raw_fd(fd) }))
     }
 
-    fn recv_with_flags(&self, mut buf: BorrowedCursor<'_>, flags: i32) -> io::Result<()> {
+    fn recv_with_flags(&self, mut buf: BorrowedCursor<'_, u8>, flags: i32) -> io::Result<()> {
         let ret = cvt(unsafe {
             netc::recv(
                 self.0.as_raw_fd(),
@@ -159,7 +159,7 @@ impl Socket {
         Ok(buf.len())
     }
 
-    pub fn read_buf(&self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, buf: BorrowedCursor<'_, u8>) -> io::Result<()> {
         self.recv_with_flags(buf, 0)
     }
 
@@ -304,8 +304,8 @@ impl Socket {
     }
 
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        let raw: c_int = unsafe { getsockopt(self, libc::SOL_SOCKET, libc::SO_ERROR)? };
-        if raw == 0 { Ok(None) } else { Ok(Some(io::Error::from_raw_os_error(raw as i32))) }
+        let raw = unsafe { getsockopt(self, libc::SOL_SOCKET, libc::SO_ERROR)? };
+        if raw == 0 { Ok(None) } else { Ok(Some(io::Error::from_raw_os_error(raw))) }
     }
 
     pub fn as_raw(&self) -> RawFd {

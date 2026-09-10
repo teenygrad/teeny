@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering::SeqCst;
 mod drop_checks {
     //! These tests mainly make sure the elements are correctly dropped.
 
-    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     #[derive(Debug)]
@@ -143,6 +143,51 @@ mod drop_checks {
         check::<5>(5, 1);
         check::<5>(5, 4);
     }
+
+    /// Regression test for #156501
+    #[test]
+    fn panicking_clone() {
+        static CLONE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        static DROP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        struct PanickingClone(u8);
+
+        impl Clone for PanickingClone {
+            fn clone(&self) -> Self {
+                if CLONE_COUNTER.fetch_add(1, Relaxed) == 3 {
+                    panic!(
+                        "⚞(· <:::> ·)⚟ aaaaaah its the turbofish monster!!! its gonna eat us all!!!1!"
+                    );
+                }
+
+                Self(self.0)
+            }
+        }
+
+        impl Drop for PanickingClone {
+            fn drop(&mut self) {
+                assert_eq!(self.0, 42);
+
+                DROP_COUNTER.fetch_add(1, Relaxed);
+            }
+        }
+
+        let array = [const { PanickingClone(42) }; 17];
+        let mut iter = array.into_iter().map_windows::<_, (), 17>(|_| ());
+
+        // initialize the buffer
+        iter.next();
+
+        let result = std::panic::catch_unwind(|| {
+            // now do the clones and panic.
+            // this should't try to drop uninitialized memory
+            let _ = iter.clone();
+        });
+
+        assert!(result.is_err());
+
+        assert_eq!(DROP_COUNTER.load(Relaxed), 3);
+    }
 }
 
 #[test]
@@ -172,6 +217,7 @@ fn test_case_from_pr_82413_comment() {
 
 #[test]
 #[should_panic = "array in `Iterator::map_windows` must contain more than 0 elements"]
+#[allow(unconditional_panic)]
 fn check_zero_window() {
     let _ = std::iter::repeat(0).map_windows(|_: &[_; 0]| ());
 }

@@ -201,7 +201,7 @@ impl OnDiskCache {
 
     /// Serialize the current-session data that will be loaded by [`OnDiskCache`]
     /// in a subsequent incremental compilation session.
-    pub fn serialize(tcx: TyCtxt<'_>, encoder: FileEncoder) -> FileEncodeResult {
+    pub fn serialize(tcx: TyCtxt<'_>, encoder: FileEncoder<'static>) -> FileEncodeResult {
         // Serializing the `DepGraph` should not modify it.
         tcx.dep_graph.with_ignore(|| {
             // Allocate `SourceFileIndex`es.
@@ -489,11 +489,6 @@ where
 impl<'a, 'tcx> TyDecoder<'tcx> for CacheDecoder<'a, 'tcx> {
     const CLEAR_CROSS_CRATE: bool = false;
 
-    #[inline]
-    fn interner(&self) -> TyCtxt<'tcx> {
-        self.tcx
-    }
-
     fn cached_ty_for_shorthand<F>(&mut self, shorthand: usize, or_insert_with: F) -> Ty<'tcx>
     where
         F: FnOnce(&mut Self) -> Ty<'tcx>,
@@ -528,6 +523,15 @@ impl<'a, 'tcx> TyDecoder<'tcx> for CacheDecoder<'a, 'tcx> {
     fn decode_alloc_id(&mut self) -> interpret::AllocId {
         let alloc_decoding_session = self.alloc_decoding_session;
         alloc_decoding_session.decode_alloc_id(self)
+    }
+}
+
+impl<'a, 'tcx> rustc_type_ir::InternerDecoder for CacheDecoder<'a, 'tcx> {
+    type Interner = TyCtxt<'tcx>;
+
+    #[inline]
+    fn interner(&self) -> Self::Interner {
+        self.tcx
     }
 }
 
@@ -779,7 +783,7 @@ impl_ref_decoder! {<'tcx>
 /// An encoder that can write to the incremental compilation cache.
 pub struct CacheEncoder<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    encoder: FileEncoder,
+    encoder: FileEncoder<'static>,
     type_shorthands: FxHashMap<Ty<'tcx>, usize>,
     predicate_shorthands: FxHashMap<ty::PredicateKind<'tcx>, usize>,
     interpret_allocs: FxIndexSet<interpret::AllocId>,
