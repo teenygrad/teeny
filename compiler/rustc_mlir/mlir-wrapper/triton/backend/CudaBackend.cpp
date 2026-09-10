@@ -315,7 +315,6 @@ LogicalResult CudaBackend::makeTTIR(MLIRContext &context, ModuleOp module) {
   }
 
   addPass(pm, MlirPass::inliner);
-  addPass(pm, MlirPass::ttir_rewrite_tensor_pointer);
   if (capability < 90) {
     addPass(pm, MlirPass::ttir_rewrite_tensor_descriptor_to_pointer);
   }
@@ -625,7 +624,7 @@ std::string CudaBackend::llvmTranslateToAsm(
   std::string targetError;
   llvm::Triple triple(llvm::Triple::normalize(tripleStr));
   const llvm::Target *target =
-      llvm::TargetRegistry::lookupTarget(triple.getTriple(), targetError);
+      llvm::TargetRegistry::lookupTarget(triple, targetError);
   if (!target) {
     llvm::errs() << targetError << "\n";
     return {};

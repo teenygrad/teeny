@@ -273,7 +273,7 @@ llvm::TargetMachine *RiscvBackend::createRiscvTargetMachine() {
       m_target_triple.empty() ? "riscv64" : m_target_triple));
   std::string targetError;
   const llvm::Target *target =
-      llvm::TargetRegistry::lookupTarget(triple.getTriple(), targetError);
+      llvm::TargetRegistry::lookupTarget(triple, targetError);
   if (!target) {
     llvm::errs() << "RiscvBackend: " << targetError << "\n";
     return nullptr;

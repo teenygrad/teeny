@@ -151,8 +151,8 @@ fn compile_codegen_unit_impl(
 fn cleanup_mlir_module(mlir_module: &mut MlirModule<'static>) -> Result<(), MlirError> {
     let pass_manager = PassManager::new(mlir_module.context());
 
-    pass_manager.add_pass(pass::transform::create_canonicalizer());
-    pass_manager.add_pass(pass::transform::create_symbol_dce());
+    pass_manager.add_pass(pass::transform::create_canonicalizer_pass());
+    pass_manager.add_pass(pass::transform::create_symbol_dce_pass());
 
     pass_manager
         .run(mlir_module.llmod_mut())

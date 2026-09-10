@@ -40,7 +40,7 @@ melior_macro::dialect! {
         "triton/Dialect/Triton/IR/TritonOps.td",
         "triton/Dialect/Triton/IR/TritonTypes.td"
     ],
-    include_directories: ["TRITON_INCLUDE_DIRECTORY"],
+    include_directory_env_vars: ["TRITON_INCLUDE_DIRECTORY"],
 }
 
 pub fn load_triton_dialect(context: &Context) {

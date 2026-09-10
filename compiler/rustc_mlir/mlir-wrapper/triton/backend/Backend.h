@@ -77,7 +77,6 @@ enum MlirPass {
   // ttir
   ttir_combine,
   ttir_reorder_broadcast,
-  ttir_rewrite_tensor_pointer,
   ttir_rewrite_tensor_descriptor_to_pointer,
   ttir_loop_unroll,
   ttir_triton_licm,
@@ -222,7 +221,6 @@ private:
       // ttir
       {MlirPass::ttir_combine, createTritonCombineOps},
       {MlirPass::ttir_reorder_broadcast, createTritonReorderBroadcast},
-      {MlirPass::ttir_rewrite_tensor_pointer, createTritonRewriteTensorPointer},
       {MlirPass::ttir_rewrite_tensor_descriptor_to_pointer,
        createTritonRewriteTensorDescriptorToPointer},
       {MlirPass::ttir_loop_unroll, createTritonLoopUnroll},
