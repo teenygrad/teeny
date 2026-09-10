@@ -2777,7 +2777,7 @@ version = "0.1.0"
 
 [[package]]
 name = "mlir-sys"
-version = "210.0.1"
+version = "220.0.2"
 dependencies = [
  "bindgen",
  "cargo_metadata 0.23.1",
