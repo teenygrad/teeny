@@ -55,6 +55,15 @@ add_definitions(${LLVM_DEFINITIONS})
 # below via MLIR_DIALECT_LIBS instead of needing an explicit source/link entry.
 add_subdirectory(riscv)
 
+# TritonCPU dialect/conversions/transforms ported from the triton-cpu fork
+# (teenyc-3yu). Off by default: the sources still target triton-cpu's patched
+# LLVM (mlir::x86::amx rather than LLVM 22.0's mlir::amx, among other drift),
+# so they do not compile here yet. See cpu/README.md.
+option(TRITON_CPU_ENABLE "Build the ported TritonCPU dialect and passes" OFF)
+if(TRITON_CPU_ENABLE)
+    add_subdirectory(cpu)
+endif()
+
 # Source files
 set(WRAPPER_SOURCES
     MLIRWrapper.cpp
