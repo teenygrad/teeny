@@ -505,8 +505,8 @@ impl CodegenBackend for MlirCodegenBackend {
                     }
                     Arch::RiscV32 | Arch::RiscV64 => {
                         out.push_str(
-                            "  a RISC-V chip identifier understood by this backend's (currently \
-                             stub) RISC-V/Triton path, e.g. generic-rvv1.0, spacemit-k3 -- not \
+                            "  a RISC-V chip identifier understood by this backend's \
+                             RISC-V/Triton path, e.g. generic-rvv1.0, spacemit-k3 -- not \
                              an LLVM -mcpu value\n",
                         );
                     }

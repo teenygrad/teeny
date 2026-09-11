@@ -71,6 +71,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     // The wrapper's RISC-V backend references the in-tree RVV dialect, which cmake
     // builds as its own archive. It must follow mlir-wrapper on the link line.
     println!("cargo:rustc-link-lib=static=MLIRRVVDialect");
+    // RiscvBackend lowers through TritonCPU (mlir-wrapper's CpuBackend), whose
+    // passes live in these archives. Dependents come first so each archive's
+    // references resolve against the ones after it; the MLIR libraries they
+    // need are linked by mlir-sys, and TritonIR by `triton` below.
+    for lib in ["TritonCPUToLLVM", "TritonCPUTransforms", "TritonToTritonCPU", "TritonCPUIR"] {
+        println!("cargo:rustc-link-lib=static={lib}");
+    }
 
     // Link MLIR libraries
     let mlir_lib_dir = llvm.install_dir.join("lib");

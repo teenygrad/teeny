@@ -18,12 +18,14 @@
 #define TRITON_RISCV_BACKEND_H
 
 #include <memory>
+#include <set>
 #include <stdint.h>
 #include <string>
 
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/Triple.h"
 
-#include "Backend.h"
+#include "CpuBackend.h"
 
 namespace mlir {
 namespace triton {
@@ -32,13 +34,10 @@ namespace triton {
 // RISC-V backend compile options (FFI-safe / repr(C))
 //
 // Mirrors the FFI-safe struct conventions used by CudaCompileOptions in
-// CudaBackend.h. RiscvBackend below does not yet lower the incoming
-// Triton/MLIR module (see makeTTIR/makeTTGIR/makeLLIR): makeLLVMIR
-// synthesizes a placeholder kernel function instead, which makeASM/makeBIN
-// then compile for real through LLVM's RISC-V backend.
+// CudaBackend.h.
 // ---------------------------------------------------------------------------
 
-/// FFI-safe compilation options for the (stub) RISC-V backend.
+/// FFI-safe compilation options for the RISC-V backend.
 struct RiscvCompileOptions {
   const char *target_triple; /// RISC-V target triple
   const char *cpu;           /// RISC-V CPU
@@ -46,12 +45,11 @@ struct RiscvCompileOptions {
   bool debug;
 };
 
-/// RISC-V backend. Does not yet lower the incoming Triton/MLIR module (see
-/// makeTTIR/makeTTGIR/makeLLIR); makeLLVMIR instead synthesizes a minimal
-/// placeholder `void @<name>()` kernel function, which makeASM/makeBIN
-/// compile for real through LLVM's RISC-V backend -- makeBIN links the
+/// RISC-V backend. CpuBackend lowers the incoming Triton module through
+/// TritonCPU IR to optimised LLVM IR; this class describes the RISC-V target
+/// and compiles that IR through LLVM's RISC-V backend -- makeBIN links the
 /// result into a shared library via `ld.lld` so it can be dlopen'd and run.
-class RiscvBackend : public Backend {
+class RiscvBackend : public CpuBackend {
 public:
   RiscvBackend(std::string target, RiscvCompileOptions options);
 
@@ -59,33 +57,29 @@ public:
 
   virtual void loadDialects(MLIRContext &context) override;
 
-  virtual LogicalResult makeTTIR(MLIRContext &context,
-                                 ModuleOp module) override;
-
-  virtual LogicalResult makeTTGIR(MLIRContext &context,
-                                  ModuleOp module) override;
-
-  virtual LogicalResult gluonToTTGIR(MLIRContext &context,
-                                     ModuleOp module) override;
-
-  virtual LogicalResult makeLLIR(MLIRContext &context,
-                                 ModuleOp module) override;
-
-  virtual LogicalResult makeLLVMIR(MLIRContext &context,
-                                   ModuleOp module) override;
-
   virtual LogicalResult makeASM(MLIRContext &context, ModuleOp module) override;
 
   virtual LogicalResult makeBIN(MLIRContext &context, ModuleOp module) override;
 
+protected:
+  virtual std::string getTargetArch() const override;
+
+  virtual std::set<std::string> getTargetFeatures() const override;
+
+  /// Uses a real, generic LLVM cpu name matching the triple's width rather
+  /// than `m_cpu` -- see the comment in the .cpp for why forwarding that
+  /// Triton-side chip identifier directly would abort the process instead of
+  /// failing gracefully.
+  virtual std::unique_ptr<llvm::TargetMachine> createTargetMachine() override;
+
 private:
-  /// Creates an LLVM `TargetMachine` for this backend's target triple,
-  /// logging why and returning nullptr on failure. Caller owns the
-  /// returned pointer. Uses a real, generic LLVM cpu name matching the
-  /// triple's width rather than `m_cpu` -- see the comment in the .cpp for
-  /// why forwarding that Triton-side chip identifier directly would abort
-  /// the process instead of failing gracefully.
-  llvm::TargetMachine *createRiscvTargetMachine();
+  /// The normalized target triple, defaulting to riscv64 when none was given.
+  llvm::Triple targetTriple() const;
+
+  /// The LLVM feature string the target machine is created with, e.g.
+  /// "+m,+a,+f,+d,+c". getTargetFeatures() derives from the same string, so
+  /// pass selection and codegen always agree on the target.
+  std::string llvmFeatures() const;
 
   /// Reparses `m_llvmir` (populated by makeLLVMIR) into `context`, logging
   /// why and returning nullptr on failure.
@@ -108,7 +102,6 @@ private:
   std::string m_target_triple;
   std::string m_cpu;
   std::string m_features;
-  bool m_debug;
 };
 
 } // namespace triton

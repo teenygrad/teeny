@@ -186,12 +186,13 @@ impl Default for CudaCompileOptions {
 // Tagged union of backend option structs (mirrors `CompileOptionsData` in C++)
 // ---------------------------------------------------------------------------
 
-/// FFI-safe compilation options for the (stub) RISC-V backend.
+/// FFI-safe compilation options for the RISC-V backend.
 /// Mirrors `RiscvCompileOptions` in `RiscvBackend.h`.
 ///
-/// Reserved for a future real RISC-V Triton backend; the C++ `RiscvBackend`
-/// stub reports `Error::NotImplemented` for every codegen stage and does not
-/// yet consume these fields.
+/// `target_triple` selects the LLVM target and `debug` prints the IR after each
+/// pass. `cpu` and `features` are not yet mapped onto LLVM cpu/feature names, so
+/// the backend compiles for a generic RV64GC/RV32GC baseline (see
+/// `RiscvBackend::createTargetMachine`).
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct RiscvCompileOptions {

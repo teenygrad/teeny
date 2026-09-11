@@ -27,6 +27,7 @@
 #include "llvm/IR/Module.h"
 
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -125,6 +126,16 @@ enum MlirPass {
   gluon_canonicalizer,
   gluon_inliner,
   gluon_infer_coalesced_encodings,
+
+  // convert: generic MLIR conversions used by the CPU pipeline
+  lower_affine,
+  math_to_llvmir,
+  math_to_libm,
+  func_to_llvmir,
+  ub_to_llvmir,
+  memref_expand_strided_metadata,
+  memref_to_llvmir,
+  reconcile_unrealized_casts,
 };
 
 class Backend {
@@ -274,6 +285,18 @@ private:
       {MlirPass::gluon_inliner, gluon::createGluonInline},
       {MlirPass::gluon_infer_coalesced_encodings,
        gluon::createGluonInferCoalescedEncodingsPass},
+
+      // convert: generic MLIR conversions used by the CPU pipeline
+      {MlirPass::lower_affine, createLowerAffinePass},
+      {MlirPass::math_to_llvmir, createConvertMathToLLVMPass},
+      {MlirPass::math_to_libm, createConvertMathToLibmPass},
+      {MlirPass::func_to_llvmir, createConvertFuncToLLVMPass},
+      {MlirPass::ub_to_llvmir, createUBToLLVMConversionPass},
+      {MlirPass::memref_expand_strided_metadata,
+       memref::createExpandStridedMetadataPass},
+      {MlirPass::memref_to_llvmir, createFinalizeMemRefToLLVMConversionPass},
+      {MlirPass::reconcile_unrealized_casts,
+       createReconcileUnrealizedCastsPass},
   };
 };
 
