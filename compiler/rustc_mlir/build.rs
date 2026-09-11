@@ -48,7 +48,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .define("LLVM_DIR", llvm.install_dir.join("lib/cmake/llvm"))
         .define("MLIR_DIR", &mlir_dir)
         .define("TRITON_SOURCE_DIR", triton.source_dir())
-        .define("TRITON_BUILD_DIR", triton_build_dir);
+        .define("TRITON_BUILD_DIR", triton_build_dir)
+        // The CMake option defaults OFF for standalone configures; passing it
+        // explicitly also overrides a stale OFF left in an existing build cache.
+        .define("TRITON_CPU_ENABLE", "ON");
 
     let dst = config.build();
 
