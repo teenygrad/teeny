@@ -22,6 +22,18 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/MC/MCAsmBackend.h"
+#include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCCodeEmitter.h"
+#include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCInstrInfo.h"
+#include "llvm/MC/MCObjectFileInfo.h"
+#include "llvm/MC/MCObjectWriter.h"
+#include "llvm/MC/MCParser/MCAsmParser.h"
+#include "llvm/MC/MCParser/MCTargetAsmParser.h"
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCStreamer.h"
+#include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -89,27 +101,22 @@ LogicalResult RiscvBackend::makeASM(MLIRContext &context, ModuleOp module) {
 }
 
 LogicalResult RiscvBackend::makeBIN(MLIRContext &context, ModuleOp module) {
+  // TritonCompiler::compile only calls makeBIN after makeASM succeeded, so the
+  // module has already been through codegen once. Assembling that output is
+  // far cheaper than running instruction selection a second time.
+  if (m_asm.empty()) {
+    llvm::errs() << "RiscvBackend: makeBIN needs the assembly makeASM emits\n";
+    return failure();
+  }
+
   auto tm = createTargetMachine();
   if (!tm) {
     return failure();
   }
 
-  llvm::LLVMContext llvmContext;
-  auto mod = parseStoredLLVMIR(llvmContext);
-  if (!mod) {
-    return failure();
-  }
-
   llvm::SmallVector<char, 0> objBuf;
-  {
-    llvm::raw_svector_ostream os(objBuf);
-    llvm::legacy::PassManager pm;
-    if (tm->addPassesToEmitFile(pm, os, nullptr,
-                                llvm::CodeGenFileType::ObjectFile)) {
-      llvm::errs() << "RiscvBackend: failed to add passes to emit object file\n";
-      return failure();
-    }
-    pm.run(*mod);
+  if (failed(assembleObject(*tm, objBuf))) {
+    return failure();
   }
 
   // Link the object into a shared library so it can be dlopen'd and run at
@@ -174,6 +181,72 @@ LogicalResult RiscvBackend::makeBIN(MLIRContext &context, ModuleOp module) {
   }
 
   m_bin.assign((*soBuf)->getBufferStart(), (*soBuf)->getBufferEnd());
+  return success();
+}
+
+LogicalResult
+RiscvBackend::assembleObject(const llvm::TargetMachine &tm,
+                             llvm::SmallVectorImpl<char> &objBuf) const {
+  // Build the MC layer from the target machine makeASM emitted with: the
+  // assembler rejects instructions, such as RVV's, whose extensions its
+  // subtarget lacks.
+  const llvm::Target &target = tm.getTarget();
+  const llvm::Triple &triple = tm.getTargetTriple();
+  const llvm::MCTargetOptions &mcOptions = tm.Options.MCOptions;
+
+  std::unique_ptr<llvm::MCRegisterInfo> mri(target.createMCRegInfo(triple));
+  std::unique_ptr<llvm::MCAsmInfo> mai(
+      mri ? target.createMCAsmInfo(*mri, triple, mcOptions) : nullptr);
+  std::unique_ptr<llvm::MCSubtargetInfo> sti(target.createMCSubtargetInfo(
+      triple, tm.getTargetCPU(), tm.getTargetFeatureString()));
+  std::unique_ptr<llvm::MCInstrInfo> mcii(target.createMCInstrInfo());
+  if (!mri || !mai || !sti || !mcii) {
+    llvm::errs() << "RiscvBackend: failed to create the MC target description "
+                    "for "
+                 << triple.getTriple() << "\n";
+    return failure();
+  }
+
+  llvm::SourceMgr srcMgr;
+  srcMgr.AddNewSourceBuffer(
+      llvm::MemoryBuffer::getMemBuffer(m_asm, "<riscv-asm>"), llvm::SMLoc());
+
+  llvm::MCContext ctx(triple, *mai, *mri, *sti, &srcMgr);
+  std::unique_ptr<llvm::MCObjectFileInfo> mofi(
+      target.createMCObjectFileInfo(ctx, tm.isPositionIndependent()));
+  ctx.setObjectFileInfo(mofi.get());
+
+  std::unique_ptr<llvm::MCAsmBackend> mab(
+      target.createMCAsmBackend(*sti, *mri, mcOptions));
+  std::unique_ptr<llvm::MCCodeEmitter> emitter(
+      target.createMCCodeEmitter(*mcii, ctx));
+  if (!mab || !emitter) {
+    llvm::errs() << "RiscvBackend: failed to create the assembler backend\n";
+    return failure();
+  }
+
+  llvm::raw_svector_ostream os(objBuf);
+  std::unique_ptr<llvm::MCObjectWriter> writer = mab->createObjectWriter(os);
+  std::unique_ptr<llvm::MCStreamer> streamer(target.createMCObjectStreamer(
+      triple, ctx, std::move(mab), std::move(writer), std::move(emitter),
+      *sti));
+
+  std::unique_ptr<llvm::MCAsmParser> parser(
+      llvm::createMCAsmParser(srcMgr, ctx, *streamer, *mai));
+  std::unique_ptr<llvm::MCTargetAsmParser> targetParser(
+      target.createMCAsmParser(*sti, *parser, *mcii));
+  if (!targetParser) {
+    llvm::errs() << "RiscvBackend: " << triple.getTriple()
+                 << " has no assembly parser\n";
+    return failure();
+  }
+  parser->setTargetParser(*targetParser);
+
+  // Diagnostics go through srcMgr; Run returns true if there were any errors.
+  if (parser->Run(/*NoInitialTextSection=*/false)) {
+    llvm::errs() << "RiscvBackend: failed to assemble makeASM's output\n";
+    return failure();
+  }
   return success();
 }
 

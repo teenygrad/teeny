@@ -86,6 +86,11 @@ private:
   /// why and returning nullptr on failure.
   std::unique_ptr<llvm::Module> parseStoredLLVMIR(llvm::LLVMContext &context);
 
+  /// Assembles `m_asm` (populated by makeASM) into an ELF object in `objBuf`
+  /// with LLVM's integrated assembler, using `tm`'s triple, cpu and features.
+  LogicalResult assembleObject(const llvm::TargetMachine &tm,
+                               llvm::SmallVectorImpl<char> &objBuf) const;
+
   /// Locates the `ld.lld` binary used to link makeBIN's object file into a
   /// shared library: `$TEENYC_LLD_PATH` if set, else the `rust-lld` copy
   /// bundled with this running `teenyc`'s own toolchain (see the .cpp),
