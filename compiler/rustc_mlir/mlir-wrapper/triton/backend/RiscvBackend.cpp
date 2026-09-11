@@ -187,14 +187,15 @@ std::string RiscvBackend::getTargetArch() const {
 }
 
 std::string RiscvBackend::llvmFeatures() const {
-  // A generic cpu name alone implies no ISA extensions, which defaults codegen
-  // to the soft-float ABI (lp64/ilp32) -- incompatible with the hard-float ABI
-  // (lp64d/ilp32d) essentially all real RISC-V Linux userspace (glibc, other
-  // .so's on the system) actually uses. Matches the `features`
-  // rustc_target::spec::targets::riscv64_generic declares (M/A/F/D/C, i.e.
-  // the standard "G" extension set, plus V); once m_features carries a real
-  // per-chip feature string this should prefer that instead of always using
-  // this fixed baseline.
+  // rustc passes the target spec's features plus -C target-feature (see
+  // resolve_riscv in rustc_codegen_llvm/src/mlir/target.rs); that is where V
+  // comes from. The fallback matters because a generic cpu name alone implies
+  // no ISA extensions, which defaults codegen to the soft-float ABI
+  // (lp64/ilp32) -- incompatible with the hard-float ABI (lp64d/ilp32d)
+  // essentially all real RISC-V Linux userspace actually uses.
+  if (!m_features.empty()) {
+    return m_features;
+  }
   return "+m,+a,+f,+d,+c";
 }
 
@@ -241,9 +242,9 @@ std::unique_ptr<llvm::TargetMachine> RiscvBackend::createTargetMachine() {
   // not a recoverable LogicalResult::failure()) when it can't derive a
   // valid XLen from the cpu, e.g. "LLVM ERROR: RV64 target requires an
   // RV64 CPU". So this always uses a real, generic LLVM cpu name matching
-  // the triple's width, and ignores m_cpu. That compiles the lowered kernel
-  // correctly, but a real chip-name-to-LLVM-cpu/feature mapping is needed
-  // before m_cpu can be honored and chip-specific extensions such as V used.
+  // the triple's width, and ignores m_cpu. Extensions such as V come from
+  // llvmFeatures() instead; a chip-name-to-LLVM-cpu mapping is still needed
+  // before m_cpu can select chip-specific tuning.
   std::string cpu = triple.isArch64Bit() ? "generic-rv64" : "generic-rv32";
 
   // PIC: makeBIN links the resulting object into a shared library.

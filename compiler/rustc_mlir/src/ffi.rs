@@ -189,9 +189,10 @@ impl Default for CudaCompileOptions {
 /// FFI-safe compilation options for the RISC-V backend.
 /// Mirrors `RiscvCompileOptions` in `RiscvBackend.h`.
 ///
-/// `target_triple` selects the LLVM target and `debug` prints the IR after each
-/// pass. `cpu` and `features` are not yet mapped onto LLVM cpu/feature names, so
-/// the backend compiles for a generic RV64GC/RV32GC baseline (see
+/// `target_triple` selects the LLVM target, `features` is its LLVM target-feature
+/// string (NULL falls back to the RV64GC/RV32GC baseline), and `debug` prints
+/// the IR after each pass. `cpu` is a Triton-side chip identifier not yet mapped
+/// onto an LLVM cpu name, so the target machine uses a generic one (see
 /// `RiscvBackend::createTargetMachine`).
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]

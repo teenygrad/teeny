@@ -41,7 +41,7 @@ namespace triton {
 struct RiscvCompileOptions {
   const char *target_triple; /// RISC-V target triple
   const char *cpu;           /// RISC-V CPU
-  const char *features;      /// RISC-V features
+  const char *features;      /// LLVM target features, e.g. "+m,+a,+f,+d,+c,+v"
   bool debug;
 };
 
@@ -76,9 +76,10 @@ private:
   /// The normalized target triple, defaulting to riscv64 when none was given.
   llvm::Triple targetTriple() const;
 
-  /// The LLVM feature string the target machine is created with, e.g.
-  /// "+m,+a,+f,+d,+c". getTargetFeatures() derives from the same string, so
-  /// pass selection and codegen always agree on the target.
+  /// The LLVM feature string the target machine is created with: `m_features`
+  /// as passed by rustc, else the "+m,+a,+f,+d,+c" baseline.
+  /// getTargetFeatures() derives from the same string, so pass selection and
+  /// codegen always agree on the target.
   std::string llvmFeatures() const;
 
   /// Reparses `m_llvmir` (populated by makeLLVMIR) into `context`, logging
