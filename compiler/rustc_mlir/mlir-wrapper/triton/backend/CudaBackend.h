@@ -230,6 +230,13 @@ private:
                                llvm::Module &module,
                                const std::vector<std::string> &libPaths);
 
+  /// The PTX ISA version the PTX declares (10 * major + minor).
+  int ptxVersion() const;
+
+  /// The capability LLVM compiles for; differs from m_capability only where
+  /// LLVM's NVPTX backend lacks the SM, as upstream Triton does.
+  int llvmCapability() const;
+
   /// The NVPTX cpu (`sm_<capability>[a]`) and feature string LLVM is given.
   std::string llvmCpu() const;
   std::string llvmFeatures() const;

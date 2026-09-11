@@ -43,6 +43,7 @@
 
 #include "CudaBackend.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <regex>
 
@@ -175,9 +176,7 @@ LogicalResult CudaBackend::makeLLVMIR(MLIRContext &context, ModuleOp module) {
 }
 
 LogicalResult CudaBackend::makeASM(MLIRContext &context, ModuleOp module) {
-  int ptx_version = this->m_options.ptx_version.has_value
-                        ? this->m_options.ptx_version.value
-                        : 90;
+  int ptx_version = ptxVersion();
   auto tm = createTargetMachine();
   if (!tm) {
     return LogicalResult::failure();
@@ -586,16 +585,30 @@ CudaBackend::linkExternLibs(llvm::LLVMContext &llvmContext,
   return LogicalResult::success();
 }
 
+int CudaBackend::ptxVersion() const {
+  return m_options.ptx_version.has_value ? m_options.ptx_version.value : 90;
+}
+
+int CudaBackend::llvmCapability() const {
+  // LLVM's NVPTX backend has no sm_107 (Jetson Thor): it ignores the unknown
+  // processor and compiles for a generic subtarget. Upstream Triton compiles
+  // 107 as sm_100; makeASM still stamps the real capability on `.target`.
+  return m_capability == 107 ? 100 : static_cast<int>(m_capability);
+}
+
 std::string CudaBackend::llvmCpu() const {
-  std::string cpu = "sm_" + std::to_string(m_capability);
-  if (m_capability >= 90) {
+  const int capability = llvmCapability();
+  std::string cpu = "sm_" + std::to_string(capability);
+  if (capability >= 90) {
     cpu += "a";
   }
   return cpu;
 }
 
 std::string CudaBackend::llvmFeatures() const {
-  return ""; // AXM TODO - get_features
+  // As upstream Triton's get_features, which still caps the version at PTX 9.0
+  // for LLVM 23 even though its NVPTX backend defines features up to ptx93.
+  return "+ptx" + std::to_string(std::min(90, ptxVersion()));
 }
 
 std::unique_ptr<llvm::TargetMachine> CudaBackend::createTargetMachine() const {

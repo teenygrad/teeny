@@ -125,6 +125,60 @@ fn cuda_valid_target_cpu_succeeds() {
     assert!(result.is_ok(), "expected sm_90 to be accepted: {result:?}");
 }
 
+/// Compiled PTX without the lines that are expected to differ between
+/// capabilities: the declared PTX ISA version and the target SM.
+fn ptx_without_version_and_target(ptx: &str) -> String {
+    ptx.lines()
+        .filter(|line| !line.starts_with(".version ") && !line.starts_with(".target "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn cuda_capability_107_compiles_as_sm_100() {
+    // LLVM's NVPTX backend has no sm_107 (Jetson Thor): given `sm_107a` it
+    // ignores the processor and compiles for a generic subtarget. Upstream
+    // Triton compiles capability 107 as sm_100 and only stamps `.target sm_107`
+    // onto the PTX afterwards.
+    let src = data_file("triton_relu.rs");
+    let mut ptx = Vec::new();
+    for cpu in ["sm_100", "sm_107"] {
+        let output_name = format!("cuda_{cpu}");
+        let target_cpu = format!("target-cpu={cpu}");
+        let result = try_compile(&src, "nvptx64-nvidia-cuda", &output_name, &["-C", &target_cpu]);
+        assert!(result.is_ok(), "expected {cpu} to compile: {result:?}");
+        ptx.push(
+            std::fs::read_to_string(format!("/tmp/kernel-{output_name}.asm"))
+                .expect("read compiled PTX"),
+        );
+    }
+
+    assert!(
+        ptx[1].lines().any(|line| line == ".target sm_107a"),
+        "capability 107 PTX should still declare its own target"
+    );
+    assert_eq!(
+        ptx_without_version_and_target(&ptx[0]),
+        ptx_without_version_and_target(&ptx[1]),
+        "capability 107 should be lowered exactly like sm_100"
+    );
+}
+
+#[test]
+fn cuda_default_ptx_versions_meet_llvm_minimums() {
+    // CudaBackend passes the resolved PTX version to LLVM as `+ptx<version>`,
+    // and LLVM aborts the whole process when that is below the minimum for the
+    // SM it compiles for (getMinPTXVersionForSM in NVPTXSubtarget.cpp), so each
+    // capability's default version must meet it.
+    let src = data_file("triton_relu.rs");
+    for capability in [75, 80, 86, 87, 88, 89, 90, 100, 101, 103, 107, 110, 120, 121] {
+        let output_name = format!("cuda_ptx_sm_{capability}");
+        let target_cpu = format!("target-cpu=sm_{capability}");
+        let result = try_compile(&src, "nvptx64-nvidia-cuda", &output_name, &["-C", &target_cpu]);
+        assert!(result.is_ok(), "expected sm_{capability} to compile: {result:?}");
+    }
+}
+
 #[test]
 fn cuda_invalid_target_cpu_is_rejected() {
     // Before teenyc-j3a, an unrecognized -C target-cpu silently defaulted to

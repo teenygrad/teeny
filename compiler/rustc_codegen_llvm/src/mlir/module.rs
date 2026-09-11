@@ -123,12 +123,19 @@ fn default_ptx_version_for_capability(capability: i32) -> i32 {
         80 => 70,  // Ampere DC:         CUDA 11.0 / PTX ISA 7.0
         86 => 71,  // Ampere:            CUDA 11.1 / PTX ISA 7.1
         87 => 74,  // Ampere embedded:   CUDA 11.4 / PTX ISA 7.4 (Jetson Orin)
+        // CudaBackend passes the version to LLVM as `+ptx<version>`, and LLVM
+        // aborts when it is below the target's minimum (getMinPTXVersionForSM
+        // in NVPTXSubtarget.cpp), so the entries below are those minimums.
+        88 => 90,  // sm_88   requires PTX ISA 9.0
         89 => 78,  // Ada Lovelace:      CUDA 11.8 / PTX ISA 7.8
         90 => 80,  // Hopper:            sm_90a  requires PTX ISA 8.0 (NVPTX.td)
         100 => 86, // Blackwell DC:      sm_100a requires PTX ISA 8.6 (NVPTX.td)
+        101 => 86, // sm_101a requires PTX ISA 8.6
         103 => 88, // Blackwell DC Ultra: sm_103a requires PTX ISA 8.8 (NVPTX.td)
+        107 => 86, // compiled as sm_100a (LLVM has no sm_107), which requires PTX ISA 8.6
         110 => 90, // Blackwell (approx): sm_110a requires PTX ISA 9.0 (NVPTX.td)
         120 => 87, // Blackwell:         sm_120a requires PTX ISA 8.7 (NVPTX.td, RTX 50-series)
+        121 => 88, // sm_121a requires PTX ISA 8.8
         _ => 80,   // unknown architecture: widely-supported baseline
     }
 }
