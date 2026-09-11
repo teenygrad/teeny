@@ -33,8 +33,10 @@ use rustc_codegen_ssa::back::write::{
 };
 use rustc_codegen_ssa::base::codegen_crate;
 use rustc_codegen_ssa::traits::*;
-use rustc_codegen_ssa::{CompiledModule, CompiledModules, CrateInfo, ModuleCodegen, TargetConfig};
-use rustc_data_structures::fx::FxIndexMap;
+use rustc_codegen_ssa::{
+    CompiledModule, CompiledModules, CrateInfo, ModuleCodegen, TargetConfig, target_features,
+};
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_errors::DiagCtxtHandle;
 use rustc_middle::dep_graph;
@@ -440,11 +442,29 @@ impl CodegenBackend for MlirCodegenBackend {
         crate::llvm_util::target_cpu(sess).to_string()
     }
 
-    fn target_config(&self, _sess: &Session) -> TargetConfig {
-        // To Do: Implement MLIR-specific target config for the target
-        // defined in the session
+    fn target_config(&self, sess: &Session) -> TargetConfig {
+        // The LLVM backend asks an LLVM target machine which features its base
+        // cpu enables. This backend's target cpus (`generic-rvv1.0`, `sm_90`)
+        // are not LLVM cpu names -- LLVM's RISC-V backend aborts on them -- so
+        // the base features are the target spec's, with Rust's implications;
+        // internal_target_features then applies -C target-feature. Without
+        // them rustc warns that ABI-required features such as `d` are missing.
+        let mut spec_features = FxHashSet::default();
+        target_features::target_spec_to_backend_features(sess, |feature, enable| {
+            if enable {
+                spec_features.insert(feature);
+            } else {
+                spec_features.remove(feature);
+            }
+        });
+        let internal_target_features = target_features::internal_target_features(
+            sess,
+            |feature| smallvec::SmallVec::from_buf([feature]),
+            |feature| spec_features.contains(feature),
+        );
+
         TargetConfig {
-            internal_target_features: Default::default(),
+            internal_target_features,
             has_reliable_f16: false,
             has_reliable_f16_math: false,
             has_reliable_f128: false,
