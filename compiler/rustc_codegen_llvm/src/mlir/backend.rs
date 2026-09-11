@@ -386,6 +386,27 @@ fn write_compiled_module(
         .unwrap_or_else(|e| panic!("Failed to write output to {}: {}", out_path.display(), e));
     info!("Output written to {} ({} bytes)", out_path.display(), bytes.len());
 
+    // With --emit=asm, rustc's produce_final_output_artifacts copies the
+    // conventionally named assembly temp file to the requested output. That
+    // is the only way a backend that also links a binary (RiscvBackend's .so)
+    // can hand back its assembly text instead of the binary.
+    let assembly = cgcx.module_config.emit_asm.then(|| {
+        let asm = module.module_llvm.asm.as_deref().unwrap_or_else(|| {
+            panic!(
+                "--emit=asm requested but no assembly is available for module '{}'",
+                module.name
+            )
+        });
+        let asm_path = cgcx
+            .output_filenames
+            .temp_path_for_cgu(rustc_session::config::OutputType::Assembly, &module.name);
+        std::fs::write(&asm_path, asm.as_bytes()).unwrap_or_else(|e| {
+            panic!("Failed to write assembly to {}: {}", asm_path.display(), e)
+        });
+        info!("Assembly written to {} ({} bytes)", asm_path.display(), asm.len());
+        asm_path
+    });
+
     if let Some(mlir_src) = module.module_llvm.mlir_source.as_deref() {
         let mlir_path = cgcx
             .output_filenames
@@ -404,7 +425,7 @@ fn write_compiled_module(
         global_asm_object: None,
         dwarf_object: None,
         bytecode: None,
-        assembly: None,
+        assembly,
         llvm_ir: None,
         links_from_incr_cache: Vec::new(),
     }

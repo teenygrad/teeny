@@ -51,6 +51,7 @@ llvm_offload = []
 # tidy-alphabetical-end
 
 [dev-dependencies]
+insta = "1.48.0"
 rustc_driver = { path = "../rustc_driver" }
 rustc_interface = { path = "../rustc_interface" }
 tracing-subscriber = "0.3.22"

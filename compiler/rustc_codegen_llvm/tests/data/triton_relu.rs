@@ -2392,5 +2392,5 @@ type LlvmTriton = triton::llvm::triton::LlvmTriton;
 pub extern "C" fn entry_point(input_ptr: *mut f32, output_ptr: *mut f32, n_elements: i32) {
     let input_ptr = LlvmPointer(input_ptr as *mut _);
     let output_ptr = LlvmPointer(output_ptr as *mut _);
-    relu::<LlvmTriton, f32, 1024>(input_ptr, output_ptr, n_elements);
+    relu::<LlvmTriton, f32, 32>(input_ptr, output_ptr, n_elements);
 }

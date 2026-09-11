@@ -96,29 +96,29 @@ fn cuda_invalid_target_cpu_is_rejected() {
 }
 
 #[test]
-fn riscv_target_compiles_placeholder_kernel_end_to_end() {
+fn riscv_target_lowers_relu_kernel_to_assembly() {
     // riscv64-generic selects TargetBackend::Riscv (see
     // rustc_target::spec::targets::riscv64_generic and
-    // rustc_codegen_llvm::mlir::target::resolve). RiscvBackend doesn't lower
-    // the incoming module yet (makeTTIR/makeTTGIR/makeLLIR are no-ops) --
-    // makeLLVMIR instead synthesizes a placeholder `void @<name>()` kernel,
-    // which makeASM/makeBIN then compile for real through LLVM's RISC-V
-    // backend and link the result into a shared library via ld.lld.
-    // compile_module retrieves those bytes via get_bin_bytes() and
-    // write_compiled_module prefers them over the ASM text, so the output
-    // file below is the actual linked .so, not just assembly -- this was
-    // manually verified further (outside this test) by cross-compiling a
-    // dlopen(3)/dlsym(3) harness for riscv64-linux-gnu and running it under
-    // `qemu-riscv64`: it loads this exact .so and successfully calls the
-    // exported `riscv_kernel` symbol.
+    // rustc_codegen_llvm::mlir::target::resolve), which lowers the kernel
+    // through the TritonCPU pipeline in CpuBackend. --emit=asm makes the
+    // backend hand back RiscvBackend's assembly instead of the linked .so, so
+    // the snapshot records what the kernel was actually lowered to.
+    //
+    // The kernel's block size is kept small: codegen time and output size grow
+    // with it (see teenyc-trp). After an intended change, a failing run leaves
+    // a pending snapshot; review it from compiler/rustc_codegen_llvm with
+    // `cargo insta review`.
     let src = data_file("triton_relu.rs");
-    let result = try_compile(&src, "riscv64-generic", "riscv_stub", &[]);
-    assert!(result.is_ok(), "expected the RISC-V placeholder pipeline to succeed: {result:?}");
+    let result = try_compile(&src, "riscv64-generic", "riscv_relu", &["--emit=asm"]);
+    assert!(result.is_ok(), "expected the RISC-V relu kernel to compile: {result:?}");
 
-    let bytes = std::fs::read("/tmp/kernel-riscv_stub.asm").expect("read compiled output");
-    assert_eq!(&bytes[..4], b"\x7fELF", "expected a real ELF file, not assembly text");
-    // e_type at offset 16 (u16 LE): ET_DYN (3) for a shared object.
-    assert_eq!(u16::from_le_bytes([bytes[16], bytes[17]]), 3, "expected ET_DYN (shared object)");
-    // e_machine at offset 18 (u16 LE): EM_RISCV (243).
-    assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), 243, "expected EM_RISCV");
+    let bytes = std::fs::read("/tmp/kernel-riscv_relu.asm").expect("read compiled output");
+    let asm = String::from_utf8(bytes).expect("--emit=asm output is not assembly text");
+
+    // Debug info records the directory of the source file, which is absolute
+    // here and so differs between checkouts.
+    let data_dir = src.parent().expect("data file has a parent directory");
+    let asm = asm.replace(&*data_dir.to_string_lossy(), "$TEST_DATA");
+
+    insta::assert_snapshot!("riscv64_relu_asm", asm);
 }
