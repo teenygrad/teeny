@@ -291,11 +291,7 @@ std::set<std::string> RiscvBackend::getTargetFeatures() const {
 }
 
 std::unique_ptr<llvm::TargetMachine> RiscvBackend::createTargetMachine() {
-  llvm::InitializeAllTargets();
-  llvm::InitializeAllTargetInfos();
-  llvm::InitializeAllTargetMCs();
-  llvm::InitializeAllAsmParsers();
-  llvm::InitializeAllAsmPrinters();
+  initializeLLVMTargets();
 
   llvm::Triple triple = targetTriple();
   std::string targetError;

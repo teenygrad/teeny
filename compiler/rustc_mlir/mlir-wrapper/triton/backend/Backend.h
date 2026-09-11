@@ -189,6 +189,14 @@ public:
   size_t getBINSize() const { return m_bin.size(); }
 
 protected:
+  /// Registers all LLVM targets, target infos, MC layers, asm parsers and asm
+  /// printers, exactly once per process. TargetRegistry::RegisterTarget is not
+  /// thread-safe: two threads registering the same target can link it to
+  /// itself, after which lookupTarget loops forever. rustc runs several
+  /// compilations concurrently in one process (the test harnesses do), so
+  /// backends must call this rather than the llvm::InitializeAll* functions.
+  static void initializeLLVMTargets();
+
   std::string m_target;
   std::optional<Error> m_last_error;
   std::string m_last_error_string = "";

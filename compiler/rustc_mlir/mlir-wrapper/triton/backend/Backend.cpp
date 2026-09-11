@@ -15,10 +15,12 @@
  */
 
 #include <iostream>
+#include <mutex>
 #include <vector>
 
 #include "Backend.h"
 
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/IR/Builders.h"
@@ -60,6 +62,17 @@ Backend::Backend(std::string target) : m_target(target) {
 
 Backend::~Backend() {
   // nop
+}
+
+void Backend::initializeLLVMTargets() {
+  static std::once_flag initialized;
+  std::call_once(initialized, [] {
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetInfos();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmParsers();
+    llvm::InitializeAllAsmPrinters();
+  });
 }
 
 LogicalResult Backend::applyPasses(MLIRContext &context, ModuleOp module,

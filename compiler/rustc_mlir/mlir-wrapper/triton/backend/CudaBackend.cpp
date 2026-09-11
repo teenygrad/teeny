@@ -599,11 +599,7 @@ std::string CudaBackend::llvmFeatures() const {
 }
 
 std::unique_ptr<llvm::TargetMachine> CudaBackend::createTargetMachine() const {
-  llvm::InitializeAllTargets();
-  llvm::InitializeAllTargetInfos();
-  llvm::InitializeAllTargetMCs();
-  llvm::InitializeAllAsmParsers();
-  llvm::InitializeAllAsmPrinters();
+  initializeLLVMTargets();
 
   llvm::Triple triple(llvm::Triple::normalize("nvptx64-nvidia-cuda"));
   std::string targetError;
