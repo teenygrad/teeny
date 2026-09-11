@@ -85,10 +85,6 @@ impl LlvmCompiler {
             crate_type
         );
 
-        unsafe {
-            env::set_var("CFG_VERSION", "tg-1.90.0");
-        }
-
         // Build the arguments for the compiler
         // Note: We no longer need -Zcodegen-backend flag since we're registering
         // the backend programmatically via the callbacks

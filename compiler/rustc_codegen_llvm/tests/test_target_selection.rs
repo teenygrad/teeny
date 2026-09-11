@@ -80,10 +80,6 @@ fn try_compile_with(
 ) -> Result<(), String> {
     let output_path = PathBuf::from("/tmp").join(format!("kernel-{output_name}.asm"));
 
-    unsafe {
-        env::set_var("CFG_VERSION", "tg-1.90.0");
-    }
-
     let mut args = vec![
         "/home/arshadm/.cargo/bin/rustc".to_string(),
         filename.display().to_string(),
