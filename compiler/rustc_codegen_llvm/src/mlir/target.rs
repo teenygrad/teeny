@@ -115,17 +115,24 @@ fn resolve_riscv(sess: &Session) -> (CompileOptions, Vec<CString>) {
     // (the rustc-level tuple, e.g. "riscv64-generic") -- the latter isn't a
     // real LLVM triple `TargetRegistry::lookupTarget` can resolve.
     let triple_c = CString::new(sess.target.llvm_target.as_ref()).ok();
+    // Built the same way as the LLVM backend's target machine features: the
+    // target spec's (riscv64-generic enables `+v`), then `-C target-feature`.
+    // Without them LLVM has no vector extension to lower TritonCPU's
+    // fixed-width vector ops to, and expands them element by element.
+    let features_c = CString::new(crate::llvm_util::global_llvm_features(sess, false).join(","))
+        .unwrap_or_else(|_| sess.dcx().fatal("RISC-V target features contain a NUL byte"));
 
     let mut options = CompileOptions::default_riscv();
     // Safety: CompileOptionsData is a union; default_riscv() sets the riscv variant.
     options.data.riscv.cpu = cpu_c.as_ptr();
+    options.data.riscv.features = features_c.as_ptr();
     if let Some(triple_c) = &triple_c {
         options.data.riscv.target_triple = triple_c.as_ptr();
     }
     options.data.riscv.debug =
         tracing::enabled!(target: crate::mlir::LOG_TARGET, tracing::Level::TRACE);
 
-    let mut keep_alive = vec![cpu_c];
+    let mut keep_alive = vec![cpu_c, features_c];
     keep_alive.extend(triple_c);
     (options, keep_alive)
 }

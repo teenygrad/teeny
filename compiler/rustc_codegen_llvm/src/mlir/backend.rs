@@ -33,8 +33,10 @@ use rustc_codegen_ssa::back::write::{
 };
 use rustc_codegen_ssa::base::codegen_crate;
 use rustc_codegen_ssa::traits::*;
-use rustc_codegen_ssa::{CompiledModule, CompiledModules, CrateInfo, ModuleCodegen, TargetConfig};
-use rustc_data_structures::fx::FxIndexMap;
+use rustc_codegen_ssa::{
+    CompiledModule, CompiledModules, CrateInfo, ModuleCodegen, TargetConfig, target_features,
+};
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_errors::DiagCtxtHandle;
 use rustc_middle::dep_graph;
@@ -386,6 +388,27 @@ fn write_compiled_module(
         .unwrap_or_else(|e| panic!("Failed to write output to {}: {}", out_path.display(), e));
     info!("Output written to {} ({} bytes)", out_path.display(), bytes.len());
 
+    // With --emit=asm, rustc's produce_final_output_artifacts copies the
+    // conventionally named assembly temp file to the requested output. That
+    // is the only way a backend that also links a binary (RiscvBackend's .so)
+    // can hand back its assembly text instead of the binary.
+    let assembly = cgcx.module_config.emit_asm.then(|| {
+        let asm = module.module_llvm.asm.as_deref().unwrap_or_else(|| {
+            panic!(
+                "--emit=asm requested but no assembly is available for module '{}'",
+                module.name
+            )
+        });
+        let asm_path = cgcx
+            .output_filenames
+            .temp_path_for_cgu(rustc_session::config::OutputType::Assembly, &module.name);
+        std::fs::write(&asm_path, asm.as_bytes()).unwrap_or_else(|e| {
+            panic!("Failed to write assembly to {}: {}", asm_path.display(), e)
+        });
+        info!("Assembly written to {} ({} bytes)", asm_path.display(), asm.len());
+        asm_path
+    });
+
     if let Some(mlir_src) = module.module_llvm.mlir_source.as_deref() {
         let mlir_path = cgcx
             .output_filenames
@@ -404,7 +427,7 @@ fn write_compiled_module(
         global_asm_object: None,
         dwarf_object: None,
         bytecode: None,
-        assembly: None,
+        assembly,
         llvm_ir: None,
         links_from_incr_cache: Vec::new(),
     }
@@ -419,11 +442,29 @@ impl CodegenBackend for MlirCodegenBackend {
         crate::llvm_util::target_cpu(sess).to_string()
     }
 
-    fn target_config(&self, _sess: &Session) -> TargetConfig {
-        // To Do: Implement MLIR-specific target config for the target
-        // defined in the session
+    fn target_config(&self, sess: &Session) -> TargetConfig {
+        // The LLVM backend asks an LLVM target machine which features its base
+        // cpu enables. This backend's target cpus (`generic-rvv1.0`, `sm_90`)
+        // are not LLVM cpu names -- LLVM's RISC-V backend aborts on them -- so
+        // the base features are the target spec's, with Rust's implications;
+        // internal_target_features then applies -C target-feature. Without
+        // them rustc warns that ABI-required features such as `d` are missing.
+        let mut spec_features = FxHashSet::default();
+        target_features::target_spec_to_backend_features(sess, |feature, enable| {
+            if enable {
+                spec_features.insert(feature);
+            } else {
+                spec_features.remove(feature);
+            }
+        });
+        let internal_target_features = target_features::internal_target_features(
+            sess,
+            |feature| smallvec::SmallVec::from_buf([feature]),
+            |feature| spec_features.contains(feature),
+        );
+
         TargetConfig {
-            internal_target_features: Default::default(),
+            internal_target_features,
             has_reliable_f16: false,
             has_reliable_f16_math: false,
             has_reliable_f128: false,
@@ -505,8 +546,8 @@ impl CodegenBackend for MlirCodegenBackend {
                     }
                     Arch::RiscV32 | Arch::RiscV64 => {
                         out.push_str(
-                            "  a RISC-V chip identifier understood by this backend's (currently \
-                             stub) RISC-V/Triton path, e.g. generic-rvv1.0, spacemit-k3 -- not \
+                            "  a RISC-V chip identifier understood by this backend's \
+                             RISC-V/Triton path, e.g. generic-rvv1.0, spacemit-k3 -- not \
                              an LLVM -mcpu value\n",
                         );
                     }

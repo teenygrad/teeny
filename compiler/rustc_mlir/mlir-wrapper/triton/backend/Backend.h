@@ -27,6 +27,7 @@
 #include "llvm/IR/Module.h"
 
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -125,6 +126,16 @@ enum MlirPass {
   gluon_canonicalizer,
   gluon_inliner,
   gluon_infer_coalesced_encodings,
+
+  // convert: generic MLIR conversions used by the CPU pipeline
+  lower_affine,
+  math_to_llvmir,
+  math_to_libm,
+  func_to_llvmir,
+  ub_to_llvmir,
+  memref_expand_strided_metadata,
+  memref_to_llvmir,
+  reconcile_unrealized_casts,
 };
 
 class Backend {
@@ -178,6 +189,14 @@ public:
   size_t getBINSize() const { return m_bin.size(); }
 
 protected:
+  /// Registers all LLVM targets, target infos, MC layers, asm parsers and asm
+  /// printers, exactly once per process. TargetRegistry::RegisterTarget is not
+  /// thread-safe: two threads registering the same target can link it to
+  /// itself, after which lookupTarget loops forever. rustc runs several
+  /// compilations concurrently in one process (the test harnesses do), so
+  /// backends must call this rather than the llvm::InitializeAll* functions.
+  static void initializeLLVMTargets();
+
   std::string m_target;
   std::optional<Error> m_last_error;
   std::string m_last_error_string = "";
@@ -274,6 +293,18 @@ private:
       {MlirPass::gluon_inliner, gluon::createGluonInline},
       {MlirPass::gluon_infer_coalesced_encodings,
        gluon::createGluonInferCoalescedEncodingsPass},
+
+      // convert: generic MLIR conversions used by the CPU pipeline
+      {MlirPass::lower_affine, createLowerAffinePass},
+      {MlirPass::math_to_llvmir, createConvertMathToLLVMPass},
+      {MlirPass::math_to_libm, createConvertMathToLibmPass},
+      {MlirPass::func_to_llvmir, createConvertFuncToLLVMPass},
+      {MlirPass::ub_to_llvmir, createUBToLLVMConversionPass},
+      {MlirPass::memref_expand_strided_metadata,
+       memref::createExpandStridedMetadataPass},
+      {MlirPass::memref_to_llvmir, createFinalizeMemRefToLLVMConversionPass},
+      {MlirPass::reconcile_unrealized_casts,
+       createReconcileUnrealizedCastsPass},
   };
 };
 

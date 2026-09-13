@@ -17,12 +17,23 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/IR/IRBuilder.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/MC/MCAsmBackend.h"
+#include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCCodeEmitter.h"
+#include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCInstrInfo.h"
+#include "llvm/MC/MCObjectFileInfo.h"
+#include "llvm/MC/MCObjectWriter.h"
+#include "llvm/MC/MCParser/MCAsmParser.h"
+#include "llvm/MC/MCParser/MCTargetAsmParser.h"
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCStreamer.h"
+#include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -42,105 +53,27 @@
 namespace mlir {
 namespace triton {
 
-namespace {
-
-/// Name for the placeholder kernel function makeLLVMIR synthesizes: the
-/// incoming module's symbol name if it has one, else a generic fallback.
-std::string kernelNameFor(ModuleOp module) {
-  if (auto name = module.getName()) {
-    return name->str();
-  }
-  return "riscv_kernel";
-}
-
-} // namespace
-
 RiscvBackend::RiscvBackend(std::string target, RiscvCompileOptions options)
-    : Backend(target),
+    : CpuBackend(target, options.debug),
       m_target_triple(options.target_triple ? options.target_triple : ""),
       m_cpu(options.cpu ? options.cpu : ""),
-      m_features(options.features ? options.features : ""),
-      m_debug(options.debug) {}
+      m_features(options.features ? options.features : "") {}
 
 RiscvBackend::~RiscvBackend() {}
 
 void RiscvBackend::loadDialects(MLIRContext &context) {
-  // Registered for future use: this backend does not yet lower the
-  // incoming Triton/MLIR module through any dialect at all (see
-  // makeTTIR/makeTTGIR/makeLLIR below) -- makeLLVMIR synthesizes a
-  // placeholder kernel function directly. RVVDialect exists so real
-  // MIR-to-LLVM-IR lowering has somewhere to represent RVV-specific
+  // The TritonCPU lowering does not produce RVVDialect ops yet. It is
+  // registered so RVV-specific lowering has somewhere to represent RVV
   // concepts (see RVVDialect.td) once that lowering exists.
   DialectRegistry registry;
   registry.insert<mlir::rvv::RVVDialect>();
   context.appendDialectRegistry(registry);
-}
 
-LogicalResult RiscvBackend::makeTTIR(MLIRContext &context, ModuleOp module) {
-  // This backend doesn't lower the incoming module yet -- makeLLVMIR
-  // synthesizes a placeholder kernel function directly instead (see its
-  // comment) -- so there is no TTIR-stage work to do until it does.
-  return success();
-}
-
-LogicalResult RiscvBackend::makeTTGIR(MLIRContext &context, ModuleOp module) {
-  // See makeTTIR: no TTGIR-stage work until this backend lowers the real
-  // module instead of synthesizing a placeholder in makeLLVMIR.
-  return success();
-}
-
-LogicalResult RiscvBackend::gluonToTTGIR(MLIRContext &context,
-                                         ModuleOp module) {
-  // NOP for RISC-V backend
-  return success();
-}
-
-LogicalResult RiscvBackend::makeLLIR(MLIRContext &context, ModuleOp module) {
-  // See makeTTIR: no LLIR-stage work until this backend lowers the real
-  // module instead of synthesizing a placeholder in makeLLVMIR.
-  return success();
-}
-
-LogicalResult RiscvBackend::makeLLVMIR(MLIRContext &context, ModuleOp module) {
-  // Real MIR/Triton-to-LLVM-IR lowering for RISC-V doesn't exist yet (see
-  // makeTTIR/makeTTGIR/makeLLIR above). Until it does, synthesize a minimal
-  // placeholder kernel -- a single exported `void @<name>()` function with
-  // an empty body -- so makeASM/makeBIN have a real LLVM module to compile
-  // through LLVM's RISC-V backend instead of failing outright.
-  llvm::LLVMContext llvmContext;
-  std::string kernelName = kernelNameFor(module);
-  auto llvmMod = std::make_unique<llvm::Module>(kernelName, llvmContext);
-
-  llvm::Triple triple(llvm::Triple::normalize(
-      m_target_triple.empty() ? "riscv64" : m_target_triple));
-  llvmMod->setTargetTriple(triple);
-
-  auto *funcTy =
-      llvm::FunctionType::get(llvm::Type::getVoidTy(llvmContext),
-                              /*isVarArg=*/false);
-  auto *func = llvm::Function::Create(
-      funcTy, llvm::Function::ExternalLinkage, kernelName, llvmMod.get());
-  auto *entry = llvm::BasicBlock::Create(llvmContext, "entry", func);
-  llvm::IRBuilder<> builder(entry);
-  builder.CreateRetVoid();
-
-  std::string verifyError;
-  llvm::raw_string_ostream verifyOs(verifyError);
-  if (llvm::verifyModule(*llvmMod, &verifyOs)) {
-    llvm::errs() << "RiscvBackend: generated placeholder module failed "
-                    "verification: "
-                 << verifyError << "\n";
-    return failure();
-  }
-
-  llvm::raw_string_ostream os(m_llvmir);
-  llvmMod->print(os, nullptr);
-
-  return success();
+  CpuBackend::loadDialects(context);
 }
 
 LogicalResult RiscvBackend::makeASM(MLIRContext &context, ModuleOp module) {
-  llvm::TargetMachine *tm = createRiscvTargetMachine();
+  auto tm = createTargetMachine();
   if (!tm) {
     return failure();
   }
@@ -148,7 +81,6 @@ LogicalResult RiscvBackend::makeASM(MLIRContext &context, ModuleOp module) {
   llvm::LLVMContext llvmContext;
   auto mod = parseStoredLLVMIR(llvmContext);
   if (!mod) {
-    delete tm;
     return failure();
   }
 
@@ -159,43 +91,33 @@ LogicalResult RiscvBackend::makeASM(MLIRContext &context, ModuleOp module) {
     if (tm->addPassesToEmitFile(pm, os, nullptr,
                                 llvm::CodeGenFileType::AssemblyFile)) {
       llvm::errs() << "RiscvBackend: failed to add passes to emit assembly\n";
-      delete tm;
       return failure();
     }
     pm.run(*mod);
   }
-  delete tm;
 
   m_asm.assign(asmBuf.data(), asmBuf.size());
   return success();
 }
 
 LogicalResult RiscvBackend::makeBIN(MLIRContext &context, ModuleOp module) {
-  llvm::TargetMachine *tm = createRiscvTargetMachine();
+  // TritonCompiler::compile only calls makeBIN after makeASM succeeded, so the
+  // module has already been through codegen once. Assembling that output is
+  // far cheaper than running instruction selection a second time.
+  if (m_asm.empty()) {
+    llvm::errs() << "RiscvBackend: makeBIN needs the assembly makeASM emits\n";
+    return failure();
+  }
+
+  auto tm = createTargetMachine();
   if (!tm) {
     return failure();
   }
 
-  llvm::LLVMContext llvmContext;
-  auto mod = parseStoredLLVMIR(llvmContext);
-  if (!mod) {
-    delete tm;
+  llvm::SmallVector<char, 0> objBuf;
+  if (failed(assembleObject(*tm, objBuf))) {
     return failure();
   }
-
-  llvm::SmallVector<char, 0> objBuf;
-  {
-    llvm::raw_svector_ostream os(objBuf);
-    llvm::legacy::PassManager pm;
-    if (tm->addPassesToEmitFile(pm, os, nullptr,
-                                llvm::CodeGenFileType::ObjectFile)) {
-      llvm::errs() << "RiscvBackend: failed to add passes to emit object file\n";
-      delete tm;
-      return failure();
-    }
-    pm.run(*mod);
-  }
-  delete tm;
 
   // Link the object into a shared library so it can be dlopen'd and run at
   // runtime. Uses LLD as a cross-linker (it can target RISC-V regardless of
@@ -262,15 +184,116 @@ LogicalResult RiscvBackend::makeBIN(MLIRContext &context, ModuleOp module) {
   return success();
 }
 
-llvm::TargetMachine *RiscvBackend::createRiscvTargetMachine() {
-  llvm::InitializeAllTargets();
-  llvm::InitializeAllTargetInfos();
-  llvm::InitializeAllTargetMCs();
-  llvm::InitializeAllAsmParsers();
-  llvm::InitializeAllAsmPrinters();
+LogicalResult
+RiscvBackend::assembleObject(const llvm::TargetMachine &tm,
+                             llvm::SmallVectorImpl<char> &objBuf) const {
+  // Build the MC layer from the target machine makeASM emitted with: the
+  // assembler rejects instructions, such as RVV's, whose extensions its
+  // subtarget lacks.
+  const llvm::Target &target = tm.getTarget();
+  const llvm::Triple &triple = tm.getTargetTriple();
+  const llvm::MCTargetOptions &mcOptions = tm.Options.MCOptions;
 
-  llvm::Triple triple(llvm::Triple::normalize(
+  std::unique_ptr<llvm::MCRegisterInfo> mri(target.createMCRegInfo(triple));
+  std::unique_ptr<llvm::MCAsmInfo> mai(
+      mri ? target.createMCAsmInfo(*mri, triple, mcOptions) : nullptr);
+  std::unique_ptr<llvm::MCSubtargetInfo> sti(target.createMCSubtargetInfo(
+      triple, tm.getTargetCPU(), tm.getTargetFeatureString()));
+  std::unique_ptr<llvm::MCInstrInfo> mcii(target.createMCInstrInfo());
+  if (!mri || !mai || !sti || !mcii) {
+    llvm::errs() << "RiscvBackend: failed to create the MC target description "
+                    "for "
+                 << triple.getTriple() << "\n";
+    return failure();
+  }
+
+  llvm::SourceMgr srcMgr;
+  srcMgr.AddNewSourceBuffer(
+      llvm::MemoryBuffer::getMemBuffer(m_asm, "<riscv-asm>"), llvm::SMLoc());
+
+  llvm::MCContext ctx(triple, *mai, *mri, *sti, &srcMgr);
+  std::unique_ptr<llvm::MCObjectFileInfo> mofi(
+      target.createMCObjectFileInfo(ctx, tm.isPositionIndependent()));
+  ctx.setObjectFileInfo(mofi.get());
+
+  std::unique_ptr<llvm::MCAsmBackend> mab(
+      target.createMCAsmBackend(*sti, *mri, mcOptions));
+  std::unique_ptr<llvm::MCCodeEmitter> emitter(
+      target.createMCCodeEmitter(*mcii, ctx));
+  if (!mab || !emitter) {
+    llvm::errs() << "RiscvBackend: failed to create the assembler backend\n";
+    return failure();
+  }
+
+  llvm::raw_svector_ostream os(objBuf);
+  std::unique_ptr<llvm::MCObjectWriter> writer = mab->createObjectWriter(os);
+  std::unique_ptr<llvm::MCStreamer> streamer(target.createMCObjectStreamer(
+      triple, ctx, std::move(mab), std::move(writer), std::move(emitter),
+      *sti));
+
+  std::unique_ptr<llvm::MCAsmParser> parser(
+      llvm::createMCAsmParser(srcMgr, ctx, *streamer, *mai));
+  std::unique_ptr<llvm::MCTargetAsmParser> targetParser(
+      target.createMCAsmParser(*sti, *parser, *mcii));
+  if (!targetParser) {
+    llvm::errs() << "RiscvBackend: " << triple.getTriple()
+                 << " has no assembly parser\n";
+    return failure();
+  }
+  parser->setTargetParser(*targetParser);
+
+  // Diagnostics go through srcMgr; Run returns true if there were any errors.
+  if (parser->Run(/*NoInitialTextSection=*/false)) {
+    llvm::errs() << "RiscvBackend: failed to assemble makeASM's output\n";
+    return failure();
+  }
+  return success();
+}
+
+llvm::Triple RiscvBackend::targetTriple() const {
+  return llvm::Triple(llvm::Triple::normalize(
       m_target_triple.empty() ? "riscv64" : m_target_triple));
+}
+
+std::string RiscvBackend::getTargetArch() const {
+  return targetTriple().getArchName().str();
+}
+
+std::string RiscvBackend::llvmFeatures() const {
+  // rustc passes the target spec's features plus -C target-feature (see
+  // resolve_riscv in rustc_codegen_llvm/src/mlir/target.rs); that is where V
+  // comes from. The fallback matters because a generic cpu name alone implies
+  // no ISA extensions, which defaults codegen to the soft-float ABI
+  // (lp64/ilp32) -- incompatible with the hard-float ABI (lp64d/ilp32d)
+  // essentially all real RISC-V Linux userspace actually uses.
+  if (!m_features.empty()) {
+    return m_features;
+  }
+  return "+m,+a,+f,+d,+c";
+}
+
+std::set<std::string> RiscvBackend::getTargetFeatures() const {
+  // CpuBackend selects passes by bare feature name, so keep only the
+  // extensions the LLVM feature string enables, without their "+".
+  const std::string featureString = llvmFeatures();
+  llvm::SmallVector<llvm::StringRef, 8> parts;
+  llvm::StringRef(featureString).split(parts, ',', /*MaxSplit=*/-1,
+                                       /*KeepEmpty=*/false);
+
+  std::set<std::string> features;
+  for (llvm::StringRef part : parts) {
+    part = part.trim();
+    if (part.consume_front("+")) {
+      features.insert(part.str());
+    }
+  }
+  return features;
+}
+
+std::unique_ptr<llvm::TargetMachine> RiscvBackend::createTargetMachine() {
+  initializeLLVMTargets();
+
+  llvm::Triple triple = targetTriple();
   std::string targetError;
   const llvm::Target *target =
       llvm::TargetRegistry::lookupTarget(triple, targetError);
@@ -287,28 +310,17 @@ llvm::TargetMachine *RiscvBackend::createRiscvTargetMachine() {
   // RISC-V backend calls report_fatal_error (aborting the whole process,
   // not a recoverable LogicalResult::failure()) when it can't derive a
   // valid XLen from the cpu, e.g. "LLVM ERROR: RV64 target requires an
-  // RV64 CPU". So for now this always uses a real, generic LLVM cpu name
-  // matching the triple's width, and ignores m_cpu -- fine for the
-  // placeholder `ret void` body makeLLVMIR produces today, but a real
-  // chip-name-to-LLVM-cpu/feature mapping is needed before m_cpu
-  // can be honored.
+  // RV64 CPU". So this always uses a real, generic LLVM cpu name matching
+  // the triple's width, and ignores m_cpu. Extensions such as V come from
+  // llvmFeatures() instead; a chip-name-to-LLVM-cpu mapping is still needed
+  // before m_cpu can select chip-specific tuning.
   std::string cpu = triple.isArch64Bit() ? "generic-rv64" : "generic-rv32";
-
-  // "generic-rv64"/"generic-rv32" alone imply no ISA extensions, which
-  // defaults codegen to the soft-float ABI (lp64/ilp32) -- incompatible
-  // with the hard-float ABI (lp64d/ilp32d) essentially all real RISC-V
-  // Linux userspace (glibc, other .so's on the system) actually uses.
-  // Matches the `features` rustc_target::spec::targets::riscv64_generic
-  // declares (M/A/F/D/C, i.e. the standard "G" extension set, plus V);
-  // once m_features carries a real per-chip feature string this
-  // should prefer that instead of always using this fixed baseline.
-  std::string features = "+m,+a,+f,+d,+c";
 
   // PIC: makeBIN links the resulting object into a shared library.
   llvm::TargetOptions opts;
-  llvm::TargetMachine *tm = target->createTargetMachine(
-      triple, cpu, features, opts, llvm::Reloc::PIC_, std::nullopt,
-      llvm::CodeGenOptLevel::Default);
+  std::unique_ptr<llvm::TargetMachine> tm(target->createTargetMachine(
+      triple, cpu, llvmFeatures(), opts, llvm::Reloc::PIC_, std::nullopt,
+      llvm::CodeGenOptLevel::Default));
   if (!tm) {
     llvm::errs() << "RiscvBackend: failed to create target machine for "
                  << triple.getTriple() << " (cpu=" << cpu << ")\n";

@@ -56,13 +56,16 @@ add_definitions(${LLVM_DEFINITIONS})
 add_subdirectory(riscv)
 
 # TritonCPU dialect/conversions/transforms ported from the triton-cpu fork
-# (teenyc-3yu). Off by default: the sources still target triton-cpu's patched
-# LLVM (mlir::x86::amx rather than LLVM 22.0's mlir::amx, among other drift),
-# so they do not compile here yet. See cpu/README.md.
+# (teenyc-3yu). RiscvBackend lowers through these passes via CpuBackend, so the
+# wrapper cannot be built without them; rustc_mlir/build.rs passes
+# -DTRITON_CPU_ENABLE=ON.
 option(TRITON_CPU_ENABLE "Build the ported TritonCPU dialect and passes" OFF)
-if(TRITON_CPU_ENABLE)
-    add_subdirectory(cpu)
+if(NOT TRITON_CPU_ENABLE)
+    message(FATAL_ERROR
+        "mlir-wrapper requires -DTRITON_CPU_ENABLE=ON: RiscvBackend lowers "
+        "through the TritonCPU passes (triton/backend/CpuBackend.cpp)")
 endif()
+add_subdirectory(cpu)
 
 # Source files
 set(WRAPPER_SOURCES
@@ -72,11 +75,21 @@ set(WRAPPER_SOURCES
     triton/TritonCompiler.cpp
     triton/backend/Backend.cpp
     triton/backend/CudaBackend.cpp
+    triton/backend/CpuBackend.cpp
     triton/backend/RiscvBackend.cpp
 )
 
 # Create static library
 add_library(mlir-wrapper STATIC ${WRAPPER_SOURCES})
+
+# CpuBackend.cpp includes the TritonCPU passes' tablegen'd headers, which the
+# TritonCPU libraries generate, so those must be built first.
+add_dependencies(mlir-wrapper
+    TritonCPUIR
+    TritonToTritonCPU
+    TritonCPUTransforms
+    TritonCPUToLLVM
+)
 
 # Get MLIR libraries
 get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)

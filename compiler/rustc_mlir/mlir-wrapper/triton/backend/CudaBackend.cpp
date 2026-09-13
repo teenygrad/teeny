@@ -43,6 +43,7 @@
 
 #include "CudaBackend.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <regex>
 
@@ -86,13 +87,6 @@ Capability CudaBackend::getCapability() const { return m_capability; }
 LogicalResult CudaBackend::makeLLVMIR(MLIRContext &context, ModuleOp module) {
   llvm::LLVMContext llvmContext;
 
-  // Initialize LLVM targets (required for NVPTX/codegen)
-  llvm::InitializeAllTargets();
-  llvm::InitializeAllTargetInfos();
-  llvm::InitializeAllTargetMCs();
-  llvm::InitializeAllAsmParsers();
-  llvm::InitializeAllAsmPrinters();
-
   // Address Sanitizer is only supported on the AMD backend; not applicable
   // when using the base Backend (no knobs). Subclasses can override and check
   // enable_asan and return failure() for NVIDIA.
@@ -105,17 +99,16 @@ LogicalResult CudaBackend::makeLLVMIR(MLIRContext &context, ModuleOp module) {
     return LogicalResult::failure();
   }
 
-  // Set target triple for NVIDIA PTX
-  auto triple = llvm::Triple("nvptx64-nvidia-cuda");
-  llvmMod->setTargetTriple(triple);
-
-  // Attach data layout for NVPTX64 (matches triple/capability; proc/features
-  // would require TargetMachine if layout varied per SM).
-  static const char nvptx64DataLayout[] =
-      "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-"
-      "f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:"
-      "64";
-  llvmMod->setDataLayout(llvm::DataLayout(nvptx64DataLayout));
+  // LLVM refuses to run codegen on a module whose data layout differs from
+  // the target machine's, and NVPTX's layout changes between LLVM releases, so
+  // take it from the target machine makeASM emits PTX with, as upstream
+  // Triton's attach_datalayout does.
+  auto tm = createTargetMachine();
+  if (!tm) {
+    return LogicalResult::failure();
+  }
+  llvmMod->setTargetTriple(tm->getTargetTriple());
+  llvmMod->setDataLayout(tm->createDataLayout());
 
   if (m_options.enable_reflect_ftz) {
     llvmMod->addModuleFlag(llvm::Module::Override, "nvvm-reflect-ftz", 1u);
@@ -183,30 +176,20 @@ LogicalResult CudaBackend::makeLLVMIR(MLIRContext &context, ModuleOp module) {
 }
 
 LogicalResult CudaBackend::makeASM(MLIRContext &context, ModuleOp module) {
-  int ptx_version = this->m_options.ptx_version.has_value
-                        ? this->m_options.ptx_version.value
-                        : 90;
-  std::string features = ""; // AXM TODO - get_features
-
-  std::string proc = "sm_" + std::to_string(this->m_capability);
-  if (this->m_capability >= 90) {
-    proc += "a";
+  int ptx_version = ptxVersion();
+  auto tm = createTargetMachine();
+  if (!tm) {
+    return LogicalResult::failure();
   }
-
-  std::string triple = "nvptx64-nvidia-cuda";
   std::vector<std::string> flags = {"nvptx-mad-wide-opt"};
 
   // 2. Translate LLVM module to assembly (PTX)
-  // This part is pseudo-code, as actual translation will depend on LLVM API
-  // presence.
-  std::string src_asm = m_llvmir; // Assume m_llvmir contains the LLVM IR for
-                                  // the module serialized right before
-  std::string ret = llvmTranslateToAsm(src_asm, triple, proc, features, flags,
+  std::string ret = llvmTranslateToAsm(m_llvmir, *tm, flags,
                                        m_options.enable_fp_fusion, false);
   if (ret.empty()) {
     llvm::errs() << "Failed to translate LLVM IR to PTX\n";
-    llvm::errs() << "LLVM IR: " << src_asm << "\n";
-    llvm::errs() << "Triple: " << triple << "\n";
+    llvm::errs() << "LLVM IR: " << m_llvmir << "\n";
+    llvm::errs() << "Triple: " << tm->getTargetTriple().str() << "\n";
     return LogicalResult::failure();
   }
   // 3. Find kernel name
@@ -602,15 +585,62 @@ CudaBackend::linkExternLibs(llvm::LLVMContext &llvmContext,
   return LogicalResult::success();
 }
 
-/// Translates LLVM IR to NVPTX assembly (PTX) using the given triple, CPU,
-/// and features. Returns the PTX string or empty on error.
+int CudaBackend::ptxVersion() const {
+  return m_options.ptx_version.has_value ? m_options.ptx_version.value : 90;
+}
+
+int CudaBackend::llvmCapability() const {
+  // LLVM's NVPTX backend has no sm_107 (Jetson Thor): it ignores the unknown
+  // processor and compiles for a generic subtarget. Upstream Triton compiles
+  // 107 as sm_100; makeASM still stamps the real capability on `.target`.
+  return m_capability == 107 ? 100 : static_cast<int>(m_capability);
+}
+
+std::string CudaBackend::llvmCpu() const {
+  const int capability = llvmCapability();
+  std::string cpu = "sm_" + std::to_string(capability);
+  if (capability >= 90) {
+    cpu += "a";
+  }
+  return cpu;
+}
+
+std::string CudaBackend::llvmFeatures() const {
+  // As upstream Triton's get_features, which still caps the version at PTX 9.0
+  // for LLVM 23 even though its NVPTX backend defines features up to ptx93.
+  return "+ptx" + std::to_string(std::min(90, ptxVersion()));
+}
+
+std::unique_ptr<llvm::TargetMachine> CudaBackend::createTargetMachine() const {
+  initializeLLVMTargets();
+
+  llvm::Triple triple(llvm::Triple::normalize("nvptx64-nvidia-cuda"));
+  std::string targetError;
+  const llvm::Target *target =
+      llvm::TargetRegistry::lookupTarget(triple, targetError);
+  if (!target) {
+    llvm::errs() << "CudaBackend: " << targetError << "\n";
+    return nullptr;
+  }
+
+  const std::string cpu = llvmCpu();
+  llvm::TargetOptions opts;
+  std::unique_ptr<llvm::TargetMachine> tm(target->createTargetMachine(
+      triple, cpu, llvmFeatures(), opts, llvm::Reloc::Static, std::nullopt,
+      llvm::CodeGenOptLevel::Default));
+  if (!tm) {
+    llvm::errs() << "CudaBackend: failed to create target machine for "
+                 << triple.getTriple() << " (cpu=" << cpu << ")\n";
+  }
+  return tm;
+}
+
+/// Translates LLVM IR to NVPTX assembly (PTX) with `tm`. Returns the PTX
+/// string or empty on error.
 std::string CudaBackend::llvmTranslateToAsm(
-    const std::string &llvmIr, const std::string &tripleStr,
-    const std::string &cpu, const std::string &features,
+    const std::string &llvmIr, llvm::TargetMachine &tm,
     const std::vector<std::string> & /*flags*/, bool /*enableFpFusion*/,
     bool /*verbose*/) {
-  // Targets were already initialized in makeLLVMIR; no need to repeat.
-
   llvm::LLVMContext ctx;
   auto buf = llvm::MemoryBuffer::getMemBuffer(llvmIr, "<llvm-ir>");
   llvm::SMDiagnostic err;
@@ -621,35 +651,17 @@ std::string CudaBackend::llvmTranslateToAsm(
     return {};
   }
 
-  std::string targetError;
-  llvm::Triple triple(llvm::Triple::normalize(tripleStr));
-  const llvm::Target *target =
-      llvm::TargetRegistry::lookupTarget(triple, targetError);
-  if (!target) {
-    llvm::errs() << targetError << "\n";
-    return {};
-  }
-
-  llvm::TargetOptions opts;
-  llvm::TargetMachine *tm = target->createTargetMachine(
-      triple, cpu, features, opts, llvm::Reloc::Static, std::nullopt,
-      llvm::CodeGenOptLevel::Default);
-  if (!tm)
-    return {};
-
   llvm::SmallVector<char, 0> asmBuf;
   {
     llvm::raw_svector_ostream os(asmBuf);
     llvm::legacy::PassManager pm;
-    if (tm->addPassesToEmitFile(pm, os, nullptr,
-                                llvm::CodeGenFileType::AssemblyFile)) {
+    if (tm.addPassesToEmitFile(pm, os, nullptr,
+                               llvm::CodeGenFileType::AssemblyFile)) {
       llvm::errs() << "Failed to add passes to emit file\n";
-      delete tm;
       return {};
     }
     (void)pm.run(*mod);
   }
-  delete tm;
   // Build return string after stream and pass manager are destroyed so
   // no shared state can cause use-after-free or hang when copying.
   return std::string(asmBuf.data(), asmBuf.size());

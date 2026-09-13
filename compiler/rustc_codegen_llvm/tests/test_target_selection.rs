@@ -25,7 +25,7 @@ use std::env;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
-use rustc_driver::{Callbacks, run_compiler};
+use rustc_driver::{Callbacks, Compilation, run_compiler};
 use rustc_interface::interface;
 
 struct MlirBackendCallbacks;
@@ -38,16 +38,47 @@ impl Callbacks for MlirBackendCallbacks {
     }
 }
 
+/// Selects the `mlir` backend, records the target features rustc derived from
+/// its `target_config` once the session exists, and stops before codegen.
+#[derive(Default)]
+struct TargetFeatureCallbacks {
+    features: Vec<String>,
+}
+
+impl Callbacks for TargetFeatureCallbacks {
+    fn config(&mut self, config: &mut interface::Config) {
+        MlirBackendCallbacks.config(config);
+    }
+
+    fn after_crate_root_parsing(
+        &mut self,
+        compiler: &interface::Compiler,
+        _krate: &mut rustc_ast::Crate,
+    ) -> Compilation {
+        self.features =
+            compiler.sess.internal_target_features.iter().map(|f| f.to_string()).collect();
+        Compilation::Stop
+    }
+}
+
 /// Compiles `filename` for `target`, with `extra_args` appended (e.g.
 /// `-C target-cpu=...`). Returns `Err` if compilation panicked (which is how
 /// `sess.dcx().fatal(..)` surfaces through `run_compiler` when used as a
 /// library rather than through the `rustc` binary's own exit-code wrapper).
 fn try_compile(filename: &Path, target: &str, output_name: &str, extra_args: &[&str]) -> Result<(), String> {
-    let output_path = PathBuf::from("/tmp").join(format!("kernel-{output_name}.asm"));
+    try_compile_with(&mut MlirBackendCallbacks, filename, target, output_name, extra_args)
+}
 
-    unsafe {
-        env::set_var("CFG_VERSION", "tg-1.90.0");
-    }
+/// Like [`try_compile`], but driven by `callbacks`, which must select the
+/// `mlir` backend themselves (e.g. by delegating to [`MlirBackendCallbacks`]).
+fn try_compile_with(
+    callbacks: &mut (dyn Callbacks + Send),
+    filename: &Path,
+    target: &str,
+    output_name: &str,
+    extra_args: &[&str],
+) -> Result<(), String> {
+    let output_path = PathBuf::from("/tmp").join(format!("kernel-{output_name}.asm"));
 
     let mut args = vec![
         "/home/arshadm/.cargo/bin/rustc".to_string(),
@@ -63,9 +94,17 @@ fn try_compile(filename: &Path, target: &str, output_name: &str, extra_args: &[&
     ];
     args.extend(extra_args.iter().map(|s| s.to_string()));
 
-    let mut callbacks = MlirBackendCallbacks;
-    panic::catch_unwind(AssertUnwindSafe(|| run_compiler(&args, &mut callbacks)))
+    panic::catch_unwind(AssertUnwindSafe(|| run_compiler(&args, callbacks)))
         .map_err(|_| "compilation panicked".to_string())
+}
+
+/// The Rust target features rustc records for `target` with `extra_args`.
+fn reported_target_features(target: &str, output_name: &str, extra_args: &[&str]) -> Vec<String> {
+    let mut callbacks = TargetFeatureCallbacks::default();
+    let src = data_file("triton_relu.rs");
+    let result = try_compile_with(&mut callbacks, &src, target, output_name, extra_args);
+    assert!(result.is_ok(), "expected {target} to get as far as parsing: {result:?}");
+    callbacks.features
 }
 
 fn data_file(name: &str) -> PathBuf {
@@ -82,6 +121,60 @@ fn cuda_valid_target_cpu_succeeds() {
     assert!(result.is_ok(), "expected sm_90 to be accepted: {result:?}");
 }
 
+/// Compiled PTX without the lines that are expected to differ between
+/// capabilities: the declared PTX ISA version and the target SM.
+fn ptx_without_version_and_target(ptx: &str) -> String {
+    ptx.lines()
+        .filter(|line| !line.starts_with(".version ") && !line.starts_with(".target "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn cuda_capability_107_compiles_as_sm_100() {
+    // LLVM's NVPTX backend has no sm_107 (Jetson Thor): given `sm_107a` it
+    // ignores the processor and compiles for a generic subtarget. Upstream
+    // Triton compiles capability 107 as sm_100 and only stamps `.target sm_107`
+    // onto the PTX afterwards.
+    let src = data_file("triton_relu.rs");
+    let mut ptx = Vec::new();
+    for cpu in ["sm_100", "sm_107"] {
+        let output_name = format!("cuda_{cpu}");
+        let target_cpu = format!("target-cpu={cpu}");
+        let result = try_compile(&src, "nvptx64-nvidia-cuda", &output_name, &["-C", &target_cpu]);
+        assert!(result.is_ok(), "expected {cpu} to compile: {result:?}");
+        ptx.push(
+            std::fs::read_to_string(format!("/tmp/kernel-{output_name}.asm"))
+                .expect("read compiled PTX"),
+        );
+    }
+
+    assert!(
+        ptx[1].lines().any(|line| line == ".target sm_107a"),
+        "capability 107 PTX should still declare its own target"
+    );
+    assert_eq!(
+        ptx_without_version_and_target(&ptx[0]),
+        ptx_without_version_and_target(&ptx[1]),
+        "capability 107 should be lowered exactly like sm_100"
+    );
+}
+
+#[test]
+fn cuda_default_ptx_versions_meet_llvm_minimums() {
+    // CudaBackend passes the resolved PTX version to LLVM as `+ptx<version>`,
+    // and LLVM aborts the whole process when that is below the minimum for the
+    // SM it compiles for (getMinPTXVersionForSM in NVPTXSubtarget.cpp), so each
+    // capability's default version must meet it.
+    let src = data_file("triton_relu.rs");
+    for capability in [75, 80, 86, 87, 88, 89, 90, 100, 101, 103, 107, 110, 120, 121] {
+        let output_name = format!("cuda_ptx_sm_{capability}");
+        let target_cpu = format!("target-cpu=sm_{capability}");
+        let result = try_compile(&src, "nvptx64-nvidia-cuda", &output_name, &["-C", &target_cpu]);
+        assert!(result.is_ok(), "expected sm_{capability} to compile: {result:?}");
+    }
+}
+
 #[test]
 fn cuda_invalid_target_cpu_is_rejected() {
     // Before teenyc-j3a, an unrecognized -C target-cpu silently defaulted to
@@ -96,29 +189,52 @@ fn cuda_invalid_target_cpu_is_rejected() {
 }
 
 #[test]
-fn riscv_target_compiles_placeholder_kernel_end_to_end() {
+fn riscv_target_lowers_relu_kernel_to_assembly() {
     // riscv64-generic selects TargetBackend::Riscv (see
     // rustc_target::spec::targets::riscv64_generic and
-    // rustc_codegen_llvm::mlir::target::resolve). RiscvBackend doesn't lower
-    // the incoming module yet (makeTTIR/makeTTGIR/makeLLIR are no-ops) --
-    // makeLLVMIR instead synthesizes a placeholder `void @<name>()` kernel,
-    // which makeASM/makeBIN then compile for real through LLVM's RISC-V
-    // backend and link the result into a shared library via ld.lld.
-    // compile_module retrieves those bytes via get_bin_bytes() and
-    // write_compiled_module prefers them over the ASM text, so the output
-    // file below is the actual linked .so, not just assembly -- this was
-    // manually verified further (outside this test) by cross-compiling a
-    // dlopen(3)/dlsym(3) harness for riscv64-linux-gnu and running it under
-    // `qemu-riscv64`: it loads this exact .so and successfully calls the
-    // exported `riscv_kernel` symbol.
+    // rustc_codegen_llvm::mlir::target::resolve), which lowers the kernel
+    // through the TritonCPU pipeline in CpuBackend. --emit=asm makes the
+    // backend hand back RiscvBackend's assembly instead of the linked .so, so
+    // the snapshot records what the kernel was actually lowered to.
+    //
+    // The kernel's block size is kept small: codegen time and output size grow
+    // with it (see teenyc-trp). After an intended change, a failing run leaves
+    // a pending snapshot; review it from compiler/rustc_codegen_llvm with
+    // `cargo insta review`.
     let src = data_file("triton_relu.rs");
-    let result = try_compile(&src, "riscv64-generic", "riscv_stub", &[]);
-    assert!(result.is_ok(), "expected the RISC-V placeholder pipeline to succeed: {result:?}");
+    let result = try_compile(&src, "riscv64-generic", "riscv_relu", &["--emit=asm"]);
+    assert!(result.is_ok(), "expected the RISC-V relu kernel to compile: {result:?}");
 
-    let bytes = std::fs::read("/tmp/kernel-riscv_stub.asm").expect("read compiled output");
-    assert_eq!(&bytes[..4], b"\x7fELF", "expected a real ELF file, not assembly text");
-    // e_type at offset 16 (u16 LE): ET_DYN (3) for a shared object.
-    assert_eq!(u16::from_le_bytes([bytes[16], bytes[17]]), 3, "expected ET_DYN (shared object)");
-    // e_machine at offset 18 (u16 LE): EM_RISCV (243).
-    assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), 243, "expected EM_RISCV");
+    let bytes = std::fs::read("/tmp/kernel-riscv_relu.asm").expect("read compiled output");
+    let asm = String::from_utf8(bytes).expect("--emit=asm output is not assembly text");
+
+    // Debug info records the directory of the source file, which is absolute
+    // here and so differs between checkouts.
+    let data_dir = src.parent().expect("data file has a parent directory");
+    let asm = asm.replace(&*data_dir.to_string_lossy(), "$TEST_DATA");
+
+    insta::assert_snapshot!("riscv64_relu_asm", asm);
+}
+
+#[test]
+fn riscv_target_reports_its_spec_target_features() {
+    // rustc warns (and will eventually error) when a feature the target's ABI
+    // requires -- `d` for riscv64-generic's lp64d -- is missing from the
+    // features the codegen backend reports. The spec enables m/a/f/d/c/v; the
+    // reported set must include them and the features they imply.
+    let features = reported_target_features("riscv64-generic", "riscv_features", &[]);
+    for feature in ["m", "a", "f", "d", "c", "v", "zve64d", "zvl128b"] {
+        assert!(
+            features.iter().any(|f| f == feature),
+            "`{feature}` missing from reported target features {features:?}"
+        );
+    }
+}
+
+#[test]
+fn riscv_target_feature_flag_overrides_spec_features() {
+    let features =
+        reported_target_features("riscv64-generic", "riscv_no_v", &["-C", "target-feature=-v"]);
+    assert!(!features.iter().any(|f| f == "v"), "`-v` left `v` enabled: {features:?}");
+    assert!(features.iter().any(|f| f == "d"), "`-v` removed `d`: {features:?}");
 }

@@ -17,12 +17,14 @@
 #ifndef TRITON_CUDA_BACKEND_H
 #define TRITON_CUDA_BACKEND_H
 
+#include <memory>
 #include <stddef.h>
 #include <stdint.h>
 #include <string>
 #include <vector>
 
 #include "llvm/IR/Module.h"
+#include "llvm/Target/TargetMachine.h"
 
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
@@ -228,10 +230,24 @@ private:
                                llvm::Module &module,
                                const std::vector<std::string> &libPaths);
 
+  /// The PTX ISA version the PTX declares (10 * major + minor).
+  int ptxVersion() const;
+
+  /// The capability LLVM compiles for; differs from m_capability only where
+  /// LLVM's NVPTX backend lacks the SM, as upstream Triton does.
+  int llvmCapability() const;
+
+  /// The NVPTX cpu (`sm_<capability>[a]`) and feature string LLVM is given.
+  std::string llvmCpu() const;
+  std::string llvmFeatures() const;
+
+  /// The NVPTX target machine for llvmCpu()/llvmFeatures(). makeLLVMIR takes
+  /// the module's data layout from it and makeASM emits PTX with it, so the two
+  /// always agree. Logs why and returns nullptr on failure.
+  std::unique_ptr<llvm::TargetMachine> createTargetMachine() const;
+
   std::string llvmTranslateToAsm(const std::string &llvmIr,
-                                 const std::string &tripleStr,
-                                 const std::string &cpu,
-                                 const std::string &features,
+                                 llvm::TargetMachine &tm,
                                  const std::vector<std::string> & /*flags*/,
                                  bool /*enableFpFusion*/, bool /*verbose*/);
 

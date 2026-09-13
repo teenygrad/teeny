@@ -1,0 +1,156 @@
+---
+source: compiler/rustc_codegen_llvm/tests/test_target_selection.rs
+expression: asm
+---
+	.attribute	4, 16
+	.attribute	5, "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_v1p0_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0_zca1p0_zcd1p0_zve32f1p0_zve32x1p0_zve64d1p0_zve64f1p0_zve64x1p0_zvl128b1p0_zvl32b1p0_zvl64b1p0"
+	.file	"LLVMDialectModule"
+	.text
+	.globl	entry_point
+	.p2align	7
+	.type	entry_point,@function
+entry_point:
+.Lfunc_begin0:
+	.file	1 "$TEST_DATA" "triton_relu.rs"
+	.loc	1 2392 0
+	.cfi_sections .debug_frame
+	.cfi_startproc
+	li	a4, 32
+.Ltmp0:
+	.loc	1 2378 19 prologue_end
+	vsetvli	zero, a4, e32, m8, ta, mu
+	vid.v	v8
+	.loc	1 2377 61
+	slliw	a3, a3, 5
+	.loc	1 2378 19
+	vor.vx	v16, v8, a3
+	.loc	1 2379 13
+	vmslt.vx	v8, v16, a2
+	.loc	1 2379 37 is_stmt 0
+	vmv.v.i	v16, 0
+	vmv1r.v	v0, v8
+	.loc	1 2380 20 is_stmt 1
+	slli	a3, a3, 2
+	add	a0, a0, a3
+	.loc	1 2379 37
+	vle32.v	v16, (a0), v0.t
+	.loc	1 2381 65
+	vmfeq.vv	v0, v16, v16
+	vmerge.vim	v24, v16, 0, v0
+	vfmax.vv	v16, v16, v24
+	.loc	1 2382 20
+	vmv1r.v	v0, v8
+	.loc	1 2383 22
+	add	a1, a1, a3
+	.loc	1 2382 20
+	vse32.v	v16, (a1), v0.t
+.Ltmp1:
+	.loc	1 2396 2
+	ret
+.Ltmp2:
+.Lfunc_end0:
+	.size	entry_point, .Lfunc_end0-entry_point
+	.cfi_endproc
+
+	.section	.debug_abbrev,"",@progbits
+	.byte	1
+	.byte	17
+	.byte	1
+	.byte	37
+	.byte	14
+	.byte	19
+	.byte	5
+	.byte	3
+	.byte	14
+	.byte	16
+	.byte	23
+	.byte	27
+	.byte	14
+	.byte	17
+	.byte	1
+	.byte	18
+	.byte	6
+	.byte	0
+	.byte	0
+	.byte	2
+	.byte	46
+	.byte	0
+	.byte	3
+	.byte	14
+	.byte	32
+	.byte	11
+	.byte	0
+	.byte	0
+	.byte	3
+	.byte	46
+	.byte	1
+	.byte	17
+	.byte	1
+	.byte	18
+	.byte	6
+	.byte	49
+	.byte	19
+	.byte	0
+	.byte	0
+	.byte	4
+	.byte	29
+	.byte	0
+	.byte	49
+	.byte	19
+	.byte	17
+	.byte	1
+	.byte	18
+	.byte	6
+	.byte	88
+	.byte	11
+	.byte	89
+	.byte	5
+	.byte	87
+	.byte	11
+	.byte	0
+	.byte	0
+	.byte	0
+	.section	.debug_info,"",@progbits
+.Lcu_begin0:
+	.word	.Ldebug_info_end0-.Ldebug_info_start0
+.Ldebug_info_start0:
+	.half	4
+	.word	.debug_abbrev
+	.byte	8
+	.byte	1
+	.word	.Linfo_string0
+	.half	2
+	.word	.Linfo_string1
+	.word	.Lline_table_start0
+	.word	.Linfo_string2
+	.quad	.Lfunc_begin0
+	.word	.Lfunc_end0-.Lfunc_begin0
+	.byte	2
+	.word	.Linfo_string3
+	.byte	1
+	.byte	3
+	.quad	.Lfunc_begin0
+	.word	.Lfunc_end0-.Lfunc_begin0
+	.word	42
+	.byte	4
+	.word	42
+	.quad	.Ltmp0
+	.word	.Ltmp1-.Ltmp0
+	.byte	1
+	.half	2395
+	.byte	5
+	.byte	0
+	.byte	0
+.Ldebug_info_end0:
+	.section	.debug_str,"MS",@progbits,1
+.Linfo_string0:
+	.asciz	"triton"
+.Linfo_string1:
+	.asciz	"triton_relu.rs"
+.Linfo_string2:
+	.asciz	"$TEST_DATA"
+.Linfo_string3:
+	.asciz	"entry_point"
+	.section	".note.GNU-stack","",@progbits
+	.section	.debug_line,"",@progbits
+.Lline_table_start0:

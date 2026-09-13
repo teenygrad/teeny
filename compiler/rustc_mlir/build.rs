@@ -48,7 +48,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .define("LLVM_DIR", llvm.install_dir.join("lib/cmake/llvm"))
         .define("MLIR_DIR", &mlir_dir)
         .define("TRITON_SOURCE_DIR", triton.source_dir())
-        .define("TRITON_BUILD_DIR", triton_build_dir);
+        .define("TRITON_BUILD_DIR", triton_build_dir)
+        // The CMake option defaults OFF for standalone configures; passing it
+        // explicitly also overrides a stale OFF left in an existing build cache.
+        .define("TRITON_CPU_ENABLE", "ON");
 
     let dst = config.build();
 
@@ -68,6 +71,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     // The wrapper's RISC-V backend references the in-tree RVV dialect, which cmake
     // builds as its own archive. It must follow mlir-wrapper on the link line.
     println!("cargo:rustc-link-lib=static=MLIRRVVDialect");
+    // RiscvBackend lowers through TritonCPU (mlir-wrapper's CpuBackend), whose
+    // passes live in these archives. Dependents come first so each archive's
+    // references resolve against the ones after it; the MLIR libraries they
+    // need are linked by mlir-sys, and TritonIR by `triton` below.
+    for lib in ["TritonCPUToLLVM", "TritonCPUTransforms", "TritonToTritonCPU", "TritonCPUIR"] {
+        println!("cargo:rustc-link-lib=static={lib}");
+    }
 
     // Link MLIR libraries
     let mlir_lib_dir = llvm.install_dir.join("lib");
