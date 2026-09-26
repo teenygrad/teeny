@@ -2597,7 +2597,12 @@ impl<'a> TritonCodegen<'a> {
             };
             let shape_str: String =
                 block_shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x");
-            let type_str = format!("!tt.tensordesc<tensor<{}x{}>>", shape_str, elem_ty_str);
+            // Triton's TensorDescType::verify rejects a ranked tensor element
+            // type outright: "tensor descriptors must not wrap tensor types;
+            // use !tt.tensordesc<shape x element-type[, layout]> instead"
+            // (src/triton/lib/Dialect/Triton/IR/Types.cpp). The shape and
+            // element type go in directly -- !tt.tensordesc<32x32xf32>.
+            let type_str = format!("!tt.tensordesc<{}x{}>", shape_str, elem_ty_str);
             println!("[DEBUG-DESC] make_tensor_descriptor: result_ty={}", type_str);
             melior::ir::Type::parse(self.module.context(), &type_str)
                 .expect("valid tensordesc type")
