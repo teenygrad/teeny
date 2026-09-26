@@ -2285,7 +2285,7 @@ mod tests {
 
         // Descriptor type: !tt.tensordesc<tensor<1x16xf32>>.
         // The block has 1 row and 16 columns – the gather restriction.
-        let desc_ty = Type::parse(&context, "!tt.tensordesc<tensor<1x16xf32>>")
+        let desc_ty = Type::parse(&context, "!tt.tensordesc<1x16xf32>")
             .expect("valid tensordesc type");
 
         // x_offsets type: tensor<16xi32> (16 column-offset indices).
@@ -2364,7 +2364,7 @@ mod tests {
 
         // Descriptor type: !tt.tensordesc<tensor<1x16xf32>>.
         // The block has 1 row and 16 columns – the scatter restriction.
-        let desc_ty = Type::parse(&context, "!tt.tensordesc<tensor<1x16xf32>>")
+        let desc_ty = Type::parse(&context, "!tt.tensordesc<1x16xf32>")
             .expect("valid tensordesc type");
 
         // x_offsets type: tensor<16xi32> (16 column-offset indices).
@@ -2902,7 +2902,7 @@ mod tests {
         let result_tensor_ty: Type = tensor_type(&[16, 16], f32_type).into();
 
         // Descriptor type: !tt.tensordesc<tensor<16x16xf32>>.
-        let desc_ty = Type::parse(&context, "!tt.tensordesc<tensor<16x16xf32>>")
+        let desc_ty = Type::parse(&context, "!tt.tensordesc<16x16xf32>")
             .expect("valid tensordesc type");
 
         // Two i32 indices for a 2-D descriptor.
@@ -4838,7 +4838,7 @@ mod tests {
         let base_ptr_ty = pointer_type(f32_type);
 
         // result type: !tt.tensordesc<tensor<8x16xf32>>
-        let result_ty = Type::parse(&context, "!tt.tensordesc<tensor<8x16xf32>>")
+        let result_ty = Type::parse(&context, "!tt.tensordesc<8x16xf32>")
             .expect("valid tensordesc type");
 
         // Function arguments: base, s0, s1 (shape i32), str0, str1 (strides i64)
@@ -4895,7 +4895,7 @@ mod tests {
             "missing op mnemonic:\n{output}"
         );
         assert!(
-            output.contains("!tt.tensordesc<tensor<8x16xf32>>"),
+            output.contains("!tt.tensordesc<8x16xf32>"),
             "missing tensordesc result type:\n{output}"
         );
         assert!(
@@ -5931,7 +5931,7 @@ mod tests {
         let src_tensor_ty: Type = tensor_type(&[16, 16], f32_type).into();
 
         // Descriptor type: !tt.tensordesc<tensor<16x16xf32>>.
-        let desc_ty = Type::parse(&context, "!tt.tensordesc<tensor<16x16xf32>>")
+        let desc_ty = Type::parse(&context, "!tt.tensordesc<16x16xf32>")
             .expect("valid tensordesc type");
 
         // Two i32 indices for a 2-D descriptor.
