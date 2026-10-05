@@ -283,7 +283,24 @@ impl<'a> TritonCodegen<'a> {
             "triton::Triton::broadcast_to" => {
                 TritonCodegen::codegen_broadcast_to_call as LocalCallHandler<'a, 'tcx>
             }
+            // Same handler, same reason as `expand_dims_i32` below: the
+            // handler reads its operands through `codegen_operand` and is
+            // agnostic to the element type, while the Rust signatures differ
+            // because `Tensor<D>` and `I32Tensor` are separate associated
+            // types (teenyc-u9z).
+            "triton::Triton::broadcast_to_i32" => {
+                TritonCodegen::codegen_broadcast_to_call as LocalCallHandler<'a, 'tcx>
+            }
             "triton::Triton::expand_dims" => {
+                TritonCodegen::codegen_expand_dims_call as LocalCallHandler<'a, 'tcx>
+            }
+            // Same handler: `codegen_expand_dims_call` reads `args[0]` through
+            // `codegen_operand` with the operand's own type, so it is agnostic
+            // to the element type. Only the Rust signature differs --
+            // `expand_dims` is typed over `Self::Tensor<D>` and this one over
+            // `Self::I32Tensor`, which are separate associated types with no
+            // equality bound, so teenygrad needs both (teenyc-u9z).
+            "triton::Triton::expand_dims_i32" => {
                 TritonCodegen::codegen_expand_dims_call as LocalCallHandler<'a, 'tcx>
             }
             "triton::Triton::permute" => {
