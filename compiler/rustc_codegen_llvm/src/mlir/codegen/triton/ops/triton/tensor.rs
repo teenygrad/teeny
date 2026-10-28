@@ -29,6 +29,7 @@ use rustc_mlir::shared::arith::{Int, create_extsi, create_int_constant};
 use rustc_mlir::shared::builtin::tensor_type;
 use rustc_mlir::shared::ub::create_ub_poison;
 use rustc_mlir::triton::program::{ProgramAxis, create_get_num_programs};
+use rustc_target::spec::Arch;
 use rustc_mlir::triton::tensor::{
     CacheModifier, EvictionPolicy, InputPrecision, MemSemantic, MemSyncScope, PropagateNan, RmwOp,
     ScaleDotElemType, add_ptr, advance, assert_op, atomic_cas, atomic_rmw, broadcast, clampf,
@@ -3521,8 +3522,10 @@ impl<'a> TritonCodegen<'a> {
         self.codegen_math_unary(tcx, instance, mir, args, "math.erf", location, mlir_block, state)
     }
 
-    /// `triton::Triton::atan` — uses CUDA libdevice `__nv_atanf` via `tt.extern_elementwise`.
-    /// `math.atan` has no lowering in Triton's TritonGPUToLLVM pipeline.
+    /// `triton::Triton::atan` — on CUDA, uses libdevice `__nv_atanf` via `tt.extern_elementwise`,
+    /// since `math.atan` has no lowering in Triton's TritonGPUToLLVM pipeline. Every other target
+    /// goes through TritonCPU, which lowers `math.atan` but has no libdevice to resolve
+    /// `__nv_atanf` against.
     pub fn codegen_atan_call<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -3540,6 +3543,9 @@ impl<'a> TritonCodegen<'a> {
         mlir_block: &BlockRef<'a, 'a>,
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        if tcx.sess.target.arch != Arch::Nvptx64 {
+            return self.codegen_math_unary(tcx, instance, mir, args, "math.atan", location, mlir_block, state);
+        }
         let x = self.codegen_operand(
             tcx,
             instance,

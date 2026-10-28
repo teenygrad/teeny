@@ -231,35 +231,17 @@ struct ReduceOpConversion
           elemTy, static_cast<int64_t>(
                       (1UL << (elemTy.getIntOrFloatBitWidth() - 1)) - 1));
     else if (kind == vector::CombiningKind::MINIMUMF ||
-             kind == vector::CombiningKind::MAXIMUMF) {
-      if (elemTy.isF32())
-        initVal =
-            rewriter.getF32FloatAttr(std::numeric_limits<float>::quiet_NaN());
-      else if (elemTy.isF64())
-        initVal =
-            rewriter.getF64FloatAttr(std::numeric_limits<double>::quiet_NaN());
-      else
-        llvm_unreachable("Unsupported type for acc init value.");
-    }
-
-    else if (kind == vector::CombiningKind::MINNUMF) {
-      if (elemTy.isF32())
-        initVal =
-            rewriter.getF32FloatAttr(std::numeric_limits<float>::infinity());
-      else if (elemTy.isF64())
-        initVal =
-            rewriter.getF64FloatAttr(std::numeric_limits<double>::infinity());
-      else
-        llvm_unreachable("Unsupported type for acc init value.");
-    } else if (kind == vector::CombiningKind::MAXNUMF) {
-      if (elemTy.isF32())
-        initVal =
-            rewriter.getF32FloatAttr(-std::numeric_limits<float>::infinity());
-      else if (elemTy.isF64())
-        initVal =
-            rewriter.getF64FloatAttr(-std::numeric_limits<double>::infinity());
-      else
-        llvm_unreachable("Unsupported type for acc init value.");
+             kind == vector::CombiningKind::MINNUMF ||
+             kind == vector::CombiningKind::MAXIMUMF ||
+             kind == vector::CombiningKind::MAXNUMF) {
+      // The identity is +inf for min and -inf for max, NaN-propagating or not.
+      // A NaN seed is not an identity for MINIMUMF/MAXIMUMF: they propagate
+      // NaN, so every reduction would return NaN regardless of its input.
+      bool negative = kind == vector::CombiningKind::MAXIMUMF ||
+                      kind == vector::CombiningKind::MAXNUMF;
+      auto floatTy = cast<FloatType>(elemTy);
+      initVal = rewriter.getFloatAttr(
+          floatTy, APFloat::getInf(floatTy.getFloatSemantics(), negative));
     }
 
     if (vecTy)
