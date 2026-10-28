@@ -118,6 +118,7 @@ compiler/
 - `library/` - Standard library (std, core, alloc, etc.)
 - `src/bootstrap/` - Bootstrap build system
 - `src/triton/` - Triton compiler integration (submodule)
+- `src/sleef/` - SLEEF vector math library (submodule), cross-built for riscv64 by `compiler/rustc_mlir/build.rs` and linked into RISC-V kernels
 - `src/llvm-project/` - LLVM 23.1 source
 - `tests/` - Comprehensive test suites
 - `src/tools/` - Additional tooling (cargo, rustfmt, clippy, etc.)
@@ -153,6 +154,14 @@ The MLIR backend in `compiler/rustc_codegen_mlir/` implements the `CodegenBacken
 - ninja or GNU make 3.81+
 - cmake (version per LLVM docs)
 - libstdc++-static (Fedora/Ubuntu)
+
+### RISC-V Vector Math (optional)
+
+RISC-V kernels call SLEEF's RVV functions for vector math when `rustc_mlir`'s build script can
+cross-build `src/sleef`, which needs clang (gcc before 14 lacks the RVV intrinsics; override with
+`$TEENY_SLEEF_CC`/`$TEENY_SLEEF_CXX`) and the riscv64 libc headers (`libc6-dev-riscv64-cross` on
+Ubuntu). Without them the build warns and kernels call scalar libm instead.
+`$TEENYC_SLEEF_RISCV_LIB` points `teenyc` at a different riscv64 `libsleef.a`.
 
 **Recommended**: Set `llvm.download-ci-llvm = true` in bootstrap.toml to download prebuilt LLVM instead of building from source (saves hours).
 
