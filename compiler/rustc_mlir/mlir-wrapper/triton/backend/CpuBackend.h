@@ -130,6 +130,11 @@ protected:
   /// the subclass keeps that choice correct when cross-compiling.
   virtual std::set<std::string> getTargetFeatures() const = 0;
 
+  /// Whether to map vector math onto the vector library rather than libm.
+  /// The vector library must be one the target can call into, and that the
+  /// kernel will be linked or loaded against.
+  virtual bool useVecLib(const std::set<std::string> &features) const;
+
   /// TargetMachine for the target, used for the LLVM module's triple, data
   /// layout and O3 pipeline. Returns nullptr, after logging why, on failure.
   virtual std::unique_ptr<llvm::TargetMachine> createTargetMachine() = 0;

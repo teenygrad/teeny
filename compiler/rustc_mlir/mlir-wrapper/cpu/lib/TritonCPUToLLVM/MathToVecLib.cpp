@@ -233,18 +233,18 @@ private:
   std::string baseName;
 };
 
+std::string sleefUlpSuffix(unsigned ulp) {
+  if (ulp == 0)
+    return "";
+  char buf[5]; // 4 char suffix + '\0' added by snprintf
+  snprintf(buf, 5, "_u%02u", ulp);
+  return buf;
+}
+
 class SleefNameGenerator {
 public:
   SleefNameGenerator(StringRef baseName, unsigned ulp = 10)
-      : baseName(baseName), ulpSuffix(4, '\0') {
-    if (ulp == 0) {
-      ulpSuffix = "";
-    } else {
-      char buf[5]; // 4 char suffix + '\0' added by snprintf
-      snprintf(buf, 5, "_u%02u", ulp);
-      ulpSuffix = buf;
-    }
-  }
+      : baseName(baseName), ulpSuffix(sleefUlpSuffix(ulp)) {}
 
   std::string operator()(unsigned bitwidth, unsigned numel,
                          ValueRange /*operands*/) const {
@@ -255,6 +255,32 @@ public:
       return "";
     return "Sleef_" + baseName + (bitwidth == 32 ? "f" : "d") +
            std::to_string(numel) + ulpSuffix;
+  }
+
+private:
+  std::string baseName;
+  std::string ulpSuffix;
+};
+
+/*
+ * Names libsleef's RVV functions, e.g. Sleef_sinfx_u10rvvm2: "x" marks a
+ * scalable vector, and rvvm<N> the LMUL whose minimum size (VLEN = 128) the
+ * fixed vector fills. libsleef only provides LMUL 1 and 2.
+ */
+class RvvSleefNameGenerator {
+public:
+  RvvSleefNameGenerator(StringRef baseName, unsigned ulp = 10)
+      : baseName(baseName), ulpSuffix(sleefUlpSuffix(ulp)) {}
+
+  std::string operator()(unsigned bitwidth, unsigned numel,
+                         ValueRange /*operands*/) const {
+    if (bitwidth != 32 && bitwidth != 64)
+      return "";
+    unsigned vecSize = numel * bitwidth;
+    if (vecSize != 128 && vecSize != 256)
+      return "";
+    return "Sleef_" + baseName + (bitwidth == 32 ? "f" : "d") + "x" +
+           ulpSuffix + "rvvm" + std::to_string(vecSize / 128);
   }
 
 private:
@@ -317,6 +343,69 @@ private:
   GetVecFnNameFn getVecFnNameImpl;
 };
 
+/*
+ * libsleef's RVV functions take and return scalable vectors (vfloat32m2_t
+ * etc.), which the RVV calling convention passes in vector registers, where a
+ * fixed-width vector would be passed in memory. So each fixed vector is
+ * inserted at the start of the scalable type of the same minimum size, and
+ * the result extracted back out of it. The V extension guarantees VLEN >= 128,
+ * so the scalable vector always has room for the whole fixed one; the lanes
+ * past it are computed on zeros and dropped.
+ */
+template <typename OpT>
+struct RvvVecOpToVecLibConversion : public OpRewritePattern<OpT> {
+public:
+  RvvVecOpToVecLibConversion(MLIRContext *context, GetVecFnNameFn getVecFnName)
+      : OpRewritePattern<OpT>(context), getVecFnName(getVecFnName) {}
+
+  LogicalResult matchAndRewrite(OpT op, PatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    VectorType vecTy = dyn_cast<VectorType>(op.getType());
+    if (!vecTy || vecTy.getRank() > 1 || vecTy.isScalable())
+      return failure();
+
+    int64_t numElems = vecTy.getNumElements();
+    auto fnName = getVecFnName(vecTy.getElementTypeBitWidth(), numElems,
+                               op->getOperands());
+    if (fnName.empty())
+      return failure();
+
+    // vscale is VLEN / 64, so at VLEN = 128 the scalable type holds twice its
+    // minimum element count.
+    Type elemTy = vecTy.getElementType();
+    auto scalableTy = VectorType::get({numElems / 2}, elemTy, {true});
+
+    auto module = SymbolTable::getNearestSymbolTable(op);
+    if (!SymbolTable::lookupSymbolIn(module, fnName)) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&module->getRegion(0).front());
+      SmallVector<Type> argTys(op->getNumOperands(), scalableTy);
+      auto fnTy = FunctionType::get(rewriter.getContext(), argTys, scalableTy);
+      auto opFunc = func::FuncOp::create(rewriter, rewriter.getUnknownLoc(),
+                                         fnName, fnTy);
+      opFunc.setPrivate();
+      opFunc->setAttr(LLVM::LLVMDialect::getReadnoneAttrName(),
+                      UnitAttr::get(rewriter.getContext()));
+    }
+
+    Value zeros = arith::ConstantOp::create(
+        rewriter, loc,
+        SplatElementsAttr::get(scalableTy, rewriter.getFloatAttr(elemTy, 0)));
+    SmallVector<Value> args;
+    for (Value operand : op->getOperands())
+      args.push_back(
+          vector::ScalableInsertOp::create(rewriter, loc, operand, zeros, 0));
+    auto call = func::CallOp::create(rewriter, loc, fnName,
+                                     TypeRange{scalableTy}, args);
+    rewriter.replaceOpWithNewOp<vector::ScalableExtractOp>(
+        op, vecTy, call.getResult(0), 0);
+    return success();
+  }
+
+private:
+  GetVecFnNameFn getVecFnName;
+};
+
 struct ExternElementwiseOpConversion
     : public OpToVecLibConversion<triton::cpu::ExternElementwiseOp> {
   using OpToVecLibConversion::OpToVecLibConversion;
@@ -333,15 +422,15 @@ struct ExternElementwiseOpConversion
   }
 };
 
-template <typename OpTy>
+template <typename OpTy,
+          template <typename> class ConversionT = VecOpToVecLibConversion>
 void populatePatternsForOp(RewritePatternSet &patterns,
                            GetVecFnNameFn getVecFnName,
                            size_t vec_size_in_bits = 512) {
   patterns.add<VecOpToFp32<OpTy>>(patterns.getContext());
   patterns.add<DecomposeToNativeVecs<OpTy>>(patterns.getContext(),
                                             vec_size_in_bits);
-  patterns.add<VecOpToVecLibConversion<OpTy>>(patterns.getContext(),
-                                              getVecFnName);
+  patterns.add<ConversionT<OpTy>>(patterns.getContext(), getVecFnName);
 }
 
 struct MathToVecLibPass
@@ -349,6 +438,8 @@ struct MathToVecLibPass
   MathToVecLibPass() = default;
   // Default to 128-bit if no features are specified.
   size_t vec_size_in_bits = 128;
+  // RISC-V V: calls libsleef's scalable-vector functions.
+  bool rvv = false;
 
   explicit MathToVecLibPass(VecLib lib, std::set<std::string> cpu_features) {
     this->lib = lib;
@@ -370,6 +461,12 @@ struct MathToVecLibPass
       } else if (feature == "neon") {
         // Arm NEON is fixed 128-bit SIMD ISA.
         vec_size_in_bits = 128;
+        break;
+      } else if (feature == "v") {
+        // libsleef's widest RVV functions are LMUL 2: 256 bits at the
+        // VLEN = 128 the V extension guarantees.
+        rvv = true;
+        vec_size_in_bits = 256;
         break;
       }
     }
@@ -393,6 +490,15 @@ struct MathToVecLibPass
       break;
     }
     case VecLib::Sleef: {
+      if (rvv) {
+        // floor, sqrt and trunc stay as math ops: RVV has instructions for
+        // them, which beat a call.
+        populateCommonPatterns<RvvSleefNameGenerator,
+                               RvvVecOpToVecLibConversion>(patterns);
+        populatePatternsForOp<math::ExpM1Op, RvvVecOpToVecLibConversion>(
+            patterns, RvvSleefNameGenerator("expm1"), vec_size_in_bits);
+        break;
+      }
       populateCommonPatterns<SleefNameGenerator>(patterns);
       populatePatternsForOp<math::ExpM1Op>(
           patterns, SleefNameGenerator("expm1"), vec_size_in_bits);
@@ -415,48 +521,49 @@ struct MathToVecLibPass
       signalPassFailure();
   }
 
-  template <typename VecFnNameGenerator>
+  template <typename VecFnNameGenerator,
+            template <typename> class ConversionT = VecOpToVecLibConversion>
   void populateCommonPatterns(RewritePatternSet &patterns) const {
-    populatePatternsForOp<math::AcosOp>(patterns, VecFnNameGenerator("acos"),
-                                        vec_size_in_bits);
-    populatePatternsForOp<math::AcoshOp>(patterns, VecFnNameGenerator("acosh"),
-                                         vec_size_in_bits);
-    populatePatternsForOp<math::AsinOp>(patterns, VecFnNameGenerator("asin"),
-                                        vec_size_in_bits);
-    populatePatternsForOp<math::AsinhOp>(patterns, VecFnNameGenerator("asinh"),
-                                         vec_size_in_bits);
-    populatePatternsForOp<math::AtanOp>(patterns, VecFnNameGenerator("atan"),
-                                        vec_size_in_bits);
-    populatePatternsForOp<math::AtanhOp>(patterns, VecFnNameGenerator("atanh"),
-                                         vec_size_in_bits);
-    populatePatternsForOp<math::CbrtOp>(patterns, VecFnNameGenerator("cbrt"),
-                                        vec_size_in_bits);
-    populatePatternsForOp<math::CosOp>(patterns, VecFnNameGenerator("cos"),
-                                       vec_size_in_bits);
-    populatePatternsForOp<math::CoshOp>(patterns, VecFnNameGenerator("cosh"),
-                                        vec_size_in_bits);
-    populatePatternsForOp<math::ErfOp>(patterns, VecFnNameGenerator("erf"),
-                                       vec_size_in_bits);
-    populatePatternsForOp<math::ExpOp>(patterns, VecFnNameGenerator("exp"),
-                                       vec_size_in_bits);
-    populatePatternsForOp<math::Exp2Op>(patterns, VecFnNameGenerator("exp2"),
-                                        vec_size_in_bits);
-    populatePatternsForOp<math::LogOp>(patterns, VecFnNameGenerator("log"),
-                                       vec_size_in_bits);
-    populatePatternsForOp<math::Log2Op>(patterns, VecFnNameGenerator("log2"),
-                                        vec_size_in_bits);
-    populatePatternsForOp<math::Log10Op>(patterns, VecFnNameGenerator("log10"),
-                                         vec_size_in_bits);
-    populatePatternsForOp<math::Log1pOp>(patterns, VecFnNameGenerator("log1p"),
-                                         vec_size_in_bits);
-    populatePatternsForOp<math::SinOp>(patterns, VecFnNameGenerator("sin"),
-                                       vec_size_in_bits);
-    populatePatternsForOp<math::SinhOp>(patterns, VecFnNameGenerator("sinh"),
-                                        vec_size_in_bits);
-    populatePatternsForOp<math::TanOp>(patterns, VecFnNameGenerator("tan"),
-                                       vec_size_in_bits);
-    populatePatternsForOp<math::TanhOp>(patterns, VecFnNameGenerator("tanh"),
-                                        vec_size_in_bits);
+    populatePatternsForOp<math::AcosOp, ConversionT>(
+        patterns, VecFnNameGenerator("acos"), vec_size_in_bits);
+    populatePatternsForOp<math::AcoshOp, ConversionT>(
+        patterns, VecFnNameGenerator("acosh"), vec_size_in_bits);
+    populatePatternsForOp<math::AsinOp, ConversionT>(
+        patterns, VecFnNameGenerator("asin"), vec_size_in_bits);
+    populatePatternsForOp<math::AsinhOp, ConversionT>(
+        patterns, VecFnNameGenerator("asinh"), vec_size_in_bits);
+    populatePatternsForOp<math::AtanOp, ConversionT>(
+        patterns, VecFnNameGenerator("atan"), vec_size_in_bits);
+    populatePatternsForOp<math::AtanhOp, ConversionT>(
+        patterns, VecFnNameGenerator("atanh"), vec_size_in_bits);
+    populatePatternsForOp<math::CbrtOp, ConversionT>(
+        patterns, VecFnNameGenerator("cbrt"), vec_size_in_bits);
+    populatePatternsForOp<math::CosOp, ConversionT>(
+        patterns, VecFnNameGenerator("cos"), vec_size_in_bits);
+    populatePatternsForOp<math::CoshOp, ConversionT>(
+        patterns, VecFnNameGenerator("cosh"), vec_size_in_bits);
+    populatePatternsForOp<math::ErfOp, ConversionT>(
+        patterns, VecFnNameGenerator("erf"), vec_size_in_bits);
+    populatePatternsForOp<math::ExpOp, ConversionT>(
+        patterns, VecFnNameGenerator("exp"), vec_size_in_bits);
+    populatePatternsForOp<math::Exp2Op, ConversionT>(
+        patterns, VecFnNameGenerator("exp2"), vec_size_in_bits);
+    populatePatternsForOp<math::LogOp, ConversionT>(
+        patterns, VecFnNameGenerator("log"), vec_size_in_bits);
+    populatePatternsForOp<math::Log2Op, ConversionT>(
+        patterns, VecFnNameGenerator("log2"), vec_size_in_bits);
+    populatePatternsForOp<math::Log10Op, ConversionT>(
+        patterns, VecFnNameGenerator("log10"), vec_size_in_bits);
+    populatePatternsForOp<math::Log1pOp, ConversionT>(
+        patterns, VecFnNameGenerator("log1p"), vec_size_in_bits);
+    populatePatternsForOp<math::SinOp, ConversionT>(
+        patterns, VecFnNameGenerator("sin"), vec_size_in_bits);
+    populatePatternsForOp<math::SinhOp, ConversionT>(
+        patterns, VecFnNameGenerator("sinh"), vec_size_in_bits);
+    populatePatternsForOp<math::TanOp, ConversionT>(
+        patterns, VecFnNameGenerator("tan"), vec_size_in_bits);
+    populatePatternsForOp<math::TanhOp, ConversionT>(
+        patterns, VecFnNameGenerator("tanh"), vec_size_in_bits);
   }
 };
 

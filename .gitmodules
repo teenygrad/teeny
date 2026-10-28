@@ -59,3 +59,6 @@
 	path = src/gcc
 	url = https://github.com/rust-lang/gcc.git
 	shallow = true
+[submodule "src/sleef"]
+	path = src/sleef
+	url = https://github.com/shibatch/sleef.git

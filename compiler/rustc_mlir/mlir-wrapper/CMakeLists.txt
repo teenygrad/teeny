@@ -82,6 +82,13 @@ set(WRAPPER_SOURCES
 # Create static library
 add_library(mlir-wrapper STATIC ${WRAPPER_SOURCES})
 
+# riscv64 libsleef.a cross-built by rustc_mlir/build.rs, which RiscvBackend
+# links into kernels that call SLEEF. Empty when it could not be built.
+if(TEENY_SLEEF_RISCV_LIB)
+    target_compile_definitions(mlir-wrapper PRIVATE
+        TEENY_SLEEF_RISCV_LIB="${TEENY_SLEEF_RISCV_LIB}")
+endif()
+
 # CpuBackend.cpp includes the TritonCPU passes' tablegen'd headers, which the
 # TritonCPU libraries generate, so those must be built first.
 add_dependencies(mlir-wrapper
