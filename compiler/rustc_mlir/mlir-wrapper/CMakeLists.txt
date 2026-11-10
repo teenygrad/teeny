@@ -87,6 +87,10 @@ add_library(mlir-wrapper STATIC ${WRAPPER_SOURCES})
 if(TEENY_SLEEF_RISCV_LIB)
     target_compile_definitions(mlir-wrapper PRIVATE
         TEENY_SLEEF_RISCV_LIB="${TEENY_SLEEF_RISCV_LIB}")
+    # RiscvBackend.cpp embeds the archive with .incbin, which CMake's
+    # dependency scan can't see.
+    set_source_files_properties(triton/backend/RiscvBackend.cpp PROPERTIES
+        OBJECT_DEPENDS "${TEENY_SLEEF_RISCV_LIB}")
 endif()
 
 # CpuBackend.cpp includes the TritonCPU passes' tablegen'd headers, which the
