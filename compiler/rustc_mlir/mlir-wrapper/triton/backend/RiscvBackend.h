@@ -66,6 +66,10 @@ protected:
 
   virtual std::set<std::string> getTargetFeatures() const override;
 
+  /// Uses libsleef's RVV functions when the target has V and findSleef()
+  /// finds the library makeBIN links them from; libm otherwise.
+  virtual bool useVecLib(const std::set<std::string> &features) const override;
+
   /// Uses a real, generic LLVM cpu name matching the triple's width rather
   /// than `m_cpu` -- see the comment in the .cpp for why forwarding that
   /// Triton-side chip identifier directly would abort the process instead of
@@ -98,6 +102,12 @@ private:
   /// `lld` package) as a last resort. Returns an empty string if none are
   /// found.
   std::string findLld();
+
+  /// Locates the riscv64 `libsleef.a` linked into kernels that call SLEEF:
+  /// `$TEENYC_SLEEF_RISCV_LIB` if set, else the copy rustc_mlir's build
+  /// script cross-built from `src/sleef`. Returns an empty string if neither
+  /// exists.
+  static std::string findSleef();
 
   // Copied out of the incoming RiscvCompileOptions in the constructor rather
   // than storing that struct (and its raw pointers) by value: the pointers

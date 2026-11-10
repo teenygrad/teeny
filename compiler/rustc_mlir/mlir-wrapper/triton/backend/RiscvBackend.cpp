@@ -164,6 +164,14 @@ LogicalResult RiscvBackend::makeBIN(MLIRContext &context, ModuleOp module) {
 
   llvm::SmallVector<llvm::StringRef, 8> args = {
       lldPath, "-shared", "-m", "elf64lriscv", "-o", soPath, objPath};
+  // Linked statically, so the kernel carries the SLEEF functions it calls
+  // and the device needs nothing installed. The archive must follow the
+  // object for its members to resolve the object's references.
+  std::string sleefPath;
+  if (useVecLib(getTargetFeatures())) {
+    sleefPath = findSleef();
+    args.push_back(sleefPath);
+  }
   std::string errMsg;
   int rc = llvm::sys::ExecuteAndWait(lldPath, args, std::nullopt, {}, 0, 0,
                                      &errMsg);
@@ -290,6 +298,10 @@ std::set<std::string> RiscvBackend::getTargetFeatures() const {
   return features;
 }
 
+bool RiscvBackend::useVecLib(const std::set<std::string> &features) const {
+  return features.count("v") != 0 && !findSleef().empty();
+}
+
 std::unique_ptr<llvm::TargetMachine> RiscvBackend::createTargetMachine() {
   initializeLLVMTargets();
 
@@ -403,6 +415,20 @@ std::string RiscvBackend::findLld() {
   if (auto found = llvm::sys::findProgramByName("ld.lld")) {
     return *found;
   }
+  return {};
+}
+
+std::string RiscvBackend::findSleef() {
+  if (const char *override_path = std::getenv("TEENYC_SLEEF_RISCV_LIB")) {
+    if (llvm::sys::fs::exists(override_path)) {
+      return override_path;
+    }
+  }
+#ifdef TEENY_SLEEF_RISCV_LIB
+  if (llvm::sys::fs::exists(TEENY_SLEEF_RISCV_LIB)) {
+    return TEENY_SLEEF_RISCV_LIB;
+  }
+#endif
   return {};
 }
 

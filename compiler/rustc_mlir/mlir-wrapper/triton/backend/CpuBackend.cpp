@@ -192,6 +192,10 @@ CpuBackend::CpuBackend(std::string target, bool debug)
 
 CpuBackend::~CpuBackend() {}
 
+bool CpuBackend::useVecLib(const std::set<std::string> &features) const {
+  return vecLibSupported(kVecLib, features);
+}
+
 void CpuBackend::loadDialects(MLIRContext &context) {
   // Mirrors triton-cpu's load_dialects. The LLVM IR translations makeLLVMIR
   // depends on are already registered on this context by the Rust side
@@ -349,7 +353,7 @@ LogicalResult CpuBackend::makeLLIR(MLIRContext &context, ModuleOp module) {
   addCpuPass(pm, CpuPass::ttcpuir_atomic_ops_to_llvmir);
   addCpuPass(pm, CpuPass::ttcpuir_debug_ops_to_llvmir);
 
-  if (vecLibSupported(kVecLib, features)) {
+  if (useVecLib(features)) {
     addCpuPass(pm, CpuPass::ttcpuir_math_to_vec_lib, kVecLib, features);
   }
 
