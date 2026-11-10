@@ -105,8 +105,9 @@ private:
 
   /// Locates the riscv64 `libsleef.a` linked into kernels that call SLEEF:
   /// `$TEENYC_SLEEF_RISCV_LIB` if set, else the copy rustc_mlir's build
-  /// script cross-built from `src/sleef`. Returns an empty string if neither
-  /// exists.
+  /// script cross-built from `src/sleef`, which is embedded in the compiler
+  /// and written to `<user cache dir>/teenyc/` on first use. Returns an empty
+  /// string if neither is available.
   static std::string findSleef();
 
   // Copied out of the incoming RiscvCompileOptions in the constructor rather

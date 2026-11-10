@@ -48,7 +48,31 @@
 
 #include "RiscvBackend.h"
 
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/xxhash.h"
+
 #include <cstdlib>
+
+// libsleef.a is linked into every kernel .so, so it has to travel inside the
+// compiler: an installed toolchain has no build tree to find it in, and the
+// dist tarballs don't carry it as a separate file.
+#if defined(TEENY_SLEEF_RISCV_LIB) && defined(__ELF__)
+__asm__(".pushsection .rodata.teeny_sleef_riscv,\"a\",@progbits\n"
+        ".balign 16\n"
+        ".globl teeny_sleef_riscv_begin\n"
+        ".hidden teeny_sleef_riscv_begin\n"
+        "teeny_sleef_riscv_begin:\n"
+        ".incbin \"" TEENY_SLEEF_RISCV_LIB "\"\n"
+        ".globl teeny_sleef_riscv_end\n"
+        ".hidden teeny_sleef_riscv_end\n"
+        "teeny_sleef_riscv_end:\n"
+        ".popsection\n");
+extern "C" __attribute__((visibility("hidden"))) const char
+    teeny_sleef_riscv_begin[];
+extern "C" __attribute__((visibility("hidden"))) const char
+    teeny_sleef_riscv_end[];
+#define TEENY_HAVE_EMBEDDED_SLEEF 1
+#endif
 
 namespace mlir {
 namespace triton {
@@ -418,18 +442,80 @@ std::string RiscvBackend::findLld() {
   return {};
 }
 
+static llvm::StringRef embeddedSleef() {
+#ifdef TEENY_HAVE_EMBEDDED_SLEEF
+  return llvm::StringRef(teeny_sleef_riscv_begin,
+                         teeny_sleef_riscv_end - teeny_sleef_riscv_begin);
+#else
+  return {};
+#endif
+}
+
+static bool fileHasContents(const llvm::Twine &path,
+                            llvm::StringRef contents) {
+  auto buf = llvm::MemoryBuffer::getFile(path, /*IsText=*/false,
+                                         /*RequiresNullTerminator=*/false);
+  return buf && (*buf)->getBuffer() == contents;
+}
+
+// ld.lld needs the archive as a file. It goes in the per-user cache rather
+// than the shared temp dir so another user can't plant an archive that would
+// be linked into this user's kernels. The name carries the content hash so
+// toolchains embedding different SLEEF builds don't overwrite each other.
+static std::string materializeEmbeddedSleef() {
+  llvm::StringRef archive = embeddedSleef();
+  if (archive.empty()) {
+    return {};
+  }
+  llvm::SmallString<256> dir;
+  if (!llvm::sys::path::cache_directory(dir)) {
+    return {};
+  }
+  llvm::sys::path::append(dir, "teenyc");
+  if (llvm::sys::fs::create_directories(dir)) {
+    return {};
+  }
+
+  uint64_t hash = llvm::xxh3_64bits(llvm::arrayRefFromStringRef(archive));
+  llvm::SmallString<256> path(dir);
+  llvm::sys::path::append(path, "libsleef-riscv64-" + llvm::utohexstr(hash) +
+                                    ".a");
+  if (fileHasContents(path, archive)) {
+    return std::string(path);
+  }
+
+  // Written under a unique name and renamed into place, so a teenyc running
+  // concurrently never links a half-written archive.
+  llvm::SmallString<256> model(dir);
+  llvm::sys::path::append(model, "libsleef-riscv64-%%%%%%%%.tmp");
+  llvm::SmallString<256> tmp;
+  int fd = -1;
+  if (llvm::sys::fs::createUniqueFile(model, fd, tmp)) {
+    return {};
+  }
+  bool written = false;
+  {
+    llvm::raw_fd_ostream os(fd, /*shouldClose=*/true);
+    os << archive;
+    os.close();
+    written = !os.has_error();
+    os.clear_error();
+  }
+  if (!written || llvm::sys::fs::rename(tmp, path)) {
+    llvm::sys::fs::remove(tmp);
+    return {};
+  }
+  return std::string(path);
+}
+
 std::string RiscvBackend::findSleef() {
   if (const char *override_path = std::getenv("TEENYC_SLEEF_RISCV_LIB")) {
     if (llvm::sys::fs::exists(override_path)) {
       return override_path;
     }
   }
-#ifdef TEENY_SLEEF_RISCV_LIB
-  if (llvm::sys::fs::exists(TEENY_SLEEF_RISCV_LIB)) {
-    return TEENY_SLEEF_RISCV_LIB;
-  }
-#endif
-  return {};
+  static const std::string embedded = materializeEmbeddedSleef();
+  return embedded;
 }
 
 } // namespace triton
