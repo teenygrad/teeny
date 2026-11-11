@@ -2960,6 +2960,14 @@ impl<'a> TritonCodegen<'a> {
             mlir_block,
             state,
         )?;
+        // arith.select needs the condition and both values at one shape. Broadcasting the values
+        // together, then the condition against them, then the values again reaches the shape
+        // all three broadcast to, whichever of them is narrow.
+        let (true_val, false_val) =
+            self.maybe_broadcast_pair(location, true_val, false_val, mlir_block)?;
+        let (cond, true_val) = self.maybe_broadcast_pair(location, cond, true_val, mlir_block)?;
+        let (true_val, false_val) =
+            self.maybe_broadcast_pair(location, true_val, false_val, mlir_block)?;
         let result_ty = true_val.r#type();
         let op: Operation<'a> = OperationBuilder::new("arith.select", location)
             .add_operands(&[cond, true_val, false_val])
