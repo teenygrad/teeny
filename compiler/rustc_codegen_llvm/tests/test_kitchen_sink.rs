@@ -489,4 +489,29 @@ mod tests {
             );
         }
     }
+
+    // teenyc-3er: T::swizzle2d was a stub emitting ub.poison.
+    #[test]
+    fn test_swizzle2d() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_swizzle2d.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_swizzle2d");
+        assert!(result.is_ok(), "swizzle2d compile failed: {:?}", result.err());
+
+        // With runtime inputs, swizzle2d's two divisions (group index, then column within the
+        // group) and its `minimum` must survive into the PTX. Its `%`s are not asserted: LLVM
+        // rewrites each as `x - (x / y) * y`, reusing the division.
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        let count = |op: &str| ptx.lines().filter(|l| l.trim_start().starts_with(op)).count();
+        assert!(count("div.s32") >= 2, "expected two `div.s32` in PTX:\n{ptx}");
+        for op in ["min.s32", "st.global"] {
+            assert!(count(op) > 0, "no `{op}` instruction in PTX:\n{ptx}");
+        }
+    }
 }

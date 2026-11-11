@@ -4418,8 +4418,68 @@ impl<'a> TritonCodegen<'a> {
         Ok(Some(result))
     }
 
-    // `triton::Triton::swizzle2d` — no direct Triton IR equivalent.
-    stub_handler!(codegen_swizzle2d_call);
+    /// `triton::Triton::swizzle2d(i, j, size_i, size_j, size_g) -> (new_i, new_j)`: Triton's
+    /// `tl.swizzle2d` (python/triton/language/standard.py), which is plain scalar `i32`
+    /// arithmetic; its `//` and `%` are C-style, so they lower to `divsi` / `remsi`.
+    pub fn codegen_swizzle2d_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        use melior::dialect::arith::{addi, divsi, minsi, muli, remsi, subi};
+
+        if args.len() != 5 {
+            return Err(MlirError::CodegenFailed {
+                err: format!("swizzle2d: expected 5 arguments, got {}", args.len()),
+            });
+        }
+        let mut operands = Vec::with_capacity(5);
+        for arg in args {
+            operands.push(self.codegen_operand(
+                tcx,
+                instance,
+                &arg.node,
+                arg.node.ty(mir, tcx),
+                location,
+                mlir_block,
+                state,
+            )?);
+        }
+        let [i, j, size_i, size_j, size_g] = operands[..] else {
+            unreachable!("length checked above");
+        };
+
+        let emit = |op: Operation<'a>| -> Result<Value<'a, 'a>, MlirError> {
+            let op = mlir_block.append_operation(op);
+            Ok(op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into())
+        };
+        // Unrolled index of (i, j), and the number of elements in a group of `size_g` rows.
+        let ij = emit(addi(emit(muli(i, size_j, location))?, j, location))?;
+        let size_gj = emit(muli(size_g, size_j, location))?;
+        // First row of (i, j)'s group; the last group may have fewer than `size_g` rows.
+        let group_id = emit(divsi(ij, size_gj, location))?;
+        let off_i = emit(muli(group_id, size_g, location))?;
+        let group_rows = emit(minsi(emit(subi(size_i, off_i, location))?, size_g, location))?;
+        // Position within the group, read column-major.
+        let ij_in_group = emit(remsi(ij, size_gj, location))?;
+        let new_i = emit(addi(off_i, emit(remsi(ij_in_group, group_rows, location))?, location))?;
+        let new_j = emit(divsi(ij_in_group, group_rows, location))?;
+
+        state.tuple_fields.insert(destination.local, vec![new_i, new_j]);
+        Ok(None)
+    }
 
     // =========================================================================
     // Reductions (tt.reduce)
