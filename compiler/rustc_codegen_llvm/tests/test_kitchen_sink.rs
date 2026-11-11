@@ -538,4 +538,28 @@ mod tests {
             );
         }
     }
+
+    // teenyc-190: T::sort was a stub emitting ub.poison.
+    #[test]
+    fn test_sort() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_sort.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_sort");
+        assert!(result.is_ok(), "sort compile failed: {:?}", result.err());
+
+        // Each compare-and-swap compares an element with its partner (`x > y`) and selects.
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        for op in ["setp.gt.f32", "setp.gt.s32", "selp", "st.global"] {
+            assert!(
+                ptx.lines().any(|l| l.trim_start().starts_with(op)),
+                "no `{op}` instruction in PTX:\n{ptx}"
+            );
+        }
+    }
 }

@@ -43,7 +43,7 @@ use rustc_mlir::triton::tensor::{
     descriptor_load, descriptor_store, dot, dot_scaled, expand_dims, gather, histogram, join, load,
     make_range, make_tensor_descriptor, mulhiui, precise_divf, precise_sqrt,
     print as triton_print, reduce, reduce_return, reshape, scan, scan_return, splat, split, store,
-    trans, zeros_like,
+    trans, zeros_like, bitcast,
 };
 use rustc_mlir::triton::{int_to_ptr, pointer_type};
 use rustc_span::Span;
@@ -139,6 +139,33 @@ impl ValueCompare {
             Self::Int(_) => cmpi(context, CmpiPredicate::Eq, lhs, rhs, location),
         }
     }
+}
+
+/// Fixed parameters of one bitonic sort (see `codegen_sort_call`).
+#[derive(Clone, Copy)]
+struct Bitonic<'a> {
+    /// The hypercube's rank, `log2(numel)`.
+    n_dims: u32,
+    elem: melior::ir::Type<'a>,
+    /// The same-width integer type the partner exchange XORs in.
+    int_elem: melior::ir::Type<'a>,
+    compare: ValueCompare,
+    location: Location<'a>,
+}
+
+/// The `order` argument of Triton's `_bitonic_merge_hypercube`.
+#[derive(Clone, Copy)]
+enum BitonicOrder {
+    Alternating,
+    Fixed { descending: bool },
+}
+
+/// Triton's `flip` in `_compare_and_swap`: a constant 0 or 1, or the indicator of a stage.
+#[derive(Clone, Copy)]
+enum Flip {
+    Zero,
+    One,
+    Indicator(u32),
 }
 
 impl<'a> TritonCodegen<'a> {
@@ -5109,8 +5136,235 @@ impl<'a> TritonCodegen<'a> {
         )
     }
 
-    // `triton::Triton::sort` — no direct Triton IR equivalent.
-    stub_handler!(codegen_sort_call);
+    /// `triton::Triton::sort(x, dim, descending)`: Triton's `tl.sort` (`sort_impl` in
+    /// python/triton/language/standard.py), a bitonic sort on `x` viewed as a `[2; log2(numel)]`
+    /// hypercube. Like Triton, only the last dimension is supported and every extent must be a
+    /// power of two.
+    pub fn codegen_sort_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        let fail = |err: String| MlirError::CodegenFailed { err: format!("sort: {err}") };
+        if args.len() != 3 {
+            return Err(fail(format!("expected 3 arguments, got {}", args.len())));
+        }
+        let src = self.codegen_operand(
+            tcx,
+            instance,
+            &args[0].node,
+            args[0].node.ty(mir, tcx),
+            location,
+            mlir_block,
+            state,
+        )?;
+        let dims = RankedTensorType::try_from(src.r#type())
+            .ok()
+            .and_then(|t| t.dims().ok())
+            .ok_or_else(|| fail(format!("source is not a ranked tensor: {}", src.r#type())))?;
+        let rank = dims.len() as i32;
+        let dim = match self.const_option_i32(tcx, instance, mir, &args[1].node, state)? {
+            None => rank - 1,
+            Some(d) if d < 0 => d + rank,
+            Some(d) => d,
+        };
+        if dim != rank - 1 {
+            return Err(fail(format!("only the last dimension can be sorted, got dim {dim}")));
+        }
+        let descending = self.const_bool_arg(tcx, instance, &args[2].node);
+        if let Some(d) = dims.iter().find(|&&d| d <= 0 || (d & (d - 1)) != 0) {
+            return Err(fail(format!("every extent must be a power of two, got {d} in {dims:?}")));
+        }
+        let numel: i64 = dims.iter().product();
+        if numel == 1 {
+            return Ok(Some(src));
+        }
+        let n_dims = numel.trailing_zeros();
+        let log_n = dims[dims.len() - 1].trailing_zeros();
+
+        let elem = self.elem_ty(src);
+        let rust_elem = Self::rust_elem_ty(instance.instantiate_mir_and_normalize_erasing_regions(
+            tcx,
+            TypingEnv::fully_monomorphized(),
+            EarlyBinder::bind(tcx, args[0].node.ty(mir, tcx)),
+        ));
+        let sorter = Bitonic {
+            n_dims,
+            elem,
+            int_elem: self.same_width_int(elem).ok_or_else(|| fail(format!("unsupported element type {elem}")))?,
+            compare: ValueCompare::for_elem(rust_elem.kind(), elem, Extremum::Max),
+            location,
+        };
+
+        let mut h = self.reshape_to(src, &vec![2; n_dims as usize], elem, location, mlir_block)?;
+        for stage in 1..=log_n {
+            let order = if stage < log_n {
+                BitonicOrder::Alternating
+            } else {
+                BitonicOrder::Fixed { descending }
+            };
+            h = self.bitonic_merge(&sorter, h, stage, order, mlir_block)?;
+        }
+        self.reshape_to(h, &dims, elem, location, mlir_block).map(Some)
+    }
+
+    /// Triton's `_bitonic_merge_hypercube`: `stage` compare-and-swap rounds, innermost last.
+    fn bitonic_merge(
+        &self,
+        sorter: &Bitonic<'a>,
+        mut h: Value<'a, 'a>,
+        stage: u32,
+        order: BitonicOrder,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        let flip = match order {
+            BitonicOrder::Alternating => Flip::Indicator(stage),
+            BitonicOrder::Fixed { descending: false } => Flip::Zero,
+            BitonicOrder::Fixed { descending: true } => Flip::One,
+        };
+        for round in 0..stage {
+            h = self.compare_and_swap(sorter, h, flip, stage - 1 - round, mlir_block)?;
+        }
+        Ok(h)
+    }
+
+    /// Triton's `_compare_and_swap` on the `i`-th innermost hypercube axis: each element's
+    /// partner `y` along that axis is `x ^ xor_sum(x)` over the axis (on the bits), and the pair
+    /// is put in order with `where((x > y) != (flip ^ is_right), y, x)`.
+    fn compare_and_swap(
+        &self,
+        sorter: &Bitonic<'a>,
+        x: Value<'a, 'a>,
+        flip: Flip,
+        i: u32,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        use melior::dialect::arith::{CmpiPredicate, cmpi, select, xori};
+
+        let Bitonic { n_dims, elem, int_elem, compare, location } = *sorter;
+        let context = self.module.context();
+        let shape = vec![2; n_dims as usize];
+        let int_ty: melior::ir::Type<'a> = tensor_type(&shape, int_elem).into();
+        let emit = |op: Operation<'a>| self.append_result(op, mlir_block);
+        let to_err = |e| MlirError::CreateOperation { err: e };
+
+        let ix = if elem == int_elem { x } else { emit(bitcast(context, location, x, int_ty).map_err(to_err)?)? };
+        let axis = (n_dims - 1 - i) as i32;
+        let reduced: Operation<'a> = reduce(
+            context,
+            location,
+            &[ix],
+            &[self.reduce_result_ty(ix, axis)],
+            axis,
+            self.build_reduce_region(location, int_elem, "arith.xori"),
+        )
+        .map_err(to_err)?
+        .into();
+        let mut kept_shape = shape.clone();
+        kept_shape[axis as usize] = 1;
+        let kept_ty: melior::ir::Type<'a> = tensor_type(&kept_shape, int_elem).into();
+        let reduced = emit(reduced)?;
+        let kept = if n_dims == 1 {
+            emit(splat(context, location, reduced, kept_ty).map_err(to_err)?.into())?
+        } else {
+            emit(expand_dims(context, location, reduced, axis, kept_ty).map_err(to_err)?.into())?
+        };
+        let partner_bits = emit(xori(ix, emit(broadcast(context, location, kept, int_ty).map_err(to_err)?.into())?, location))?;
+        let y = if elem == int_elem {
+            partner_bits
+        } else {
+            emit(bitcast(context, location, partner_bits, x.r#type()).map_err(to_err)?)?
+        };
+
+        let is_right = self.hypercube_indicator(n_dims, i, location, mlir_block)?;
+        let swap_right = match flip {
+            Flip::Zero => is_right,
+            Flip::One => emit(xori(is_right, self.splat_i32(1, is_right.r#type(), location, mlir_block)?, location))?,
+            Flip::Indicator(stage) => {
+                emit(xori(self.hypercube_indicator(n_dims, stage, location, mlir_block)?, is_right, location))?
+            }
+        };
+        let zero = self.splat_i32(0, swap_right.r#type(), location, mlir_block)?;
+        let swap_right = emit(cmpi(context, CmpiPredicate::Ne, swap_right, zero, location))?;
+        let greater = emit(compare.better(context, x, y, location))?;
+        let take_partner = emit(xori(greater, swap_right, location))?;
+        emit(select(take_partner, y, x, location))
+    }
+
+    /// Triton's `_indicator(n_dims, j)` broadcast to the full hypercube: an `i32` tensor of
+    /// shape `[2; n_dims]` holding each element's coordinate (0 or 1) on the `j`-th innermost
+    /// axis.
+    fn hypercube_indicator(
+        &self,
+        n_dims: u32,
+        j: u32,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        let context = self.module.context();
+        let i32_ty: melior::ir::Type<'a> = IntegerType::new(context, 32).into();
+        let range: Operation<'a> = make_range(context, location, 0, 2)
+            .map_err(|e| MlirError::CreateOperation { err: e })?
+            .into();
+        let range = self.append_result(range, mlir_block)?;
+        let mut shape = vec![1; n_dims as usize];
+        shape[(n_dims - 1 - j) as usize] = 2;
+        let shaped = self.reshape_to(range, &shape, i32_ty, location, mlir_block)?;
+        let full: melior::ir::Type<'a> = tensor_type(&vec![2; n_dims as usize], i32_ty).into();
+        let op: Operation<'a> = broadcast(context, location, shaped, full)
+            .map_err(|e| MlirError::CreateOperation { err: e })?
+            .into();
+        self.append_result(op, mlir_block)
+    }
+
+    /// `tt.reshape` of `value` to `shape` with element type `elem`; a no-op if the shape
+    /// already matches.
+    fn reshape_to(
+        &self,
+        value: Value<'a, 'a>,
+        shape: &[i64],
+        elem: melior::ir::Type<'a>,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        let ty: melior::ir::Type<'a> = tensor_type(shape, elem).into();
+        if value.r#type() == ty {
+            return Ok(value);
+        }
+        let op = reshape(self.module.context(), location, value, ty, false, false)
+            .map_err(|e| MlirError::CreateOperation { err: e })?;
+        self.append_result(op, mlir_block)
+    }
+
+    /// The signless integer type with `elem`'s bit width (`elem` itself for integers), used to
+    /// XOR element bits as Triton's `_compare_and_swap` does.
+    fn same_width_int(&self, elem: melior::ir::Type<'a>) -> Option<melior::ir::Type<'a>> {
+        if elem.is_integer() {
+            return Some(elem);
+        }
+        let width = if elem.is_f16() || elem.is_bf16() {
+            16
+        } else if elem.is_f32() {
+            32
+        } else if elem.is_f64() {
+            64
+        } else {
+            return None;
+        };
+        Some(IntegerType::new(self.module.context(), width).into())
+    }
 
     /// `triton::Triton::histogram` — `tt.histogram`.
     pub fn codegen_histogram_call<'tcx>(
