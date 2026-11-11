@@ -562,4 +562,21 @@ mod tests {
             );
         }
     }
+
+    // teenyc-3h1: T::inline_asm_elementwise cannot be lowered from its current signature, so it
+    // must fail to compile rather than silently producing ub.poison. A codegen error panics
+    // inside rustc, and that panic reaches the test through `run_compiler`.
+    #[test]
+    #[should_panic(expected = "inline_asm_elementwise is not supported")]
+    fn test_inline_asm_elementwise_rejected() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_inline_asm.rs");
+        let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_inline_asm_elementwise");
+    }
 }

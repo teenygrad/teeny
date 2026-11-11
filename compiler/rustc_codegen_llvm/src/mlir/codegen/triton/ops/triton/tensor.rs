@@ -53,32 +53,6 @@ use crate::mlir::codegen::triton::location::span_to_location;
 use crate::mlir::codegen::triton::{BlockPtr, CodegenState, TritonCodegen};
 use crate::mlir::errors::MlirError;
 
-/// Generate a stub codegen method that ignores all args and returns `ub.poison`
-/// of the destination type (or `None` for void returns).
-macro_rules! stub_handler {
-    ($name:ident) => {
-        pub fn $name<'tcx>(
-            &self,
-            tcx: TyCtxt<'tcx>,
-            instance: &Instance<'tcx>,
-            mir: &Body<'tcx>,
-            _func: &Operand<'tcx>,
-            _func_name: &str,
-            _args: &[Spanned<Operand<'tcx>>],
-            destination: &Place<'tcx>,
-            _target: &Option<BasicBlock>,
-            _unwind: &UnwindAction,
-            _call_source: &CallSource,
-            _fn_span: &Span,
-            location: Location<'a>,
-            mlir_block: &BlockRef<'a, 'a>,
-            _state: &mut CodegenState<'a, 'a>,
-        ) -> Result<Option<Value<'a, 'a>>, MlirError> {
-            self.codegen_ub_stub(tcx, instance, mir, destination, location, mlir_block)
-        }
-    };
-}
-
 /// Which extreme an index reduction keeps.
 #[derive(Clone, Copy, Debug)]
 enum Extremum {
@@ -6375,10 +6349,33 @@ impl<'a> TritonCodegen<'a> {
         self.append_result(op, mlir_block)
     }
 
-
-    // inline_asm_elementwise requires extracting string constants from MIR which
-    // is not yet implemented.
-    stub_handler!(codegen_inline_asm_elementwise_call);
+    /// `triton::Triton::inline_asm_elementwise(asm, constraints, is_pure, pack)`. The
+    /// signature has no input tensors and no shape, so the operands and result type of
+    /// `tt.elementwise_inline_asm` cannot be derived from it; this is a compile error until
+    /// the API takes its inputs.
+    pub fn codegen_inline_asm_elementwise_call<'tcx>(
+        &self,
+        _tcx: TyCtxt<'tcx>,
+        _instance: &Instance<'tcx>,
+        _mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        _args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        _location: Location<'a>,
+        _mlir_block: &BlockRef<'a, 'a>,
+        _state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        Err(MlirError::CodegenFailed {
+            err: "inline_asm_elementwise is not supported: its signature takes no input \
+                  tensors or result shape, so `tt.elementwise_inline_asm` cannot be built"
+                .into(),
+        })
+    }
 
     /// `triton::Triton::multiple_of` / `max_contiguous` / `max_constancy` —
     /// compiler hint annotations; return the input tensor unchanged.
