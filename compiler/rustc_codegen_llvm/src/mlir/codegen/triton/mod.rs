@@ -102,6 +102,25 @@ type DescBlockShapes = HashMap<Local, Vec<i64>>;
 /// so that SwitchInt on Option<T> locals can be constant-folded during codegen.
 type ConstDiscLocals = HashMap<Local, u64>;
 
+/// A block pointer from `make_block_ptr`. Triton 3.6 removed `tt.make_tensor_ptr` and
+/// `tt.advance`, keeping block pointers purely in its frontend, so the backend does the same:
+/// a block pointer is this record rather than an MLIR value, and `advance` only adds to
+/// `offsets`. Integer entries are `i64`, as in Triton's frontend.
+#[derive(Clone)]
+pub(crate) struct BlockPtr<'c, 'p> {
+    #[expect(dead_code, reason = "read when block-pointer load/store is added to the Triton API")]
+    pub(crate) base: Value<'c, 'p>,
+    #[expect(dead_code, reason = "read when block-pointer load/store is added to the Triton API")]
+    pub(crate) shape: Vec<Value<'c, 'p>>,
+    #[expect(dead_code, reason = "read when block-pointer load/store is added to the Triton API")]
+    pub(crate) strides: Vec<Value<'c, 'p>>,
+    pub(crate) offsets: Vec<Value<'c, 'p>>,
+    #[expect(dead_code, reason = "read when block-pointer load/store is added to the Triton API")]
+    pub(crate) block_shape: Vec<i64>,
+    #[expect(dead_code, reason = "read when block-pointer load/store is added to the Triton API")]
+    pub(crate) order: Vec<i64>,
+}
+
 /// Codegen state threaded through all statement/terminator handlers.
 pub(crate) struct CodegenState<'c, 'p> {
     pub(crate) ssa_values: SsaValues<'c, 'p>,
@@ -121,6 +140,8 @@ pub(crate) struct CodegenState<'c, 'p> {
     pub(crate) slice_dyn_values: SliceDynValues<'c, 'p>,
     /// Block shapes for tensor descriptors: `desc_local → [dim0, dim1, ...]`.
     pub(crate) desc_block_shapes: DescBlockShapes,
+    /// Block pointers, which have no MLIR value (see `BlockPtr`).
+    pub(crate) block_ptrs: HashMap<Local, BlockPtr<'c, 'p>>,
     /// When generating inside a `scf.for` body: the MIR basic block that is the loop header.
     /// `codegen_goto` checks this and emits `scf.yield` instead of `cf.br` on the back edge.
     pub(crate) loop_header_bb: Option<BasicBlock>,
@@ -166,6 +187,7 @@ impl<'c, 'p> CodegenState<'c, 'p> {
             ptr_to_dyn_array: HashMap::new(),
             slice_dyn_values: HashMap::new(),
             desc_block_shapes: HashMap::new(),
+            block_ptrs: HashMap::new(),
             loop_header_bb: None,
             loop_iter_carry_locals: Vec::new(),
             loop_body_bbs: HashSet::new(),
@@ -2349,6 +2371,11 @@ impl<'a> TritonCodegen<'a> {
                             state.const_arrays.insert(place.local, elems);
                             return Ok(());
                         }
+                        // Block pointers have no SSA value either.
+                        if let Some(bp) = state.block_ptrs.get(&src.local).cloned() {
+                            state.block_ptrs.insert(place.local, bp);
+                            return Ok(());
+                        }
                         // const_array pointer copy.
                         if let Some(&arr_local) = state.ptr_to_const_array.get(&src.local) {
                             state.ptr_to_const_array.insert(place.local, arr_local);
@@ -3494,6 +3521,16 @@ impl<'a> TritonCodegen<'a> {
                     panic!("Tuple field {} not found for local {:?}", idx, place.local)
                 }));
             }
+        }
+
+        if state.block_ptrs.contains_key(&place.local) {
+            return Err(MlirError::CodegenFailed {
+                err: format!(
+                    "block pointer {:?} used as a value: a `make_block_ptr` result can only be \
+                     passed to `advance` (block-pointer load/store is not supported yet)",
+                    place.local
+                ),
+            });
         }
 
         Ok(state

@@ -379,4 +379,29 @@ mod tests {
             "no global store in PTX:\n{ptx}"
         );
     }
+
+    // teenyc-1jf: `T::make_block_ptr` / `T::advance` emitted `tt.make_tensor_ptr` / `tt.advance`,
+    // which Triton 3.6 no longer registers, so the module failed to verify.
+    #[test]
+    fn test_block_ptr() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_block_ptr.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_block_ptr");
+        assert!(result.is_ok(), "block_ptr compile failed: {:?}", result.err());
+
+        // The block pointer has no consumer, so the rest of the kernel must still compile intact.
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        for op in ["ld.global", "add.", "st.global"] {
+            assert!(
+                ptx.lines().any(|l| l.trim_start().starts_with(op)),
+                "no `{op}` instruction in PTX:\n{ptx}"
+            );
+        }
+    }
 }
