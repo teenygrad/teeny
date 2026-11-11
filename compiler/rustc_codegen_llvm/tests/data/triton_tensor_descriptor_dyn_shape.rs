@@ -36,9 +36,9 @@ macro_rules! include {
 
 include!("triton_prelude.rs");
 
-// teenyc-32u: a slice argument chosen at run time can't be resolved to per-dimension values.
-// The descriptor op must report that instead of silently emitting ub.poison (or, for the
-// store, dropping it).
+// teenyc-32u / teenyc-2m7: a slice argument chosen at run time has no single value.
+// It must be a compile error, not silently emitted ub.poison (or, for the store, a dropped
+// store) or one arm's value.
 fn copy_tile<T: Triton, D: Float>(src: T::Pointer<D>, dst: T::Pointer<D>, first: bool) {
     let chosen: &[i32] = if first { &[0, 0] } else { &[16, 32] };
     let src_desc = T::make_tensor_descriptor::<D>(src, chosen, &[64, 1], &[16, 16], None);

@@ -614,7 +614,7 @@ impl<'a> TritonCodegen<'a> {
             if let Operand::Move(p) | Operand::Copy(p) = &args[0].node {
                 if p.projection.is_empty() && destination.projection.is_empty() {
                     if let Some(fields) = state.tuple_fields.get(&p.local).cloned() {
-                        state.tuple_fields.insert(destination.local, fields);
+                        state.tuple_fields.insert(destination.local, fields)?;
                         return Ok(None);
                     }
                 }

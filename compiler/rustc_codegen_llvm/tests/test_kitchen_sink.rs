@@ -623,9 +623,10 @@ mod tests {
         assert!(ptx.contains("st.global"), "no global store in PTX:\n{ptx}");
     }
 
-    // teenyc-32u: a descriptor op whose slice argument can't be resolved (here, chosen at run
-    // time) must fail to compile; it used to emit ub.poison, or drop the store entirely. A
-    // codegen error panics inside rustc and reaches the test through `run_compiler`.
+    // teenyc-32u: a descriptor op whose slice argument is chosen at run time must fail to
+    // compile; it used to emit ub.poison, or drop the store entirely. Since teenyc-2m7 the slice
+    // local is rejected when it is recorded, before the descriptor op. A codegen error panics
+    // inside rustc and reaches the test through `run_compiler`.
     fn compile_dyn_descriptor(site: &str) {
         let _ = fmt()
             .with_env_filter(
@@ -641,20 +642,66 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "make_tensor_descriptor: cannot resolve `shape`")]
+    #[should_panic(expected = "is assigned in more than one place")]
     fn test_make_tensor_descriptor_dyn_shape_rejected() {
         compile_dyn_descriptor("shape");
     }
 
     #[test]
-    #[should_panic(expected = "load_tensor_descriptor: cannot resolve `offsets`")]
+    #[should_panic(expected = "is assigned in more than one place")]
     fn test_load_tensor_descriptor_dyn_offsets_rejected() {
         compile_dyn_descriptor("load");
     }
 
     #[test]
-    #[should_panic(expected = "store_tensor_descriptor: cannot resolve `offsets`")]
+    #[should_panic(expected = "is assigned in more than one place")]
     fn test_store_tensor_descriptor_dyn_offsets_rejected() {
         compile_dyn_descriptor("store");
+    }
+
+    // teenyc-2m7: a local with no SSA form that is assigned in more than one place must fail to
+    // compile instead of silently using one assignment's value. A codegen error panics inside
+    // rustc and reaches the test through `run_compiler`.
+    fn compile_multi_def(kind: &str) {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file =
+            env::current_dir().unwrap().join(format!("tests/data/triton_multi_def_{kind}.rs"));
+        let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", &format!("test_multi_def_{kind}"));
+    }
+
+    #[test]
+    #[should_panic(expected = "is assigned in more than one place")]
+    fn test_multi_def_const_array_rejected() {
+        compile_multi_def("const_array");
+    }
+
+    #[test]
+    #[should_panic(expected = "is assigned in more than one place")]
+    fn test_multi_def_dyn_array_rejected() {
+        compile_multi_def("dyn_array");
+    }
+
+    #[test]
+    #[should_panic(expected = "is assigned in more than one place")]
+    fn test_multi_def_block_ptr_rejected() {
+        compile_multi_def("block_ptr");
+    }
+
+    #[test]
+    #[should_panic(expected = "is assigned in more than one place")]
+    fn test_multi_def_option_rejected() {
+        compile_multi_def("option");
+    }
+
+    #[test]
+    #[should_panic(expected = "is assigned in more than one place")]
+    fn test_multi_def_tuple_rejected() {
+        compile_multi_def("tuple");
     }
 }
