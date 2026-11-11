@@ -579,4 +579,27 @@ mod tests {
         let file = env::current_dir().unwrap().join("tests/data/triton_inline_asm.rs");
         let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_inline_asm_elementwise");
     }
+
+    // teenyc-26l / teenyc-z81: reduction axes (`None`, negative, `Some(k)` on N-D) and N-D
+    // keep_dims, plus softmax's dim. A wrong axis or dropped dimension gives a result whose
+    // shape cannot be combined with the full-size tensor, which fails MLIR verification.
+    #[test]
+    fn test_reduce_axis() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_reduce_axis.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_reduce_axis");
+        assert!(result.is_ok(), "reduce_axis compile failed: {:?}", result.err());
+
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        assert!(
+            ptx.lines().any(|l| l.trim_start().starts_with("st.global")),
+            "no global store in PTX:\n{ptx}"
+        );
+    }
 }
