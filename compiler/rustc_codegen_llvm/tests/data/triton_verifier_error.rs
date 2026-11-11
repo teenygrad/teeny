@@ -37,16 +37,18 @@ macro_rules! include {
 include!("triton_prelude.rs");
 
 // Regression test for teenyc-1nq: a verifier failure has to be reported with the op, the
-// verifier's message and the source location, not just "failed to run pass". `T::reshape` with a
-// mismatched element count currently returns its input unchanged (teenyc-27y), so the 1024-element
-// tensor reaches a store through 64 pointers, which `tt.store`'s verifier rejects. If reshape
-// starts rejecting the mismatch itself, this needs another way to reach the verifier.
+// verifier's message and the source location, not just "failed to run pass". `T::join` doesn't
+// check that its operands have the same shape, so joining a 1024- and a 64-element tensor builds
+// a `tt.join` that MLIR's verifier rejects. If join starts rejecting the mismatch itself, this
+// needs another way to reach the verifier.
 fn verifier_error<T: Triton, D: Float, const BLOCK_SIZE: i32>() {
     let ptrs = T::zeros::<T::Pointer<D>>(&[BLOCK_SIZE]);
     let x = T::load::<D, 1>(ptrs, None, None, &[0], None, None, None, false);
-    let y = T::reshape(x, &[64], false);
-    let out = T::zeros::<T::Pointer<D>>(&[64]);
-    T::store::<D, 1>(out, y, None, &[0], None, None);
+    let small = T::zeros::<T::Pointer<D>>(&[64]);
+    let y = T::load::<D, 1>(small, None, None, &[0], None, None, None, false);
+    let joined = T::join(x, y);
+    let out = T::zeros::<T::Pointer<D>>(&[BLOCK_SIZE, 2]);
+    T::store::<D, 2>(out, joined, None, &[0, 1], None, None);
 }
 
 type LlvmTriton = triton::llvm::triton::LlvmTriton;

@@ -738,7 +738,7 @@ mod tests {
     // verifier's diagnostic: the op, its message and the kernel source location.
     #[test]
     #[should_panic(
-        expected = "triton_verifier_error.rs\":49:5): error: 'tt.store' op failed to verify"
+        expected = "triton_verifier_error.rs\":49:18): error: 'tt.join' op requires all operands"
     )]
     fn test_verifier_error_reported() {
         let _ = fmt()
@@ -750,6 +750,23 @@ mod tests {
         let compiler = LlvmCompiler::new();
         let file = env::current_dir().unwrap().join("tests/data/triton_verifier_error.rs");
         let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_verifier_error_reported");
+    }
+
+    // teenyc-27y: a reshape whose element count differs from its input's must fail to compile;
+    // it used to return the input unchanged. A codegen error panics inside rustc and reaches the
+    // test through `run_compiler`.
+    #[test]
+    #[should_panic(expected = "reshape from [1024] to [64]")]
+    fn test_reshape_numel_mismatch_rejected() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_reshape_numel_mismatch.rs");
+        let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_reshape_numel_mismatch");
     }
 
     // teenyc-32u: a descriptor op whose slice argument is chosen at run time must fail to
