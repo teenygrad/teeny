@@ -1547,12 +1547,15 @@ impl<'a> TritonCodegen<'a> {
         let src_numel: i64 = src_dims.iter().product();
         let dst_numel: i64 = shape.iter().product();
 
-        // Guard: total element counts must match (unless dims are dynamic).
+        // Total element counts must match (unless dims are dynamic). Returning `src` unchanged
+        // instead would compile a wrong-shaped tensor that only fails later, if at all.
         if src_numel != dst_numel && src_numel > 0 && dst_numel > 0 {
-            eprintln!(
-                "[WARN] reshape: element count mismatch {src_numel} vs {dst_numel}; returning src unchanged"
-            );
-            return Ok(Some(src));
+            return Err(MlirError::CodegenFailed {
+                err: format!(
+                    "reshape from {src_dims:?} to {shape:?} changes the element count \
+                     ({src_numel} vs {dst_numel})"
+                ),
+            });
         }
 
         let result_ty = tensor_type(&shape, elem_ty).into();
