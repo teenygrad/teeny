@@ -445,7 +445,7 @@ mod tests {
     // the unsigned instruction for every op, and no signed instruction for an op whose operands
     // are all unsigned. An entry `a|b` matches either instruction: LLVM may invert a branch
     // condition, so `n < m` can become `setp.ge`.
-    fn compile_unsigned(name: &str, expected: &[&str], forbidden: &[&str]) {
+    fn compile_and_check_ptx(name: &str, expected: &[&str], forbidden: &[&str]) {
         let _ = fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn test_unsigned_tensor_ops() {
-        compile_unsigned(
+        compile_and_check_ptx(
             "unsigned_tensor",
             &[
                 "div.u32",
@@ -489,10 +489,22 @@ mod tests {
 
     #[test]
     fn test_unsigned_scalar_ops() {
-        compile_unsigned(
+        compile_and_check_ptx(
             "unsigned_scalar",
             &["div.u32", "rem.u32", "setp.lt.u32|setp.ge.u32", "cvt.rn.f32.u32", "cvt.rzi.u32.f32"],
             &["div.s32", "rem.s32", "setp.lt.s32|setp.ge.s32", "cvt.rn.f32.s32", "cvt.rzi.s32.f32"],
+        );
+    }
+
+    // teenyc-2o5: scalar int-to-int casts kept the source width. The kernel only verifies when
+    // each cast produces its destination width; the extensions must also take the source's
+    // signedness.
+    #[test]
+    fn test_scalar_int_casts() {
+        compile_and_check_ptx(
+            "scalar_int_casts",
+            &["cvt.s64.s32", "cvt.u64.u32", "st.global.b8|st.global.u8"],
+            &["cvt.u64.s32", "cvt.s64.u32"],
         );
     }
 
