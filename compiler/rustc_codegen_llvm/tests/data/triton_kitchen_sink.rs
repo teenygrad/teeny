@@ -237,7 +237,6 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32, const USE_BIAS: bool
     let _randn = T::randn(123, r, 10);
     let _randi = T::randint(123, r, 10);
     let _rand4 = T::randint4x(123, r, 10);
-    let _asm = T::inline_asm_elementwise::<D>("", "", true, 1);
     let mo = T::multiple_of(dr, &[1]);
     let mc = T::max_contiguous(mo, &[1]);
     let mconst = T::max_constancy(mc, &[1]);
