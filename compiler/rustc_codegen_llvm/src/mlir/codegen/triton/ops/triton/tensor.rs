@@ -512,6 +512,10 @@ impl<'a> TritonCodegen<'a> {
             state,
         )?;
 
+        // arith.maximumf requires both operands to have the result type, so a keep-dims
+        // reduction (tensor<1xf32>) against a full tile has to be broadcast first.
+        let (lhs, rhs) = self.maybe_broadcast_pair(location, lhs, rhs, mlir_block)?;
+
         // arith.maximumf for element-wise float maximum (works on scalars and tensors).
         let result_ty = lhs.r#type();
         let max_op: Operation<'a> = OperationBuilder::new("arith.maximumf", location)
@@ -3817,6 +3821,8 @@ impl<'a> TritonCodegen<'a> {
             mlir_block,
             state,
         )?;
+        // Same constraint as codegen_maximum: operands must share the result type.
+        let (lhs, rhs) = self.maybe_broadcast_pair(location, lhs, rhs, mlir_block)?;
         let elem = self.elem_ty(lhs);
         let op_name = Self::choose_float_int_op(elem, "arith.minimumf", "arith.minsi");
         let result_ty = lhs.r#type();
