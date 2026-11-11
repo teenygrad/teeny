@@ -5853,12 +5853,274 @@ impl<'a> TritonCodegen<'a> {
         Ok(Some(result.into()))
     }
 
-    // rand/randn/randint/randint4x use Triton's Philox RNG which requires
-    // special argument handling; kept as stubs.
-    stub_handler!(codegen_rand_call);
-    stub_handler!(codegen_randn_call);
-    stub_handler!(codegen_randint_call);
-    stub_handler!(codegen_randint4x_call);
+    // =========================================================================
+    // Random numbers (Philox), following python/triton/language/random.py
+    // =========================================================================
+
+    /// `triton::Triton::randint4x(seed, offsets, n_rounds)`: the four Philox output streams.
+    pub fn codegen_randint4x_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        let streams = self.philox_streams(tcx, instance, mir, args, location, mlir_block, state)?;
+        state.tuple_fields.insert(destination.local, streams.to_vec());
+        Ok(None)
+    }
+
+    /// `triton::Triton::randint(seed, offsets, n_rounds)`: the first Philox stream.
+    pub fn codegen_randint_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        let [c0, ..] = self.philox_streams(tcx, instance, mir, args, location, mlir_block, state)?;
+        Ok(Some(c0))
+    }
+
+    /// `triton::Triton::rand(seed, offsets, n_rounds)`: uniform `f32` in [0, 1).
+    pub fn codegen_rand_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        let [c0, ..] = self.philox_streams(tcx, instance, mir, args, location, mlir_block, state)?;
+        self.uint_to_uniform_float(c0, location, mlir_block).map(Some)
+    }
+
+    /// `triton::Triton::randn(seed, offsets, n_rounds)`: standard-normal `f32`, by Box-Muller
+    /// on the first two Philox streams (Triton's `pair_uniform_to_normal`).
+    pub fn codegen_randn_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        let [c0, c1, ..] =
+            self.philox_streams(tcx, instance, mir, args, location, mlir_block, state)?;
+        let u1 = self.uint_to_uniform_float(c0, location, mlir_block)?;
+        let u2 = self.uint_to_uniform_float(c1, location, mlir_block)?;
+        let ty = u1.r#type();
+        let emit = |op: Operation<'a>| self.append_result(op, mlir_block);
+        let unary = |name: &str, x: Value<'a, 'a>| {
+            OperationBuilder::new(name, location)
+                .add_operands(&[x])
+                .add_results(&[ty])
+                .build()
+                .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })
+        };
+        let min_u1 = self.splat_f32(1.0e-7, ty, location, mlir_block)?;
+        let u1 = emit(
+            OperationBuilder::new("arith.maximumf", location)
+                .add_operands(&[min_u1, u1])
+                .add_results(&[ty])
+                .build()
+                .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?,
+        )?;
+        let two_pi = self.splat_f32(std::f32::consts::TAU, ty, location, mlir_block)?;
+        let theta = emit(melior::dialect::arith::mulf(two_pi, u2, location))?;
+        let minus_two = self.splat_f32(-2.0, ty, location, mlir_block)?;
+        let log_u1 = emit(unary("math.log", u1)?)?;
+        let r = emit(unary("math.sqrt", emit(melior::dialect::arith::mulf(minus_two, log_u1, location))?)?)?;
+        let cos_theta = emit(unary("math.cos", theta)?)?;
+        emit(melior::dialect::arith::mulf(r, cos_theta, location)).map(Some)
+    }
+
+    /// Runs Philox-4x32 (Triton's `randint4x` -> `philox` -> `philox_impl`) and returns the
+    /// four `i32` streams. With a 32-bit seed and 32-bit offsets the key is `(seed, 0)` and the
+    /// counter `(offsets, 0, 0, 0)`; the `n_rounds` rounds are unrolled, as Triton does.
+    fn philox_streams<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        args: &[Spanned<Operand<'tcx>>],
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<[Value<'a, 'a>; 4], MlirError> {
+        use melior::dialect::arith::{addi, muli, xori};
+
+        const KEY_A: u32 = 0x9E37_79B9;
+        const KEY_B: u32 = 0xBB67_AE85;
+        const ROUND_A: u32 = 0xD251_1F53;
+        const ROUND_B: u32 = 0xCD9E_8D57;
+
+        let fail = |err: String| MlirError::CodegenFailed { err: format!("philox: {err}") };
+        if args.len() != 3 {
+            return Err(fail(format!("expected 3 arguments, got {}", args.len())));
+        }
+        let mut operand = |i: usize| {
+            self.codegen_operand(
+                tcx,
+                instance,
+                &args[i].node,
+                args[i].node.ty(mir, tcx),
+                location,
+                mlir_block,
+                state,
+            )
+        };
+        let seed = operand(0)?;
+        let offsets = operand(1)?;
+        let n_rounds = self
+            .to_scalar_int(tcx, instance, &args[2].node)
+            .ok()
+            .and_then(|s| u32::try_from(s.to_i32()).ok())
+            .ok_or_else(|| fail("`n_rounds` must be a non-negative compile-time constant".into()))?;
+
+        let ty = offsets.r#type();
+        let emit = |op: Operation<'a>| self.append_result(op, mlir_block);
+        let splat_const = |v: u32| self.splat_i32(v, ty, location, mlir_block);
+        let seed_splat: Operation<'a> = splat(self.module.context(), location, seed, ty)
+            .map_err(|e| MlirError::CreateOperation { err: e })?
+            .into();
+        let (mut k0, mut k1) = (emit(seed_splat)?, splat_const(0)?);
+        let zero = splat_const(0)?;
+        let (mut c0, mut c1, mut c2, mut c3) = (offsets, zero, zero, zero);
+        let (round_a, round_b) = (splat_const(ROUND_A)?, splat_const(ROUND_B)?);
+        let (key_a, key_b) = (splat_const(KEY_A)?, splat_const(KEY_B)?);
+        let umulhi = |x, y| -> Result<Value<'a, 'a>, MlirError> {
+            let op: Operation<'a> = mulhiui(self.module.context(), location, x, y)
+                .map_err(|e| MlirError::CreateOperation { err: e })?
+                .into();
+            emit(op)
+        };
+        for _ in 0..n_rounds {
+            let (old_c0, old_c2) = (c0, c2);
+            c0 = emit(xori(emit(xori(umulhi(round_b, old_c2)?, c1, location))?, k0, location))?;
+            c2 = emit(xori(emit(xori(umulhi(round_a, old_c0)?, c3, location))?, k1, location))?;
+            c1 = emit(muli(round_b, old_c2, location))?;
+            c3 = emit(muli(round_a, old_c0, location))?;
+            k0 = emit(addi(k0, key_a, location))?;
+            k1 = emit(addi(k1, key_b, location))?;
+        }
+        Ok([c0, c1, c2, c3])
+    }
+
+    /// Triton's `uint_to_uniform_float` for 32-bit input: fold negative values onto
+    /// non-negative ones with `~x`, then scale by the largest factor keeping `MAX_INT * scale`
+    /// below 1.0.
+    fn uint_to_uniform_float(
+        &self,
+        x: Value<'a, 'a>,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        use melior::dialect::arith::{CmpiPredicate, cmpi, mulf, select, sitofp, xori};
+
+        let context = self.module.context();
+        let ty = x.r#type();
+        let emit = |op: Operation<'a>| self.append_result(op, mlir_block);
+        let zero = self.splat_i32(0, ty, location, mlir_block)?;
+        let all_ones = self.splat_i32(u32::MAX, ty, location, mlir_block)?;
+        let negative = emit(cmpi(context, CmpiPredicate::Slt, x, zero, location))?;
+        let flipped = emit(xori(x, all_ones, location))?;
+        let folded = emit(select(negative, flipped, x, location))?;
+        let dims = RankedTensorType::try_from(ty).ok().and_then(|t| t.dims().ok()).ok_or_else(|| {
+            MlirError::CodegenFailed { err: format!("philox: offsets are not a ranked tensor: {ty}") }
+        })?;
+        let f32_ty = tensor_type(&dims, melior::ir::r#type::Type::float32(context)).into();
+        let as_float = emit(sitofp(folded, f32_ty, location))?;
+        let scale = self.splat_f32(4.656_612_734_2e-10, f32_ty, location, mlir_block)?;
+        emit(mulf(as_float, scale, location))
+    }
+
+    /// Appends `op` and returns its single result.
+    fn append_result(
+        &self,
+        op: Operation<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        let op = mlir_block.append_operation(op);
+        Ok(op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into())
+    }
+
+    /// An `i32` constant (given as its bit pattern) splatted to the tensor type `ty`.
+    fn splat_i32(
+        &self,
+        value: u32,
+        ty: melior::ir::Type<'a>,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        let context = self.module.context();
+        let scalar: Operation<'a> = create_int_constant(context, location, Int::I32(value))
+            .map_err(|e| MlirError::CreateOperation { err: e })?
+            .into();
+        let scalar = self.append_result(scalar, mlir_block)?;
+        let op: Operation<'a> = splat(context, location, scalar, ty)
+            .map_err(|e| MlirError::CreateOperation { err: e })?
+            .into();
+        self.append_result(op, mlir_block)
+    }
+
+    /// An `f32` constant splatted to the tensor type `ty`.
+    fn splat_f32(
+        &self,
+        value: f32,
+        ty: melior::ir::Type<'a>,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        let context = self.module.context();
+        let f32_ty = melior::ir::r#type::Type::float32(context);
+        let attr = FloatAttribute::new(context, f32_ty, f64::from(value));
+        let scalar =
+            self.append_result(melior::dialect::arith::constant(context, attr.into(), location), mlir_block)?;
+        let op: Operation<'a> = splat(context, location, scalar, ty)
+            .map_err(|e| MlirError::CreateOperation { err: e })?
+            .into();
+        self.append_result(op, mlir_block)
+    }
+
 
     // inline_asm_elementwise requires extracting string constants from MIR which
     // is not yet implemented.

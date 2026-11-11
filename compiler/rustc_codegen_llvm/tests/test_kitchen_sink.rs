@@ -514,4 +514,28 @@ mod tests {
             assert!(count(op) > 0, "no `{op}` instruction in PTX:\n{ptx}");
         }
     }
+
+    // teenyc-1k4: T::rand / randn / randint / randint4x were stubs emitting ub.poison.
+    #[test]
+    fn test_philox() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_philox.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_philox");
+        assert!(result.is_ok(), "philox compile failed: {:?}", result.err());
+
+        // Philox rounds are high multiplies and xors; rand converts the int to float.
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        for op in ["mul.hi.u32", "xor.b32", "cvt.rn.f32.s32", "st.global"] {
+            assert!(
+                ptx.lines().any(|l| l.trim_start().starts_with(op)),
+                "no `{op}` instruction in PTX:\n{ptx}"
+            );
+        }
+    }
 }
