@@ -4006,83 +4006,54 @@ impl<'a> TritonCodegen<'a> {
         })?;
         let dims = x_ty.dims().map_err(|e| MlirError::InvalidType { msg: e.to_string() })?;
         let elem_ty = x_ty.element();
-        // axis = last dimension
-        let axis = (dims.len() as i32) - 1;
+        // Triton's softmax treats `dim = None` as axis 0. Its output always has `x`'s shape, so
+        // the reductions keep their axis and are broadcast back regardless of `keep_dims`.
+        let axis =
+            self.reduce_axis_arg(tcx, instance, mir, &args[1].node, state, dims.len())?.unwrap_or(0);
         let tensor_ty: melior::ir::Type<'a> = x.r#type();
+        let binary = |name: &str, lhs: Value<'a, 'a>, rhs: Value<'a, 'a>| {
+            OperationBuilder::new(name, location)
+                .add_operands(&[lhs, rhs])
+                .add_results(&[tensor_ty])
+                .build()
+                .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })
+        };
 
-        // --- x_max = reduce(x, arith.maximumf, axis) → scalar ---
-        let max_region = self.build_reduce_region(location, elem_ty, "arith.maximumf");
-        let max_result_ty = self.reduce_result_ty(x, axis);
-        let max_op: Operation<'a> =
-            reduce(self.module.context(), location, &[x], &[max_result_ty], axis, max_region)
-                .map_err(|e| MlirError::CreateOperation { err: e })?
-                .into();
-        let x_max: Value<'a, 'a> =
-            max_op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
-        mlir_block.append_operation(max_op);
-
-        // --- splat x_max → tensor<Nxf32> ---
-        let splat_max_op: Operation<'a> = splat(self.module.context(), location, x_max, tensor_ty)
-            .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?
-            .into();
-        let x_max_bcast: Value<'a, 'a> = splat_max_op
-            .result(0)
-            .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?
-            .into();
-        mlir_block.append_operation(splat_max_op);
-
-        // --- x_sub = x - x_max_bcast ---
-        let sub_op: Operation<'a> = OperationBuilder::new("arith.subf", location)
-            .add_operands(&[x, x_max_bcast])
-            .add_results(&[tensor_ty])
-            .build()
-            .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
-        let x_sub: Value<'a, 'a> =
-            sub_op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
-        mlir_block.append_operation(sub_op);
-
-        // --- exp_x = math.exp(x_sub) ---
-        let exp_op: Operation<'a> = OperationBuilder::new("math.exp", location)
+        let x_max = self.reduce_broadcast(x, axis, elem_ty, "arith.maximumf", location, mlir_block)?;
+        let x_sub = self.append_result(binary("arith.subf", x, x_max)?, mlir_block)?;
+        let exp_op = OperationBuilder::new("math.exp", location)
             .add_operands(&[x_sub])
             .add_results(&[tensor_ty])
             .build()
             .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
-        let exp_x: Value<'a, 'a> =
-            exp_op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
-        mlir_block.append_operation(exp_op);
+        let exp_x = self.append_result(exp_op, mlir_block)?;
+        let sum_e = self.reduce_broadcast(exp_x, axis, elem_ty, "arith.addf", location, mlir_block)?;
+        self.append_result(binary("arith.divf", exp_x, sum_e)?, mlir_block).map(Some)
+    }
 
-        // --- sum_e = reduce(exp_x, arith.addf, axis) → scalar ---
-        let sum_region = self.build_reduce_region(location, elem_ty, "arith.addf");
-        let sum_result_ty = self.reduce_result_ty(exp_x, axis);
-        let sum_op: Operation<'a> =
-            reduce(self.module.context(), location, &[exp_x], &[sum_result_ty], axis, sum_region)
+    /// Reduces `x` along `axis` with `combine_op` and broadcasts the result back to `x`'s
+    /// shape, as `x - max(x, axis, keep_dims=True)` does in Triton.
+    fn reduce_broadcast(
+        &self,
+        x: Value<'a, 'a>,
+        axis: i32,
+        elem: melior::ir::Type<'a>,
+        combine_op: &str,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        let context = self.module.context();
+        let region = self.build_reduce_region(location, elem, combine_op);
+        let op: Operation<'a> =
+            reduce(context, location, &[x], &[self.reduce_result_ty(x, axis)], axis, region)
                 .map_err(|e| MlirError::CreateOperation { err: e })?
                 .into();
-        let sum_e: Value<'a, 'a> =
-            sum_op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
-        mlir_block.append_operation(sum_op);
-
-        // --- splat sum_e → tensor<Nxf32> ---
-        let splat_sum_op: Operation<'a> = splat(self.module.context(), location, sum_e, tensor_ty)
-            .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?
+        let reduced = self.append_result(op, mlir_block)?;
+        let kept = self.keep_reduced_dim(location, x, axis, reduced, mlir_block)?;
+        let op: Operation<'a> = broadcast(context, location, kept, x.r#type())
+            .map_err(|e| MlirError::CreateOperation { err: e })?
             .into();
-        let sum_e_bcast: Value<'a, 'a> = splat_sum_op
-            .result(0)
-            .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?
-            .into();
-        mlir_block.append_operation(splat_sum_op);
-
-        // --- y = exp_x / sum_e_bcast ---
-        let div_op: Operation<'a> = OperationBuilder::new("arith.divf", location)
-            .add_operands(&[exp_x, sum_e_bcast])
-            .add_results(&[tensor_ty])
-            .build()
-            .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
-        let y: Value<'a, 'a> =
-            div_op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
-        mlir_block.append_operation(div_op);
-
-        Ok(Some(y))
+        self.append_result(op, mlir_block)
     }
 
     // =========================================================================
@@ -4507,39 +4478,85 @@ impl<'a> TritonCodegen<'a> {
             mlir_block,
             state,
         )?;
-        let axis = if args.len() > 1 {
-            self.to_scalar_int(tcx, instance, &args[1].node).map(|s| s.to_i32()).unwrap_or(0)
-        } else {
-            0
+        if args.len() != 3 {
+            return Err(MlirError::CodegenFailed {
+                err: format!("reduction: expected 3 arguments, got {}", args.len()),
+            });
+        }
+        let src_dims = Self::ranked_dims(src)?;
+        let axis = self.reduce_axis_arg(tcx, instance, mir, &args[1].node, state, src_dims.len())?;
+        let keep_dims = self.const_bool_arg(tcx, instance, &args[2].node);
+
+        // Triton reduces `axis = None` over every element: flatten (order is irrelevant to a
+        // reduction, so reordering is allowed) and reduce the single axis.
+        let (input, axis) = match axis {
+            Some(axis) => (src, axis),
+            None => {
+                let numel = src_dims.iter().product::<i64>();
+                let flat = self.reshape_with(src, &[numel], self.elem_ty(src), true, location, mlir_block)?;
+                (flat, 0)
+            }
         };
-        // args[2] is keep_dims: bool — true means retain the reduced axis as size 1.
-        // Use to_bits_unchecked() because bool is 1 byte and to_i32() would panic.
-        let keep_dims = args.len() > 2
-            && self
-                .to_scalar_int(tcx, instance, &args[2].node)
-                .map(|s| s.to_bits_unchecked() != 0)
-                .unwrap_or(false);
-        let elem = self.elem_ty(src);
+        let elem = self.elem_ty(input);
         let combine_op = Self::choose_float_int_op(elem, combine_op_float, combine_op_int);
         let region = self.build_reduce_region(location, elem, combine_op);
-        let result_ty = self.reduce_result_ty(src, axis);
+        let result_ty = self.reduce_result_ty(input, axis);
         let op: Operation<'a> =
-            reduce(self.module.context(), location, &[src], &[result_ty], axis, region)
+            reduce(self.module.context(), location, &[input], &[result_ty], axis, region)
                 .map_err(|e| MlirError::CreateOperation { err: e })?
                 .into();
-        let result = op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
-        mlir_block.append_operation(op);
-        let result_val: Value<'a, 'a> = result.into();
-        if keep_dims {
+        let result_val = self.append_result(op, mlir_block)?;
+        if !keep_dims {
+            return Ok(Some(result_val));
+        }
+        if input == src {
             return self.keep_reduced_dim(location, src, axis, result_val, mlir_block).map(Some);
         }
-        Ok(Some(result_val))
+        // `None` with keep_dims: every axis is kept with extent 1.
+        let kept_ty = tensor_type(&vec![1; src_dims.len()], elem).into();
+        let op: Operation<'a> = splat(self.module.context(), location, result_val, kept_ty)
+            .map_err(|e| MlirError::CreateOperation { err: e })?
+            .into();
+        self.append_result(op, mlir_block).map(Some)
     }
 
-    /// Applies `keep_dims` to a `tt.reduce` result. When the reduction dropped every axis
-    /// (scalar result), splat the scalar back into a rank-preserving tensor with 1 at the
-    /// reduced axis position. Example: reduce tensor<128xf32> axis=0 → f32; keep_dims →
-    /// tensor<1xf32>.
+    /// The dimensions of a ranked tensor value.
+    fn ranked_dims(value: Value<'a, 'a>) -> Result<Vec<i64>, MlirError> {
+        RankedTensorType::try_from(value.r#type()).ok().and_then(|t| t.dims().ok()).ok_or_else(
+            || MlirError::CodegenFailed {
+                err: format!("expected a ranked tensor, got {}", value.r#type()),
+            },
+        )
+    }
+
+    /// A reduction's `Option<i32>` axis for a rank-`rank` source: `None` stays `None` (reduce
+    /// every element), and a negative axis counts from the end, as in Triton's `_wrap_axis`.
+    fn reduce_axis_arg<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        operand: &Operand<'tcx>,
+        state: &CodegenState<'a, 'a>,
+        rank: usize,
+    ) -> Result<Option<i32>, MlirError> {
+        let Some(axis) = self.const_option_i32(tcx, instance, mir, operand, state)? else {
+            return Ok(None);
+        };
+        let rank = rank as i32;
+        let wrapped = if axis < 0 { axis + rank } else { axis };
+        if !(0..rank).contains(&wrapped) {
+            return Err(MlirError::CodegenFailed {
+                err: format!("reduction axis {axis} is out of range for a rank-{rank} tensor"),
+            });
+        }
+        Ok(Some(wrapped))
+    }
+
+    /// Applies `keep_dims` to a `tt.reduce` result along `axis`: the result gets `src`'s shape
+    /// with extent 1 at `axis`. A scalar result (1-D source) is splatted to that shape and a
+    /// tensor result has the axis re-inserted with `tt.expand_dims`. Example: reduce
+    /// tensor<128x4xf32> axis=1 → tensor<128xf32>; keep_dims → tensor<128x1xf32>.
     fn keep_reduced_dim(
         &self,
         location: Location<'a>,
@@ -4548,27 +4565,31 @@ impl<'a> TritonCodegen<'a> {
         result_val: Value<'a, 'a>,
         mlir_block: &BlockRef<'a, 'a>,
     ) -> Result<Value<'a, 'a>, MlirError> {
-        if result_val.r#type().is_tensor() {
-            return Ok(result_val);
-        }
-        let Some(src_dims) =
-            RankedTensorType::try_from(src.r#type()).ok().and_then(|t| t.dims().ok())
-        else {
-            return Ok(result_val);
+        let mut kept_shape = Self::ranked_dims(src)?;
+        let slot = usize::try_from(axis)
+            .ok()
+            .filter(|&a| a < kept_shape.len())
+            .ok_or_else(|| MlirError::CodegenFailed {
+                err: format!("keep_dims: axis {axis} out of range for {}", src.r#type()),
+            })?;
+        kept_shape[slot] = 1;
+        let elem = if result_val.r#type().is_tensor() {
+            self.elem_ty(result_val)
+        } else {
+            result_val.r#type()
         };
-        let kept_shape: Vec<i64> = src_dims
-            .iter()
-            .enumerate()
-            .map(|(i, &d)| if i as i32 == axis { 1 } else { d })
-            .collect();
-        let target_ty = tensor_type(&kept_shape, result_val.r#type()).into();
-        let splat_op: Operation<'a> = splat(self.module.context(), location, result_val, target_ty)
-            .map_err(|e| MlirError::CreateOperation { err: e })?
-            .into();
-        let splat_result =
-            splat_op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
-        mlir_block.append_operation(splat_op);
-        Ok(splat_result)
+        let target_ty = tensor_type(&kept_shape, elem).into();
+        let context = self.module.context();
+        let op: Operation<'a> = if result_val.r#type().is_tensor() {
+            expand_dims(context, location, result_val, axis, target_ty)
+                .map_err(|e| MlirError::CreateOperation { err: e })?
+                .into()
+        } else {
+            splat(context, location, result_val, target_ty)
+                .map_err(|e| MlirError::CreateOperation { err: e })?
+                .into()
+        };
+        self.append_result(op, mlir_block)
     }
 
     /// `triton::Triton::sum` — reduction sum.
@@ -5313,11 +5334,25 @@ impl<'a> TritonCodegen<'a> {
         location: Location<'a>,
         mlir_block: &BlockRef<'a, 'a>,
     ) -> Result<Value<'a, 'a>, MlirError> {
+        self.reshape_with(value, shape, elem, false, location, mlir_block)
+    }
+
+    /// `reshape_to` with an explicit `allow_reorder`, which lets Triton pick any element
+    /// order (fine when the consumer, such as a reduction, does not depend on it).
+    fn reshape_with(
+        &self,
+        value: Value<'a, 'a>,
+        shape: &[i64],
+        elem: melior::ir::Type<'a>,
+        allow_reorder: bool,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
         let ty: melior::ir::Type<'a> = tensor_type(shape, elem).into();
         if value.r#type() == ty {
             return Ok(value);
         }
-        let op = reshape(self.module.context(), location, value, ty, false, false)
+        let op = reshape(self.module.context(), location, value, ty, allow_reorder, false)
             .map_err(|e| MlirError::CreateOperation { err: e })?;
         self.append_result(op, mlir_block)
     }
