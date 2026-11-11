@@ -165,7 +165,8 @@ impl<'a> TritonCodegen<'a> {
             state,
         )?;
 
-        self.codegen_div(tcx, location, lhs, rhs, mlir_block)
+        let unsigned = Self::is_unsigned(tcx, instance, arg0.ty(mir, tcx));
+        self.codegen_div(tcx, unsigned, location, lhs, rhs, mlir_block)
     }
 
     pub fn codegen_and_call<'tcx>(
@@ -386,7 +387,8 @@ impl<'a> TritonCodegen<'a> {
             state,
         )?;
 
-        self.codegen_cmpi(tcx, Predicate::SLT, location, lhs, rhs, mlir_block)
+        let unsigned = Self::is_unsigned(tcx, instance, arg0.ty(mir, tcx));
+        self.codegen_cmpi(tcx, Predicate::SLT.for_signedness(unsigned), location, lhs, rhs, mlir_block)
     }
 
     pub fn codegen_cmpi<'tcx>(
@@ -521,7 +523,8 @@ impl<'a> TritonCodegen<'a> {
         if elem_ty.is_float() {
             self.codegen_cmpf(tcx, fp_pred, location, lhs, rhs, mlir_block)
         } else {
-            self.codegen_cmpi(tcx, int_pred, location, lhs, rhs, mlir_block)
+            let unsigned = Self::is_unsigned(tcx, instance, arg0.ty(mir, tcx));
+            self.codegen_cmpi(tcx, int_pred.for_signedness(unsigned), location, lhs, rhs, mlir_block)
         }
     }
 
@@ -1134,9 +1137,11 @@ impl<'a> TritonCodegen<'a> {
         Ok(Some(result.into()))
     }
 
+    /// Division; `unsigned` selects `divui` over `divsi` for integers.
     pub fn codegen_div<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
+        unsigned: bool,
         location: Location<'a>,
         lhs: Value<'a, 'a>,
         rhs: Value<'a, 'a>,
@@ -1154,9 +1159,7 @@ impl<'a> TritonCodegen<'a> {
             (false, true) => (self.like_tensor(tcx, location, rhs, lhs, mlir_block)?, rhs),
             (false, false) => {
                 if lhs_ty.is_integer() {
-                    let div_op: Operation<'a> =
-                        create_divsi(self.module.context(), location, lhs, rhs)
-                            .map_err(|e| MlirError::CreateOperation { err: e })?;
+                    let div_op = self.create_int_div(unsigned, location, lhs, rhs)?;
                     let result = div_op.result(0).expect("Div operation result not found");
                     mlir_block.append_operation(div_op);
                     return Ok(Some(result.into()));
@@ -1181,8 +1184,7 @@ impl<'a> TritonCodegen<'a> {
 
         let div_op: Operation<'a> =
             if lhs_ty.element().is_integer() && rhs_ty.element().is_integer() {
-                create_divsi(self.module.context(), location, lhs, rhs)
-                    .map_err(|e| MlirError::CreateOperation { err: e })?
+                self.create_int_div(unsigned, location, lhs, rhs)?
             } else {
                 create_divf(self.module.context(), location, lhs, rhs)
                     .map_err(|e| MlirError::CreateOperation { err: e })?
@@ -1193,9 +1195,26 @@ impl<'a> TritonCodegen<'a> {
         Ok(Some(result.into()))
     }
 
+    fn create_int_div(
+        &self,
+        unsigned: bool,
+        location: Location<'a>,
+        lhs: Value<'a, 'a>,
+        rhs: Value<'a, 'a>,
+    ) -> Result<Operation<'a>, MlirError> {
+        if unsigned {
+            Ok(melior::dialect::arith::divui(lhs, rhs, location))
+        } else {
+            create_divsi(self.module.context(), location, lhs, rhs)
+                .map_err(|e| MlirError::CreateOperation { err: e })
+        }
+    }
+
+    /// Remainder; `unsigned` selects `remui` over `remsi`.
     pub fn codegen_rem<'tcx>(
         &self,
         _tcx: TyCtxt<'tcx>,
+        unsigned: bool,
         location: Location<'a>,
         lhs: Value<'a, 'a>,
         rhs: Value<'a, 'a>,
@@ -1206,8 +1225,12 @@ impl<'a> TritonCodegen<'a> {
             todo!("TritonCodegen::codegen_rem tensor not yet supported")
         }
         if lhs_ty.is_integer() {
-            let rem_op: Operation<'a> = create_remsi(self.module.context(), location, lhs, rhs)
-                .map_err(|e| MlirError::CreateOperation { err: e })?;
+            let rem_op: Operation<'a> = if unsigned {
+                melior::dialect::arith::remui(lhs, rhs, location)
+            } else {
+                create_remsi(self.module.context(), location, lhs, rhs)
+                    .map_err(|e| MlirError::CreateOperation { err: e })?
+            };
             let result = rem_op.result(0).expect("Rem operation result not found");
             mlir_block.append_operation(rem_op);
             return Ok(Some(result.into()));

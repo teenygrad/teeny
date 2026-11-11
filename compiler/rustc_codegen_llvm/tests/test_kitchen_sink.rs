@@ -441,6 +441,61 @@ mod tests {
         }
     }
 
+    // teenyc-1qz: integer ops on unsigned values used the signed op. Each kernel has to produce
+    // the unsigned instruction for every op, and no signed instruction for an op whose operands
+    // are all unsigned. An entry `a|b` matches either instruction: LLVM may invert a branch
+    // condition, so `n < m` can become `setp.ge`.
+    fn compile_unsigned(name: &str, expected: &[&str], forbidden: &[&str]) {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join(format!("tests/data/triton_{name}.rs"));
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", &format!("test_{name}"));
+        assert!(result.is_ok(), "{name} compile failed: {:?}", result.err());
+
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        let has = |ops: &str| {
+            ops.split('|').any(|op| ptx.lines().any(|l| l.trim_start().starts_with(op)))
+        };
+        let missing: Vec<_> = expected.iter().filter(|op| !has(op)).collect();
+        let present: Vec<_> = forbidden.iter().filter(|op| has(op)).collect();
+        assert!(
+            missing.is_empty() && present.is_empty(),
+            "missing {missing:?}, unexpected {present:?} in PTX:\n{ptx}"
+        );
+    }
+
+    #[test]
+    fn test_unsigned_tensor_ops() {
+        compile_unsigned(
+            "unsigned_tensor",
+            &[
+                "div.u32",
+                "setp.lt.u32",
+                "max.u32",
+                "min.u32",
+                "cvt.rn.f32.u32",
+                "cvt.rzi.u32.f32",
+                "cvt.u32.u16",
+                "cvt.s32.s16",
+            ],
+            &["div.s32", "setp.lt.s32", "max.s32", "min.s32", "cvt.rn.f32.s32", "cvt.rzi.s32.f32"],
+        );
+    }
+
+    #[test]
+    fn test_unsigned_scalar_ops() {
+        compile_unsigned(
+            "unsigned_scalar",
+            &["div.u32", "rem.u32", "setp.lt.u32|setp.ge.u32", "cvt.rn.f32.u32", "cvt.rzi.u32.f32"],
+            &["div.s32", "rem.s32", "setp.lt.s32|setp.ge.s32", "cvt.rn.f32.s32", "cvt.rzi.s32.f32"],
+        );
+    }
+
     // teenyc-1at: argmax / argmin / max_with_indices / min_with_indices were stubs emitting
     // ub.poison, so their results were garbage.
     #[test]
