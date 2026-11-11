@@ -38,9 +38,9 @@ use rustc_mlir::triton::program::{ProgramAxis, create_get_num_programs};
 use rustc_target::spec::Arch;
 use rustc_mlir::triton::tensor::{
     CacheModifier, EvictionPolicy, InputPrecision, MemSemantic, MemSyncScope, PropagateNan, RmwOp,
-    ScaleDotElemType, add_ptr, advance, assert_op, atomic_cas, atomic_rmw, broadcast, clampf,
+    ScaleDotElemType, add_ptr, assert_op, atomic_cas, atomic_rmw, broadcast, clampf,
     descriptor_load, descriptor_store, dot, dot_scaled, expand_dims, gather, histogram, join, load,
-    make_range, make_tensor_descriptor, make_tensor_ptr, mulhiui, precise_divf, precise_sqrt,
+    make_range, make_tensor_descriptor, mulhiui, precise_divf, precise_sqrt,
     print as triton_print, reduce, reduce_return, reshape, scan, scan_return, splat, split, store,
     trans, zeros_like,
 };
@@ -49,7 +49,7 @@ use rustc_span::Span;
 use rustc_span::Spanned;
 
 use crate::mlir::codegen::triton::location::span_to_location;
-use crate::mlir::codegen::triton::{CodegenState, TritonCodegen};
+use crate::mlir::codegen::triton::{BlockPtr, CodegenState, TritonCodegen};
 use crate::mlir::errors::MlirError;
 
 /// Generate a stub codegen method that ignores all args and returns `ub.poison`
@@ -2386,11 +2386,15 @@ impl<'a> TritonCodegen<'a> {
     // Block-pointer and descriptor ops
     // =========================================================================
 
+    /// `triton::Triton::make_block_ptr(base, shape, strides, offsets, block_shape, order)`.
+    ///
+    /// Emits no op: the block pointer is recorded in `state.block_ptrs` (see `BlockPtr`), the
+    /// way Triton's own frontend keeps it since `tt.make_tensor_ptr` was removed.
     pub fn codegen_make_block_ptr_call<'tcx>(
         &self,
-        tcx: TyCtxt<'tcx>,
-        instance: &Instance<'tcx>,
-        mir: &Body<'tcx>,
+        _tcx: TyCtxt<'tcx>,
+        _instance: &Instance<'tcx>,
+        _mir: &Body<'tcx>,
         _func: &Operand<'tcx>,
         _func_name: &str,
         args: &[Spanned<Operand<'tcx>>],
@@ -2403,68 +2407,61 @@ impl<'a> TritonCodegen<'a> {
         mlir_block: &BlockRef<'a, 'a>,
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<Option<Value<'a, 'a>>, MlirError> {
-        // args: [base_ptr, &[shape_i64], &[strides_i64], &[offsets_i32], &[order_i32]]
-        let base = self.codegen_operand(
-            tcx,
-            instance,
-            &args[0].node,
-            args[0].node.ty(mir, tcx),
-            location,
-            mlir_block,
-            state,
-        )?;
-        let shape = self.slice_as_i64_values(&args[1].node, location, mlir_block, state)?;
-        let strides = self.slice_as_i64_values(&args[2].node, location, mlir_block, state)?;
-        let offsets = self.slice_as_i32_values(&args[3].node, location, mlir_block, state)?;
-        let order_vals = state
-            .slice_shape
-            .get(&match &args[4].node {
-                Operand::Move(p) | Operand::Copy(p) => p.local,
-                _ => {
-                    return self.codegen_ub_stub(
-                        tcx,
-                        instance,
-                        mir,
-                        destination,
-                        location,
-                        mlir_block,
-                    );
-                }
-            })
-            .cloned()
-            .unwrap_or_default();
-        let order: Vec<i32> = order_vals.iter().map(|&v| v as i32).collect();
+        let fail = |err: String| MlirError::CodegenFailed { err: format!("make_block_ptr: {err}") };
+        if args.len() != 6 {
+            return Err(fail(format!("expected 6 arguments, got {}", args.len())));
+        }
+        let dest = destination
+            .as_local()
+            .ok_or_else(|| fail(format!("unsupported destination {destination:?}")))?;
+        // `base` is read directly so that a block pointer cannot itself be used as the base.
+        let base = self.codegen_copy_operand(&args[0].node, state)?;
+        let shape = self.slice_as_i64_extended(&args[1].node, location, mlir_block, state)?;
+        let strides = self.slice_as_i64_extended(&args[2].node, location, mlir_block, state)?;
+        let offsets = self.slice_as_i64_extended(&args[3].node, location, mlir_block, state)?;
+        let block_shape = Self::static_slice(&args[4].node, state)
+            .ok_or_else(|| fail("`block_shape` must be compile-time constants".into()))?;
+        let order = Self::static_slice(&args[5].node, state)
+            .ok_or_else(|| fail("`order` must be compile-time constants".into()))?;
 
-        let dest_ty = destination.ty(mir, tcx).ty;
-        let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
-            tcx,
-            TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(tcx, dest_ty),
-        );
-        let result_ty = self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty);
+        let rank = block_shape.len();
+        if rank == 0 {
+            return Err(fail("a block pointer needs at least one dimension".into()));
+        }
+        for (name, len) in [
+            ("shape", shape.len()),
+            ("strides", strides.len()),
+            ("offsets", offsets.len()),
+            ("order", order.len()),
+        ] {
+            if len != rank {
+                return Err(fail(format!(
+                    "`{name}` has {len} entries but `block_shape` has {rank}"
+                )));
+            }
+        }
+        if block_shape.iter().any(|&d| d <= 0) {
+            return Err(fail(format!("`block_shape` entries must be positive, got {block_shape:?}")));
+        }
+        let mut sorted_order = order.clone();
+        sorted_order.sort_unstable();
+        if !sorted_order.iter().copied().eq(0..rank as i64) {
+            return Err(fail(format!("`order` must be a permutation of 0..{rank}, got {order:?}")));
+        }
 
-        let op: Operation<'a> = make_tensor_ptr(
-            self.module.context(),
-            location,
-            base,
-            &shape,
-            &strides,
-            &offsets,
-            &order,
-            result_ty,
-        )
-        .map_err(|e| MlirError::CreateOperation { err: e })?
-        .into();
-        let result = op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
-        mlir_block.append_operation(op);
-        Ok(Some(result.into()))
+        state
+            .block_ptrs
+            .insert(dest, BlockPtr { base, shape, strides, offsets, block_shape, order });
+        Ok(None)
     }
 
+    /// `triton::Triton::advance(ptr, offsets)`: a new block pointer whose offsets are the old
+    /// ones plus `offsets`. Only the additions are emitted.
     pub fn codegen_advance_call<'tcx>(
         &self,
-        tcx: TyCtxt<'tcx>,
-        instance: &Instance<'tcx>,
-        mir: &Body<'tcx>,
+        _tcx: TyCtxt<'tcx>,
+        _instance: &Instance<'tcx>,
+        _mir: &Body<'tcx>,
         _func: &Operand<'tcx>,
         _func_name: &str,
         args: &[Spanned<Operand<'tcx>>],
@@ -2477,31 +2474,85 @@ impl<'a> TritonCodegen<'a> {
         mlir_block: &BlockRef<'a, 'a>,
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<Option<Value<'a, 'a>>, MlirError> {
-        // args: [ptr, &[offsets_i32]]
-        let ptr = self.codegen_operand(
-            tcx,
-            instance,
-            &args[0].node,
-            args[0].node.ty(mir, tcx),
-            location,
-            mlir_block,
-            state,
-        )?;
-        let offsets = match self.slice_as_i32_values(&args[1].node, location, mlir_block, state) {
-            Ok(v) => v,
-            Err(_) => {
-                return self.codegen_ub_stub(tcx, instance, mir, destination, location, mlir_block);
-            }
+        let fail = |err: String| MlirError::CodegenFailed { err: format!("advance: {err}") };
+        if args.len() != 2 {
+            return Err(fail(format!("expected 2 arguments, got {}", args.len())));
+        }
+        let dest = destination
+            .as_local()
+            .ok_or_else(|| fail(format!("unsupported destination {destination:?}")))?;
+        let src = match &args[0].node {
+            Operand::Copy(p) | Operand::Move(p) => p.as_local(),
+            Operand::Constant(_) | Operand::RuntimeChecks(_) => None,
         };
-        let result_ty = ptr.r#type();
-        let op: Operation<'a> = advance(self.module.context(), location, ptr, &offsets, result_ty)
-            .map_err(|e| MlirError::CreateOperation { err: e })?
-            .into();
-        let result = op
-            .result(0)
-            .map_err(|e: melior::Error| MlirError::CodegenFailed { err: e.to_string() })?;
-        mlir_block.append_operation(op);
-        Ok(Some(result.into()))
+        let mut bp = src
+            .and_then(|local| state.block_ptrs.get(&local))
+            .cloned()
+            .ok_or_else(|| fail("the pointer is not a `make_block_ptr` result".into()))?;
+        let deltas = self.slice_as_i64_extended(&args[1].node, location, mlir_block, state)?;
+        if deltas.len() != bp.offsets.len() {
+            return Err(fail(format!(
+                "{} offsets given for a rank-{} block pointer",
+                deltas.len(),
+                bp.offsets.len()
+            )));
+        }
+        for (offset, delta) in bp.offsets.iter_mut().zip(deltas) {
+            let op: Operation<'a> = melior::dialect::arith::addi(*offset, delta, location);
+            *offset =
+                op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
+            mlir_block.append_operation(op);
+        }
+        state.block_ptrs.insert(dest, bp);
+        Ok(None)
+    }
+
+    /// Reads a `Copy`/`Move` operand's SSA value; constants are not expected here.
+    fn codegen_copy_operand<'tcx>(
+        &self,
+        operand: &Operand<'tcx>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => self.codegen_copy(place, state),
+            _ => Err(MlirError::CodegenFailed {
+                err: format!("expected a place operand, got {operand:?}"),
+            }),
+        }
+    }
+
+    /// The compile-time contents of a slice argument, if they are known.
+    fn static_slice<'tcx>(arg: &Operand<'tcx>, state: &CodegenState<'a, 'a>) -> Option<Vec<i64>> {
+        match arg {
+            Operand::Copy(p) | Operand::Move(p) => state.slice_shape.get(&p.local).cloned(),
+            Operand::Constant(_) | Operand::RuntimeChecks(_) => None,
+        }
+    }
+
+    /// `slice_as_i64_values`, with runtime entries sign-extended to `i64`: those keep the
+    /// width of the Rust values they came from, which is `i32` in the Triton API.
+    fn slice_as_i64_extended<'tcx>(
+        &self,
+        arg: &Operand<'tcx>,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &CodegenState<'a, 'a>,
+    ) -> Result<Vec<Value<'a, 'a>>, MlirError> {
+        let i64_ty: melior::ir::Type<'a> = IntegerType::new(self.module.context(), 64).into();
+        self.slice_as_i64_values(arg, location, mlir_block, state)?
+            .into_iter()
+            .map(|v| {
+                if v.r#type() == i64_ty {
+                    return Ok(v);
+                }
+                let op: Operation<'a> = create_extsi(self.module.context(), location, v, i64_ty)
+                    .map_err(|e| MlirError::CreateOperation { err: e })?
+                    .into();
+                let r = op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+                mlir_block.append_operation(op);
+                Ok(r.into())
+            })
+            .collect()
     }
 
     pub fn codegen_make_tensor_descriptor_call<'tcx>(
