@@ -348,6 +348,9 @@ impl<'a> TritonCodegen<'a> {
         // whenever there is more than one operand. Without a mask every lane is loaded, so
         // `other` can never be selected and is dropped rather than emitted.
         let other = if mask.is_some() { other } else { None };
+        let mask = mask.map(|m| self.broadcast_to_ptr_shape(m, ptr, location, mlir_block)).transpose()?;
+        let other =
+            other.map(|o| self.broadcast_to_ptr_shape(o, ptr, location, mlir_block)).transpose()?;
 
         // Derive result type from the ptr operand's MLIR type.
         // ptr is `tensor<Nx!tt.ptr<T>>` — extract shape [N] and element type T from
@@ -486,6 +489,39 @@ impl<'a> TritonCodegen<'a> {
         Ok(Some(i32_val))
     }
 
+    /// Broadcast a store's value or mask, or a load's mask or `other`, to the shape of the
+    /// pointer tensor `ptr`, as Triton's frontend does: `tt.store` and `tt.load` require them
+    /// to match it, and storing a keep_dims reduction to every lane is the usual way to write
+    /// one value per program. Only a same-rank tensor whose every dimension is 1 or equal to the
+    /// pointer's is broadcast; anything else is returned unchanged for the verifier to report.
+    fn broadcast_to_ptr_shape(
+        &self,
+        v: Value<'a, 'a>,
+        ptr: Value<'a, 'a>,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        let (Ok(ptr_t), Ok(v_t)) =
+            (RankedTensorType::try_from(ptr.r#type()), RankedTensorType::try_from(v.r#type()))
+        else {
+            return Ok(v);
+        };
+        let dims = |t: RankedTensorType<'a>| {
+            t.dims().map_err(|e| MlirError::InvalidType { msg: e.to_string() })
+        };
+        let (target, from) = (dims(ptr_t)?, dims(v_t)?);
+        let broadcastable = from.len() == target.len()
+            && from.iter().zip(&target).all(|(&f, &t)| f == 1 || f == t);
+        if from == target || !broadcastable {
+            return Ok(v);
+        }
+        let op: Operation<'a> =
+            broadcast(self.module.context(), location, v, tensor_type(&target, v_t.element()).into())
+                .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?
+                .into();
+        self.append_result(op, mlir_block)
+    }
+
     pub fn codegen_store<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -532,6 +568,9 @@ impl<'a> TritonCodegen<'a> {
             mlir_block,
             state,
         )?;
+
+        let value = self.broadcast_to_ptr_shape(value, ptr, location, mlir_block)?;
+        let mask = mask.map(|m| self.broadcast_to_ptr_shape(m, ptr, location, mlir_block)).transpose()?;
 
         let store_op: Operation<'a> = store(
             self.module.context(),

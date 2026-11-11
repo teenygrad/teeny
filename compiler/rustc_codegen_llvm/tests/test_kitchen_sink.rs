@@ -690,6 +690,13 @@ mod tests {
         assert!(ptx.contains("st.global"), "no global store in PTX:\n{ptx}");
     }
 
+    // teenyc-yg9: a store's value or mask, or a load's mask or `other`, narrower than the pointer
+    // tensor failed to verify (`tt.store` / `tt.load` operand shapes must match the pointer's).
+    #[test]
+    fn test_broadcast_store_load() {
+        compile_and_check_ptx("broadcast_store_load", &["st.global", "ld.global"], &[]);
+    }
+
     // teenyc-2kk: a descriptor over a non-f32 dtype used to be typed as f32.
     #[test]
     fn test_tensor_descriptor_i16() {
