@@ -733,6 +733,25 @@ mod tests {
         );
     }
 
+    // teenyc-1nq: an MLIR verifier failure used to panic with only "MLIR cleanup passes failed:
+    // CodegenFailed { err: "failed to run pass" }", naming no op. The panic must carry the
+    // verifier's diagnostic: the op, its message and the kernel source location.
+    #[test]
+    #[should_panic(
+        expected = "triton_verifier_error.rs\":49:5): error: 'tt.store' op failed to verify"
+    )]
+    fn test_verifier_error_reported() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_verifier_error.rs");
+        let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_verifier_error_reported");
+    }
+
     // teenyc-32u: a descriptor op whose slice argument is chosen at run time must fail to
     // compile; it used to emit ub.poison, or drop the store entirely. Since teenyc-2m7 the slice
     // local is rejected when it is recorded, before the descriptor op. A codegen error panics

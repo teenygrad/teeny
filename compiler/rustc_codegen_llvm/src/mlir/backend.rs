@@ -20,11 +20,14 @@
 //! with rustc's compilation pipeline.
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use melior::diagnostic::{Diagnostic, DiagnosticSeverity};
 use melior::pass;
 use melior::pass::PassManager;
 use rustc_codegen_ssa::back::lto::{ThinModule, ThinShared};
@@ -138,7 +141,14 @@ fn compile_codegen_unit_impl(
         triton_codegen.codegen(tcx, mono_item).expect("Failed to generate MLIR for instance");
     }
 
-    cleanup_mlir_module(&mut mlir_module).expect("MLIR cleanup passes failed");
+    // Panics with the error's text rather than `expect`'s `Debug` form, which would escape the
+    // quotes and newlines in the verifier diagnostics it carries.
+    if let Err(e) = cleanup_mlir_module(&mut mlir_module) {
+        match e {
+            MlirError::CodegenFailed { err } => panic!("MLIR cleanup passes failed: {err}"),
+            e => panic!("MLIR cleanup passes failed: {e:?}"),
+        }
+    }
 
     mlir_module.mlir_source = Some(mlir_module.llmod().as_operation().to_string());
 
@@ -158,11 +168,40 @@ fn cleanup_mlir_module(mlir_module: &mut MlirModule<'static>) -> Result<(), Mlir
     pass_manager.add_pass(pass::transform::create_canonicalizer_pass());
     pass_manager.add_pass(pass::transform::create_symbol_dce_pass());
 
-    pass_manager
-        .run(mlir_module.llmod_mut())
-        .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+    // A failing pass (usually the verifier rejecting an op this backend built) only reports
+    // "failed to run pass"; the op, message and source location go to the context's diagnostic
+    // handler. Collect them so the error says which op in which kernel line is at fault.
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let handler = mlir_module.context().attach_diagnostic_handler({
+        let errors = Rc::clone(&errors);
+        move |diagnostic| {
+            let is_error = matches!(diagnostic.severity(), DiagnosticSeverity::Error);
+            if is_error {
+                errors.borrow_mut().push(format_diagnostic(&diagnostic));
+            }
+            // Handled errors aren't also printed to stderr: they're in the returned error.
+            is_error
+        }
+    });
+    let result = pass_manager.run(mlir_module.llmod_mut());
+    mlir_module.context().detach_diagnostic_handler(handler);
 
-    Ok(())
+    result.map_err(|e| {
+        let errors = errors.take();
+        let err =
+            if errors.is_empty() { e.to_string() } else { format!("{e}:\n{}", errors.join("\n")) };
+        MlirError::CodegenFailed { err }
+    })
+}
+
+/// Formats `diagnostic` the way MLIR prints it to stderr, `loc(...): error: <message>`, with its
+/// notes on the following lines.
+fn format_diagnostic(diagnostic: &Diagnostic<'_>) -> String {
+    let mut text = format!("{}: error: {diagnostic}", diagnostic.location());
+    for note in (0..diagnostic.note_count()).filter_map(|i| diagnostic.note(i).ok()) {
+        text.push_str(&format!("\n{}: note: {note}", note.location()));
+    }
+    text
 }
 
 fn compile_module(mlir_module: &mut MlirModule<'static>) -> Result<(), MlirError> {
