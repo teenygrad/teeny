@@ -267,4 +267,31 @@ mod tests {
              value (this is the poison-corruption signature). Full PTX:\n{ptx}"
         );
     }
+
+    // teenyc-o4d / teenyc-3p3: T::maximum and T::minimum with operands of different shapes
+    // (a keep-dims reduction against a full tile) used to emit arith.maximumf/minimumf on
+    // mismatched types, which failed MLIR verification and panicked the backend.
+    #[test]
+    fn test_minmax_broadcast() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_minmax_broadcast.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_minmax_broadcast");
+        assert!(result.is_ok(), "minmax_broadcast compile failed: {:?}", result.err());
+
+        // Compiling isn't enough on its own: the kernel must still contain both ops, so a
+        // regression that optimises them away (as the kitchen sink's dead code does, teenyc-7lq)
+        // can't pass silently.
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        let has_op = |op: &str| {
+            ptx.lines().any(|l| l.trim_start().starts_with(op) && l.contains(".f32"))
+        };
+        assert!(has_op("max."), "no f32 max instruction in PTX:\n{ptx}");
+        assert!(has_op("min."), "no f32 min instruction in PTX:\n{ptx}");
+    }
 }

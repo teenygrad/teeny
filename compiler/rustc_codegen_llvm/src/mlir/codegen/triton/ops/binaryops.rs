@@ -890,7 +890,7 @@ impl<'a> TritonCodegen<'a> {
     /// both to their common shape (each dim is the max of the two, requiring
     /// the smaller dim to be 1).  Returns the pair unchanged when shapes already
     /// match or broadcasting is not applicable.
-    fn maybe_broadcast_pair(
+    pub(crate) fn maybe_broadcast_pair(
         &self,
         location: Location<'a>,
         lhs: Value<'a, 'a>,

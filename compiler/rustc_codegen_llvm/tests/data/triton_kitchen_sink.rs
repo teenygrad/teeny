@@ -466,8 +466,12 @@ pub trait PartialEq<Rhs: ?Sized = Self> {
 }
 
 impl PartialEq for i32 {
-    fn eq(&self, _other: &i32) -> bool { false }
-    fn ne(&self, _other: &i32) -> bool { false }
+    fn eq(&self, _other: &i32) -> bool {
+        false
+    }
+    fn ne(&self, _other: &i32) -> bool {
+        false
+    }
 }
 
 #[lang = "partial_ord"]
@@ -479,10 +483,18 @@ pub trait PartialOrd<Rhs: ?Sized = Self> {
 }
 
 impl PartialOrd for i32 {
-    fn lt(&self, _other: &i32) -> bool { false }
-    fn gt(&self, _other: &i32) -> bool { false }
-    fn le(&self, _other: &i32) -> bool { false }
-    fn ge(&self, _other: &i32) -> bool { false }
+    fn lt(&self, _other: &i32) -> bool {
+        false
+    }
+    fn gt(&self, _other: &i32) -> bool {
+        false
+    }
+    fn le(&self, _other: &i32) -> bool {
+        false
+    }
+    fn ge(&self, _other: &i32) -> bool {
+        false
+    }
 }
 
 pub mod iter {
@@ -3030,9 +3042,13 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32, const USE_BIAS: bool
     let _eq_s_sel = T::where_(eq_s, mconst, zl);
     let _ne_s_sel = T::where_(ne_s, mconst, zl);
     // SwitchInt on a const bool generic (compile-time constant discriminant).
-    if USE_BIAS { let _ = loaded + z; }
+    if USE_BIAS {
+        let _ = loaded + z;
+    }
     // SwitchInt on a runtime bool SSA value (bool function parameter).
-    if use_bias { let _ = loaded + z; }
+    if use_bias {
+        let _ = loaded + z;
+    }
 
     // Range-based for loop: scf.for with runtime bound (n_elements).
     // Accumulates z into for_acc over n_elements iterations.
@@ -3056,6 +3072,14 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32, const USE_BIAS: bool
     let _ = T::make_block_ptr(output_ptr, &[BLOCK_SIZE], &[1], &[0], &[BLOCK_SIZE], &[0]);
     T::store::<D, 1>(out_ptrs, mconst, None, &[0], None, None);
     let _ = block_ptr2;
+
+    let N = BLOCK_SIZE;
+    let x_ptrs = T::zeros::<T::Pointer<D>>(&[N]);
+    let x = T::load::<D, 1>(x_ptrs, None, None, &[0], None, None, None, false);
+    let s = T::sqrt(T::sum(x * x, Some(0), true));
+    let eps = T::full::<D>(&[N], dummy_value::<D>());
+    T::store::<D, 1>(out_ptrs, x / T::maximum(s, eps), None, &[0], None, None);
+    T::store::<D, 1>(out_ptrs, x / T::minimum(s, eps), None, &[0], None, None);
 }
 
 use triton::llvm::triton::num::*;
