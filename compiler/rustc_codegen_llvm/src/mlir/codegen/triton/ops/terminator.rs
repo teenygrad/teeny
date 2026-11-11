@@ -181,6 +181,49 @@ impl<'a> TritonCodegen<'a> {
         basic_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<(), MlirError> {
+        self.dispatch_call(
+            tcx,
+            instance,
+            mir,
+            func,
+            args,
+            destination,
+            target,
+            unwind,
+            call_source,
+            fn_span,
+            location,
+            mlir_block,
+            state,
+        )?;
+        self.codegen_goto(
+            location,
+            &target.expect("target must be Some"),
+            mlir_block,
+            basic_blocks,
+            state,
+        )
+    }
+
+    /// Lowers a call into `mlir_block` and binds its result to `destination`, without the
+    /// branch to the call's target block. Kept separate from `codegen_terminator_call` so a
+    /// reduce/scan combine body, which must stay in a single block, can reuse every handler.
+    pub(crate) fn dispatch_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        func: &Operand<'tcx>,
+        args: &[Spanned<Operand<'tcx>>],
+        destination: &Place<'tcx>,
+        target: &Option<BasicBlock>,
+        unwind: &UnwindAction,
+        call_source: &CallSource,
+        fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<(), MlirError> {
         let func_name = match func {
             Operand::Constant(c) => {
                 if let TyKind::FnDef(def_id, _) = c.ty().kind() {
@@ -545,13 +588,6 @@ impl<'a> TritonCodegen<'a> {
         if let Some(value) = value {
             state.ssa_values.insert(destination.local, value);
         }
-        self.codegen_goto(
-            location,
-            &target.expect("target must be Some"),
-            mlir_block,
-            basic_blocks,
-            state,
-        )?;
         Ok(())
     }
 

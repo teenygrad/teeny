@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+use std::collections::HashSet;
+
 use melior::ir::attribute::FloatAttribute;
 use melior::ir::operation::{OperationBuilder, OperationLike};
 use melior::ir::r#type::IntegerType;
@@ -23,7 +25,11 @@ use melior::ir::{
     Value, ValueLike,
 };
 use rustc_ast::{FloatTy, IntTy};
-use rustc_middle::mir::{BasicBlock, Body, CallSource, Operand, Place, UnwindAction};
+use rustc_middle::mir::{
+    BasicBlock, Body, CallSource, CastKind, Local, Operand, Place, RETURN_PLACE, Rvalue,
+    START_BLOCK, StatementKind, TerminatorKind, UnwindAction,
+};
+use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{EarlyBinder, Instance, TyCtxt, TyKind, TypingEnv};
 use rustc_mlir::shared::arith::{Int, create_extsi, create_int_constant};
 use rustc_mlir::shared::builtin::tensor_type;
@@ -42,6 +48,7 @@ use rustc_mlir::triton::{int_to_ptr, pointer_type};
 use rustc_span::Span;
 use rustc_span::Spanned;
 
+use crate::mlir::codegen::triton::location::span_to_location;
 use crate::mlir::codegen::triton::{CodegenState, TritonCodegen};
 use crate::mlir::errors::MlirError;
 
@@ -4165,31 +4172,45 @@ impl<'a> TritonCodegen<'a> {
         let result = op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
         mlir_block.append_operation(op);
         let result_val: Value<'a, 'a> = result.into();
-
-        // If keep_dims=true and tt.reduce dropped all axes (scalar result), splat the
-        // scalar back into a rank-preserving tensor with 1 at the reduced axis position.
-        // Example: reduce tensor<128xf32> axis=0 → f32; keep_dims → tensor<1xf32>.
-        if keep_dims && !result_val.r#type().is_tensor() {
-            if let Ok(src_t) = RankedTensorType::try_from(src.r#type()) {
-                if let Ok(src_dims) = src_t.dims() {
-                    let kept_shape: Vec<i64> = src_dims
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &d)| if i as i32 == axis { 1 } else { d })
-                        .collect();
-                    let target_ty = tensor_type(&kept_shape, result_val.r#type()).into();
-                    let splat_op: Operation<'a> =
-                        splat(self.module.context(), location, result_val, target_ty)
-                            .map_err(|e| MlirError::CreateOperation { err: e })?
-                            .into();
-                    let splat_result = splat_op.result(0).unwrap().into();
-                    mlir_block.append_operation(splat_op);
-                    return Ok(Some(splat_result));
-                }
-            }
+        if keep_dims {
+            return self.keep_reduced_dim(location, src, axis, result_val, mlir_block).map(Some);
         }
-
         Ok(Some(result_val))
+    }
+
+    /// Applies `keep_dims` to a `tt.reduce` result. When the reduction dropped every axis
+    /// (scalar result), splat the scalar back into a rank-preserving tensor with 1 at the
+    /// reduced axis position. Example: reduce tensor<128xf32> axis=0 → f32; keep_dims →
+    /// tensor<1xf32>.
+    fn keep_reduced_dim(
+        &self,
+        location: Location<'a>,
+        src: Value<'a, 'a>,
+        axis: i32,
+        result_val: Value<'a, 'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        if result_val.r#type().is_tensor() {
+            return Ok(result_val);
+        }
+        let Some(src_dims) =
+            RankedTensorType::try_from(src.r#type()).ok().and_then(|t| t.dims().ok())
+        else {
+            return Ok(result_val);
+        };
+        let kept_shape: Vec<i64> = src_dims
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| if i as i32 == axis { 1 } else { d })
+            .collect();
+        let target_ty = tensor_type(&kept_shape, result_val.r#type()).into();
+        let splat_op: Operation<'a> = splat(self.module.context(), location, result_val, target_ty)
+            .map_err(|e| MlirError::CreateOperation { err: e })?
+            .into();
+        let splat_result =
+            splat_op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
+        mlir_block.append_operation(splat_op);
+        Ok(splat_result)
     }
 
     /// `triton::Triton::sum` — reduction sum.
@@ -4493,10 +4514,300 @@ impl<'a> TritonCodegen<'a> {
         Ok(Some(result.into()))
     }
 
-    // `triton::Triton::reduce` and `associative_scan` require user-provided closure
-    // regions which cannot be generated without inlining the closure body.
-    stub_handler!(codegen_reduce_call);
-    stub_handler!(codegen_associative_scan_call);
+    // =========================================================================
+    // User-combine reduce / scan (tt.reduce / tt.scan with a combine fn)
+    // =========================================================================
+
+    /// `triton::Triton::reduce(x, axis, combine_fn, keep_dims)`.
+    pub fn codegen_reduce_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        let (src, axis, combine) =
+            self.combine_call_args(tcx, instance, mir, args, location, mlir_block, state)?;
+        let keep_dims = self.const_bool_arg(tcx, instance, &args[3].node);
+        let result_ty = self.reduce_result_ty(src, axis);
+        let op: Operation<'a> =
+            reduce(self.module.context(), location, &[src], &[result_ty], axis, Region::new())
+                .map_err(|e| MlirError::CreateOperation { err: e })?
+                .into();
+        self.codegen_combine_region(tcx, combine, &op, src, location, |ctx, loc, value| {
+            reduce_return(ctx, loc, &[value]).map(Into::into)
+        })?;
+        let result = op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+        mlir_block.append_operation(op);
+        let result_val: Value<'a, 'a> = result.into();
+        if keep_dims {
+            return self.keep_reduced_dim(location, src, axis, result_val, mlir_block).map(Some);
+        }
+        Ok(Some(result_val))
+    }
+
+    /// `triton::Triton::associative_scan(x, axis, combine_fn, reverse)`.
+    pub fn codegen_associative_scan_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        let (src, axis, combine) =
+            self.combine_call_args(tcx, instance, mir, args, location, mlir_block, state)?;
+        let reverse = self.const_bool_arg(tcx, instance, &args[3].node);
+        let op: Operation<'a> = scan(
+            self.module.context(),
+            location,
+            &[src],
+            &[src.r#type()],
+            axis,
+            reverse,
+            Region::new(),
+        )
+        .map_err(|e| MlirError::CreateOperation { err: e })?
+        .into();
+        self.codegen_combine_region(tcx, combine, &op, src, location, |ctx, loc, value| {
+            scan_return(ctx, loc, &[value]).map(Into::into)
+        })?;
+        let result = op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+        mlir_block.append_operation(op);
+        Ok(Some(result.into()))
+    }
+
+    /// Decodes the `(x, axis, combine_fn, _)` arguments shared by `reduce` and
+    /// `associative_scan`: the source tensor value, the constant axis, and the resolved
+    /// combine fn instance.
+    fn combine_call_args<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        args: &[Spanned<Operand<'tcx>>],
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<(Value<'a, 'a>, i32, Instance<'tcx>), MlirError> {
+        if args.len() != 4 {
+            return Err(MlirError::CodegenFailed {
+                err: format!("reduce/associative_scan: expected 4 arguments, got {}", args.len()),
+            });
+        }
+        let src = self.codegen_operand(
+            tcx,
+            instance,
+            &args[0].node,
+            args[0].node.ty(mir, tcx),
+            location,
+            mlir_block,
+            state,
+        )?;
+        let axis = self.to_scalar_int(tcx, instance, &args[1].node).map(|s| s.to_i32()).map_err(
+            |_| MlirError::CodegenFailed {
+                err: "reduce/associative_scan: `axis` must be a compile-time constant".into(),
+            },
+        )?;
+        let combine = self.resolve_fn_ptr_instance(tcx, instance, mir, &args[2].node)?;
+        Ok((src, axis, combine))
+    }
+
+    /// Reads a constant `bool` argument; `bool` is one byte, so `to_bits_unchecked` is used
+    /// rather than `to_i32`, which would panic on the size mismatch.
+    fn const_bool_arg<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        operand: &Operand<'tcx>,
+    ) -> bool {
+        self.to_scalar_int(tcx, instance, operand).is_ok_and(|s| s.to_bits_unchecked() != 0)
+    }
+
+    /// Finds the fn item a combine-fn operand refers to. Triton has no runtime function
+    /// pointers, so the operand must trace back, through `ReifyFnPointer` casts and plain
+    /// copies within `mir`, to a constant fn item; a fn pointer received as a parameter
+    /// cannot be resolved and is reported as an error.
+    fn resolve_fn_ptr_instance<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        operand: &Operand<'tcx>,
+    ) -> Result<Instance<'tcx>, MlirError> {
+        let unresolved = |why: &str| MlirError::CodegenFailed {
+            err: format!(
+                "reduce/associative_scan: cannot resolve the combine function ({why}); it must \
+                 be a fn item named at the call site, not a runtime fn pointer"
+            ),
+        };
+        let mut operand = operand;
+        // Each hop follows one assignment, so the chain cannot be longer than the body.
+        for _ in 0..=mir.local_decls.len() {
+            let place = match operand {
+                Operand::Constant(c) => {
+                    let ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                        tcx,
+                        TypingEnv::fully_monomorphized(),
+                        EarlyBinder::bind(tcx, c.const_.ty()),
+                    );
+                    let TyKind::FnDef(def_id, fn_args) = *ty.kind() else {
+                        return Err(unresolved(&format!("constant of type {ty:?}")));
+                    };
+                    let fn_args = fn_args
+                        .no_bound_vars()
+                        .ok_or_else(|| unresolved(&format!("{def_id:?} has bound generic args")))?;
+                    return Instance::resolve_for_fn_ptr(
+                        tcx,
+                        TypingEnv::fully_monomorphized(),
+                        def_id,
+                        fn_args,
+                    )
+                    .ok_or_else(|| unresolved(&format!("{def_id:?} has no instance")));
+                }
+                Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+                    place
+                }
+                _ => return Err(unresolved("projected operand")),
+            };
+            operand = mir
+                .basic_blocks
+                .iter()
+                .flat_map(|bb| bb.statements.iter())
+                .find_map(|stmt| match &stmt.kind {
+                    StatementKind::Assign(assign) if assign.0.as_local() == Some(place.local) => {
+                        match &assign.1 {
+                            Rvalue::Cast(
+                                CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer(_), _),
+                                op,
+                                _,
+                            )
+                            | Rvalue::Use(op, _) => Some(op),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| unresolved(&format!("{:?} is not assigned a fn item", place.local)))?;
+        }
+        Err(unresolved("assignment cycle"))
+    }
+
+    /// Fills `op`'s (empty) combine region by generating `combine`'s body inline, with its two
+    /// `Tensor<D>` parameters bound to the region's scalar block arguments. The handlers used
+    /// for kernel code are type-driven by their operands, so they emit the scalar form of each
+    /// op here. The body must be straight-line: calls, gotos and drops are followed to the
+    /// `Return`, whose value `make_return` wraps in the region terminator.
+    fn codegen_combine_region<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        combine: Instance<'tcx>,
+        op: &Operation<'a>,
+        src: Value<'a, 'a>,
+        location: Location<'a>,
+        make_return: impl Fn(
+            &'a melior::Context,
+            Location<'a>,
+            Value<'a, 'a>,
+        ) -> Result<Operation<'a>, rustc_mlir::errors::Error>,
+    ) -> Result<(), MlirError> {
+        let combine_name = tcx.def_path_str(combine.def_id());
+        let unsupported = |what: String| MlirError::CodegenFailed {
+            err: format!("reduce/associative_scan combine fn `{combine_name}`: {what}"),
+        };
+        let mir = tcx.instance_mir(combine.def);
+        if mir.arg_count != 2 {
+            return Err(unsupported(format!("expected 2 parameters, found {}", mir.arg_count)));
+        }
+
+        let elem = self.elem_ty(src);
+        let region = op.region(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+        let block = region.append_block(Block::new(&[(elem, location), (elem, location)]));
+
+        let mut state = CodegenState::new();
+        for i in 0..2 {
+            let arg = block.argument(i).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+            state.ssa_values.insert(Local::from_usize(i + 1), arg.into());
+        }
+
+        let mut visited = HashSet::new();
+        let mut bb = START_BLOCK;
+        loop {
+            if !visited.insert(bb) {
+                return Err(unsupported("loops are not supported in a combine body".into()));
+            }
+            let data = &mir.basic_blocks[bb];
+            for stmt in &data.statements {
+                self.codegen_statement(tcx, &combine, mir, stmt, &block, &mut state)?;
+            }
+            let terminator = data.terminator();
+            bb = match &terminator.kind {
+                TerminatorKind::Call {
+                    func,
+                    args,
+                    destination,
+                    target: target @ Some(next),
+                    unwind,
+                    call_source,
+                    fn_span,
+                } => {
+                    let call_loc = span_to_location(self.module.context(), tcx, *fn_span);
+                    self.dispatch_call(
+                        tcx,
+                        &combine,
+                        mir,
+                        func,
+                        args,
+                        destination,
+                        target,
+                        unwind,
+                        call_source,
+                        fn_span,
+                        call_loc,
+                        &block,
+                        &mut state,
+                    )?;
+                    *next
+                }
+                TerminatorKind::Goto { target } | TerminatorKind::Drop { target, .. } => *target,
+                TerminatorKind::Return => {
+                    let value = *state
+                        .ssa_values
+                        .get(&RETURN_PLACE)
+                        .ok_or_else(|| unsupported("return value was not generated".into()))?;
+                    let ret = make_return(self.module.context(), location, value)
+                        .map_err(|e| MlirError::CreateOperation { err: e })?;
+                    block.append_operation(ret);
+                    return Ok(());
+                }
+                kind => {
+                    return Err(unsupported(format!(
+                        "unsupported terminator {:?} in a combine body",
+                        kind.name()
+                    )));
+                }
+            };
+        }
+    }
 
     // =========================================================================
     // Atomic ops (tt.atomic_rmw / tt.atomic_cas)

@@ -349,4 +349,34 @@ mod tests {
             );
         }
     }
+
+    // teenyc-37e: `T::reduce` / `T::associative_scan` with a user combine fn used to ICE on the
+    // fn-pointer cast, and behind that both ops were stubs that emitted `ub.poison`.
+    #[test]
+    fn test_reduce_scan_combine() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_reduce_scan_combine.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_reduce_scan_combine");
+        assert!(result.is_ok(), "reduce_scan_combine compile failed: {:?}", result.err());
+
+        // The kernel's only multiply is reduce's combine body and its only add is the scan's,
+        // so each must appear for its combine region to have been generated (the old stubs
+        // produced poison and neither op).
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        let has_f32_op = |op: &str| {
+            ptx.lines().any(|l| l.trim_start().starts_with(op) && l.contains(".f32"))
+        };
+        assert!(has_f32_op("mul."), "no f32 mul (reduce combine body) in PTX:\n{ptx}");
+        assert!(has_f32_op("add."), "no f32 add (scan combine body) in PTX:\n{ptx}");
+        assert!(
+            ptx.lines().any(|l| l.trim_start().starts_with("st.global")),
+            "no global store in PTX:\n{ptx}"
+        );
+    }
 }

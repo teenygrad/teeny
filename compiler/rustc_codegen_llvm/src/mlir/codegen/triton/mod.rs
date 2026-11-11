@@ -2292,6 +2292,12 @@ impl<'a> TritonCodegen<'a> {
                     EarlyBinder::bind(tcx, ty),
                 );
 
+                // Copies of a fn pointer carry no value either (see the ReifyFnPointer cast);
+                // `resolve_fn_ptr_instance` follows them back to the fn item.
+                if matches!(normalized_ty.kind(), TyKind::FnPtr(..)) {
+                    return Ok(());
+                }
+
                 // Route Option<T> locals into the option_table instead of ssa_values.
                 if is_option_ty(tcx, normalized_ty) {
                     let opt_value = match operand {
@@ -2399,6 +2405,15 @@ impl<'a> TritonCodegen<'a> {
                 state.ssa_values.insert(place.local, result);
             }
             Rvalue::Cast(cast_kind, operand, ty) => {
+                // A fn item reified to a fn pointer is only ever a combine function handed to
+                // `reduce` / `associative_scan`, which resolve the target from the MIR (see
+                // `resolve_fn_ptr_instance`) and generate its body inline in their combine
+                // region. Triton has no runtime function pointers, so no value is emitted.
+                if matches!(cast_kind, CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer(_), _))
+                {
+                    return Ok(());
+                }
+
                 // PtrToPtr cast on a const-array pointer — propagate the side-table entry
                 // without emitting an MLIR op (const arrays have no MLIR value).
                 if matches!(cast_kind, CastKind::PtrToPtr) {
