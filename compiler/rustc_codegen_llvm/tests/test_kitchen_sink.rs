@@ -508,6 +508,18 @@ mod tests {
         );
     }
 
+    // teenyc-39u: comparisons and where_ on a keep_dims reduction and a full-width tensor failed
+    // to verify (`arith.cmpf` / `arith.select` operands of different shapes).
+    #[test]
+    fn test_broadcast_cmp_where() {
+        compile_and_check_ptx(
+            "broadcast_cmp_where",
+            // LLVM folds the integer `where_(i < m, i, m)` into `min.s32`.
+            &["setp.lt.f32", "setp.lt.s32|min.s32", "selp.b32|selp.f32", "st.global"],
+            &[],
+        );
+    }
+
     // teenyc-1at: argmax / argmin / max_with_indices / min_with_indices were stubs emitting
     // ub.poison, so their results were garbage.
     #[test]

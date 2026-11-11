@@ -404,7 +404,7 @@ impl<'a> TritonCodegen<'a> {
         let rhs_is_tensor = rhs.r#type().is_tensor();
 
         let (lhs, rhs) = match (lhs_is_tensor, rhs_is_tensor) {
-            (true, true) => (lhs, rhs),
+            (true, true) => self.maybe_broadcast_pair(location, lhs, rhs, mlir_block)?,
             (true, false) => (lhs, self.like_tensor(tcx, location, lhs, rhs, mlir_block)?),
             (false, true) => (self.like_tensor(tcx, location, rhs, lhs, mlir_block)?, rhs),
             (false, false) => {
@@ -450,7 +450,7 @@ impl<'a> TritonCodegen<'a> {
         let rhs_is_tensor = rhs.r#type().is_tensor();
 
         let (lhs, rhs) = match (lhs_is_tensor, rhs_is_tensor) {
-            (true, true) => (lhs, rhs),
+            (true, true) => self.maybe_broadcast_pair(location, lhs, rhs, mlir_block)?,
             (true, false) => (lhs, self.like_tensor(tcx, location, lhs, rhs, mlir_block)?),
             (false, true) => (self.like_tensor(tcx, location, rhs, lhs, mlir_block)?, rhs),
             (false, false) => {
@@ -937,12 +937,16 @@ impl<'a> TritonCodegen<'a> {
             return Ok((lhs, rhs));
         }
 
-        let result_ty = tensor_type(&bd, lhs_t.element()).into();
-
-        let do_broadcast = |v: Value<'a, 'a>, dims: &[i64]| -> Result<Value<'a, 'a>, MlirError> {
+        // Each operand keeps its own element type: where_ broadcasts an i1 condition against
+        // its values.
+        let do_broadcast = |v: Value<'a, 'a>,
+                            t: RankedTensorType<'a>,
+                            dims: &[i64]|
+         -> Result<Value<'a, 'a>, MlirError> {
             if dims == bd {
                 return Ok(v);
             }
+            let result_ty = tensor_type(&bd, t.element()).into();
             let op: Operation<'a> = broadcast(self.module.context(), location, v, result_ty)
                 .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?
                 .into();
@@ -951,7 +955,7 @@ impl<'a> TritonCodegen<'a> {
             Ok(r)
         };
 
-        Ok((do_broadcast(lhs, &ld)?, do_broadcast(rhs, &rd)?))
+        Ok((do_broadcast(lhs, lhs_t, &ld)?, do_broadcast(rhs, rhs_t, &rd)?))
     }
 
     pub fn codegen_mul<'tcx>(
