@@ -466,4 +466,27 @@ mod tests {
             );
         }
     }
+
+    // teenyc-1h2: T::flip was a stub emitting ub.poison.
+    #[test]
+    fn test_flip() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_flip.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_flip");
+        assert!(result.is_ok(), "flip compile failed: {:?}", result.err());
+
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        for op in ["ld.global", "st.global"] {
+            assert!(
+                ptx.lines().any(|l| l.trim_start().starts_with(op)),
+                "no `{op}` instruction in PTX:\n{ptx}"
+            );
+        }
+    }
 }

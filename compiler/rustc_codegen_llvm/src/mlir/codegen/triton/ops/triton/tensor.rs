@@ -25,8 +25,9 @@ use melior::ir::{
     Value, ValueLike,
 };
 use rustc_ast::{FloatTy, IntTy};
+use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::{
-    BasicBlock, Body, CallSource, CastKind, Local, Operand, Place, RETURN_PLACE, Rvalue,
+    BasicBlock, Body, CallSource, CastKind, ConstValue, Local, Operand, Place, RETURN_PLACE, Rvalue,
     START_BLOCK, StatementKind, TerminatorKind, UnwindAction,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
@@ -3237,8 +3238,143 @@ impl<'a> TritonCodegen<'a> {
     // Tensor manipulation (flip, gather)
     // =========================================================================
 
-    // `triton::Triton::flip` — no `tt.flip` op in this version; fall back to UB stub.
-    stub_handler!(codegen_flip_call);
+    /// `triton::Triton::flip(x, dim)`: reverses `x` along `dim` (`None` is the last axis, and a
+    /// negative `dim` counts from the end, as in Triton). Triton has no flip op, and its
+    /// frontend's XOR-swap trick needs a power-of-two extent, so this gathers instead:
+    /// `gather(x, (n - 1) - position_along_dim)`.
+    pub fn codegen_flip_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        let fail = |err: String| MlirError::CodegenFailed { err: format!("flip: {err}") };
+        if args.len() != 2 {
+            return Err(fail(format!("expected 2 arguments, got {}", args.len())));
+        }
+        let src = self.codegen_operand(
+            tcx,
+            instance,
+            &args[0].node,
+            args[0].node.ty(mir, tcx),
+            location,
+            mlir_block,
+            state,
+        )?;
+        let dims = RankedTensorType::try_from(src.r#type())
+            .ok()
+            .and_then(|t| t.dims().ok())
+            .ok_or_else(|| fail(format!("source is not a ranked tensor: {}", src.r#type())))?;
+        let rank = dims.len() as i32;
+        let dim = match self.const_option_i32(tcx, instance, mir, &args[1].node, state)? {
+            None => rank - 1,
+            Some(d) if d < 0 => d + rank,
+            Some(d) => d,
+        };
+        let n = usize::try_from(dim)
+            .ok()
+            .and_then(|d| dims.get(d))
+            .copied()
+            .ok_or_else(|| fail(format!("dim out of range for rank {rank}")))?;
+        let n = i32::try_from(n).map_err(|_| fail(format!("extent {n} does not fit in i32")))?;
+
+        let context = self.module.context();
+        let position = self.index_along_axis(location, dim, n, &dims, mlir_block)?;
+        let last: Operation<'a> =
+            create_int_constant(context, location, Int::I32((n - 1) as u32))
+                .map_err(|e| MlirError::CreateOperation { err: e })?
+                .into();
+        let last_val: Value<'a, 'a> =
+            last.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
+        mlir_block.append_operation(last);
+        let last_splat: Operation<'a> = splat(context, location, last_val, position.r#type())
+            .map_err(|e| MlirError::CreateOperation { err: e })?
+            .into();
+        let last_tensor: Value<'a, 'a> = last_splat
+            .result(0)
+            .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?
+            .into();
+        mlir_block.append_operation(last_splat);
+        let reversed: Operation<'a> =
+            melior::dialect::arith::subi(last_tensor, position, location);
+        let index: Value<'a, 'a> =
+            reversed.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
+        mlir_block.append_operation(reversed);
+
+        let op: Operation<'a> = gather(context, location, src, index, dim, false, src.r#type())
+            .map_err(|e| MlirError::CreateOperation { err: e })?;
+        let result = op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+        mlir_block.append_operation(op);
+        Ok(Some(result.into()))
+    }
+
+    /// The compile-time value of an `Option<i32>` argument. It arrives either as a MIR constant
+    /// (`const Option::<i32>::Some(0_i32)`), destructured with const-eval, or as a local built
+    /// by an aggregate, whose `Some` payload in `option_table` is an `arith.constant`.
+    fn const_option_i32<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        operand: &Operand<'tcx>,
+        state: &CodegenState<'a, 'a>,
+    ) -> Result<Option<i32>, MlirError> {
+        let fail = || MlirError::CodegenFailed {
+            err: format!("expected a compile-time Option<i32>, got {operand:?}"),
+        };
+        match operand {
+            Operand::Constant(c) => {
+                let typing_env = TypingEnv::fully_monomorphized();
+                let konst = instance.instantiate_mir_and_normalize_erasing_regions(
+                    tcx,
+                    typing_env,
+                    EarlyBinder::bind(tcx, c.const_),
+                );
+                let value = konst.eval(tcx, typing_env, c.span).map_err(|_| fail())?;
+                let ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                    tcx,
+                    typing_env,
+                    EarlyBinder::bind(tcx, operand.ty(mir, tcx)),
+                );
+                let parts =
+                    tcx.try_destructure_mir_constant_for_user_output(value, ty).ok_or_else(fail)?;
+                match parts.fields {
+                    [] => Ok(None),
+                    [(ConstValue::Scalar(Scalar::Int(int)), _)] => Ok(Some(int.to_i32())),
+                    _ => Err(fail()),
+                }
+            }
+            Operand::Copy(p) | Operand::Move(p) => {
+                match state.option_table.get(&p.local).ok_or_else(fail)? {
+                    None => Ok(None),
+                    Some(value) => Self::constant_i32(*value).map(Some).ok_or_else(fail),
+                }
+            }
+            Operand::RuntimeChecks(_) => Err(fail()),
+        }
+    }
+
+    /// The value of an `i32` produced by an `arith.constant`, if that is its definition.
+    fn constant_i32(value: Value<'a, 'a>) -> Option<i32> {
+        let result = melior::ir::operation::OperationResult::try_from(value).ok()?;
+        let op = result.owner();
+        if op.name().as_string_ref().as_str().ok()? != "arith.constant" {
+            return None;
+        }
+        let attr = op.attribute("value").ok()?;
+        i32::try_from(melior::ir::attribute::IntegerAttribute::try_from(attr).ok()?.value()).ok()
+    }
 
     /// `triton::Triton::gather` — indexed gather along an axis (`tt.gather`).
     pub fn codegen_gather_call<'tcx>(
