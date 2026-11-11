@@ -416,4 +416,28 @@ mod tests {
             );
         }
     }
+
+    // teenyc-3vx: integer T::maximum emitted arith.maximumf, which fails verification, and
+    // T::minimum used the signed op for unsigned tensors.
+    #[test]
+    fn test_int_minmax() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_int_minmax.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_int_minmax");
+        assert!(result.is_ok(), "int_minmax compile failed: {:?}", result.err());
+
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        for op in ["max.s32", "min.s32", "max.u32", "min.u32"] {
+            assert!(
+                ptx.lines().any(|l| l.trim_start().starts_with(op)),
+                "no `{op}` instruction in PTX:\n{ptx}"
+            );
+        }
+    }
 }
