@@ -719,22 +719,13 @@ impl<'a> TritonCodegen<'a> {
         mlir_block: &BlockRef<'a, 'a>,
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<Option<Value<'a, 'a>>, MlirError> {
-        // Get shape from the slice argument.
-        let shape: Vec<i64> = if let Some(Spanned {
-            node: Operand::Move(slice_place) | Operand::Copy(slice_place),
-            ..
-        }) = args.first()
-        {
-            state.slice_shape.get(&slice_place.local).cloned().unwrap_or_else(|| {
-                eprintln!(
-                    "[WARN] codegen_zeros: slice_shape not found for {:?}; using [1]",
-                    slice_place.local
-                );
-                vec![1]
-            })
-        } else {
-            vec![1]
-        };
+        // The shape has to be known at compile time; a one-element fallback would compile a
+        // kernel that silently works on the wrong number of elements.
+        let shape_arg = &args
+            .first()
+            .ok_or_else(|| MlirError::CodegenFailed { err: "zeros: missing shape".to_string() })?
+            .node;
+        let shape = self.shape_from_slice_arg(shape_arg, state, "zeros")?;
 
         // Get the element Rust type from the destination.
         let dest_ty = destination.ty(mir, tcx).ty;
@@ -1360,12 +1351,9 @@ impl<'a> TritonCodegen<'a> {
             mlir_block.append_operation(op);
             Ok(Some(result.into()))
         } else {
-            // Incompatible shapes (e.g. kitchen-sink test with mismatched dims):
-            // return source unchanged so downstream ops remain type-consistent.
-            eprintln!(
-                "[WARN] broadcast_to: incompatible shapes src={src_dims:?} dst={shape:?}; returning src unchanged"
-            );
-            Ok(Some(src))
+            Err(MlirError::CodegenFailed {
+                err: format!("broadcast_to cannot broadcast {src_dims:?} to {shape:?}"),
+            })
         }
     }
 
@@ -1478,14 +1466,14 @@ impl<'a> TritonCodegen<'a> {
             src_tensor.dims().map_err(|e| MlirError::InvalidType { msg: e.to_string() })?;
         let elem_ty = src_tensor.element();
 
-        // Guard: order length must equal tensor rank.
         if order_i32.len() != src_dims.len() {
-            eprintln!(
-                "[WARN] permute: order len {} != rank {}; returning src unchanged",
-                order_i32.len(),
-                src_dims.len()
-            );
-            return Ok(Some(src));
+            return Err(MlirError::CodegenFailed {
+                err: format!(
+                    "permute order {order_i32:?} has {} entries for a rank-{} tensor",
+                    order_i32.len(),
+                    src_dims.len()
+                ),
+            });
         }
 
         // Apply permutation to get result dims.
@@ -1714,10 +1702,12 @@ impl<'a> TritonCodegen<'a> {
         let dst_numel: i64 = shape.iter().product();
 
         if src_numel != dst_numel && src_numel > 0 && dst_numel > 0 {
-            eprintln!(
-                "[WARN] view: element count mismatch {src_numel} vs {dst_numel}; returning src unchanged"
-            );
-            return Ok(Some(src));
+            return Err(MlirError::CodegenFailed {
+                err: format!(
+                    "view from {src_dims:?} to {shape:?} changes the element count \
+                     ({src_numel} vs {dst_numel})"
+                ),
+            });
         }
 
         let result_ty = tensor_type(&shape, elem_ty).into();
@@ -1908,12 +1898,10 @@ impl<'a> TritonCodegen<'a> {
         let last_dim = src_dims.last().copied().unwrap_or(0);
 
         // tt.split requires the last dimension to be 2.
-        // If it's not (e.g. kitchen-sink test with inconsistent shapes), just
-        // store src twice as a no-op so subsequent field accesses still work.
         if last_dim != 2 {
-            eprintln!("[WARN] split: last dim {} != 2; using src for both halves", last_dim);
-            state.tuple_fields.insert(destination.local, vec![src, src])?;
-            return Ok(None);
+            return Err(MlirError::CodegenFailed {
+                err: format!("split needs a last dimension of 2, got {src_dims:?}"),
+            });
         }
 
         // Output type: same as input without the last dimension (which must be 2).
@@ -1979,7 +1967,6 @@ impl<'a> TritonCodegen<'a> {
         )?;
 
         // tt.dot requires 2D operands with compatible shapes [M×K] × [K×N] → [M×N].
-        // If shapes don't match (e.g. kitchen-sink API coverage test), degrade gracefully.
         let (a_dims, b_dims) = {
             let a_ty: Result<RankedTensorType<'a>, _> = a.r#type().try_into();
             let b_ty: Result<RankedTensorType<'a>, _> = b.r#type().try_into();
@@ -1990,8 +1977,9 @@ impl<'a> TritonCodegen<'a> {
                     (ad, bd)
                 }
                 _ => {
-                    eprintln!("[WARN] dot: operands are not ranked tensors; returning a");
-                    return Ok(Some(a));
+                    return Err(MlirError::CodegenFailed {
+                        err: "dot operands must be ranked tensors".to_string(),
+                    });
                 }
             }
         };
@@ -2002,8 +1990,12 @@ impl<'a> TritonCodegen<'a> {
             && (a_dims[1] == b_dims[0] || a_dims[1] == i64::MIN || b_dims[0] == i64::MIN);
 
         if !dot_valid {
-            eprintln!("[WARN] dot: shape mismatch a={:?} b={:?}; returning a", a_dims, b_dims);
-            return Ok(Some(a));
+            return Err(MlirError::CodegenFailed {
+                err: format!(
+                    "dot needs 2-D operands with matching inner dimensions, got {a_dims:?} and \
+                     {b_dims:?}"
+                ),
+            });
         }
 
         // Accumulator: use provided acc or create a zero tensor of shape [M×N].
@@ -2163,22 +2155,28 @@ impl<'a> TritonCodegen<'a> {
         let rhs_dims =
             rhs.r#type().try_into().ok().and_then(|t: RankedTensorType<'a>| t.dims().ok());
 
-        let valid = match (&lhs_dims, &rhs_dims) {
-            (Some(ld), Some(rd)) if ld.len() == 2 && rd.len() == 2 => {
-                let k_lhs = ld[1];
-                let k_rhs = rd[0];
-                k_lhs == k_rhs || k_lhs == i64::MIN || k_rhs == i64::MIN
+        let (lhs_dims, rhs_dims) = match (lhs_dims, rhs_dims) {
+            (Some(ld), Some(rd))
+                if ld.len() == 2
+                    && rd.len() == 2
+                    && (ld[1] == rd[0] || ld[1] == i64::MIN || rd[0] == i64::MIN) =>
+            {
+                (ld, rd)
             }
-            _ => false,
+            (ld, rd) => {
+                let describe = |d: Option<Vec<i64>>| {
+                    d.map_or("a non-tensor".to_string(), |d| format!("{d:?}"))
+                };
+                return Err(MlirError::CodegenFailed {
+                    err: format!(
+                        "dot_scaled needs 2-D operands with matching inner dimensions, got {} \
+                         and {}",
+                        describe(ld),
+                        describe(rd)
+                    ),
+                });
+            }
         };
-
-        if !valid {
-            eprintln!(
-                "[WARN] dot_scaled: incompatible shapes lhs={:?} rhs={:?}; returning lhs",
-                lhs_dims, rhs_dims
-            );
-            return Ok(Some(lhs));
-        }
 
         // Read DotFormat discriminant for lhs_format (args[2]).
         // DotFormat is a fieldless enum whose discriminant fits in u8 (size 1),
@@ -2221,8 +2219,6 @@ impl<'a> TritonCodegen<'a> {
             state,
         )?;
 
-        let lhs_dims = lhs_dims.unwrap();
-        let rhs_dims = rhs_dims.unwrap();
         let lhs_ty: RankedTensorType<'a> = lhs
             .r#type()
             .try_into()

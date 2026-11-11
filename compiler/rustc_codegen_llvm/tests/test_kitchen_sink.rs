@@ -769,6 +769,67 @@ mod tests {
         let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_reshape_numel_mismatch");
     }
 
+    // teenyc-1l5: a shape op given a shape it can't produce must fail to compile; each used to
+    // warn and fall back to one of its inputs (or, for zeros, a one-element tensor). A codegen
+    // error panics inside rustc and reaches the test through `run_compiler`.
+    fn compile_shape_op(op: &str) {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join(format!("tests/data/triton_shape_op_{op}.rs"));
+        let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", &format!("test_shape_op_{op}"));
+    }
+
+    #[test]
+    #[should_panic(expected = "view from [1024] to [64] changes the element count")]
+    fn test_shape_op_view_rejected() {
+        compile_shape_op("view");
+    }
+
+    #[test]
+    #[should_panic(expected = "broadcast_to cannot broadcast [1024] to [64]")]
+    fn test_shape_op_broadcast_to_rejected() {
+        compile_shape_op("broadcast_to");
+    }
+
+    #[test]
+    #[should_panic(expected = "permute order [1, 0] has 2 entries for a rank-1 tensor")]
+    fn test_shape_op_permute_rejected() {
+        compile_shape_op("permute");
+    }
+
+    #[test]
+    #[should_panic(expected = "split needs a last dimension of 2, got [1024]")]
+    fn test_shape_op_split_rejected() {
+        compile_shape_op("split");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "dot needs 2-D operands with matching inner dimensions, got [32, 64] and [32, 64]"
+    )]
+    fn test_shape_op_dot_rejected() {
+        compile_shape_op("dot");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "dot_scaled needs 2-D operands with matching inner dimensions, got [32, 64] and [32, 64]"
+    )]
+    fn test_shape_op_dot_scaled_rejected() {
+        compile_shape_op("dot_scaled");
+    }
+
+    #[test]
+    #[should_panic(expected = "zeros: slice_shape not found")]
+    fn test_shape_op_zeros_rejected() {
+        compile_shape_op("zeros");
+    }
+
     // teenyc-32u: a descriptor op whose slice argument is chosen at run time must fail to
     // compile; it used to emit ub.poison, or drop the store entirely. Since teenyc-2m7 the slice
     // local is rejected when it is recorded, before the descriptor op. A codegen error panics
