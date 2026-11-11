@@ -641,7 +641,7 @@ impl<'a> TritonCodegen<'a> {
             args.first()
         {
             if let Some(shape) = state.slice_shape.get(&src_place.local).cloned() {
-                state.slice_shape.insert(destination.local, shape.clone());
+                state.slice_shape.insert(destination.local, shape.clone())?;
                 eprintln!(
                     "[DEBUG] codegen_transmute_slice: shape={shape:?} → {:?}",
                     destination.local
@@ -649,7 +649,7 @@ impl<'a> TritonCodegen<'a> {
                 return Ok(None);
             }
             if let Some(vals) = state.slice_dyn_values.get(&src_place.local).cloned() {
-                state.slice_dyn_values.insert(destination.local, vals);
+                state.slice_dyn_values.insert(destination.local, vals)?;
                 eprintln!("[DEBUG] codegen_transmute_slice: dyn_values → {:?}", destination.local);
                 return Ok(None);
             }
@@ -1235,7 +1235,7 @@ impl<'a> TritonCodegen<'a> {
         };
 
         // Store both results as tuple fields; return None to skip ssa_values insertion.
-        state.tuple_fields.insert(destination.local, vec![lhs_out, rhs_out]);
+        state.tuple_fields.insert(destination.local, vec![lhs_out, rhs_out])?;
         Ok(None)
     }
 
@@ -1850,7 +1850,7 @@ impl<'a> TritonCodegen<'a> {
         // store src twice as a no-op so subsequent field accesses still work.
         if last_dim != 2 {
             eprintln!("[WARN] split: last dim {} != 2; using src for both halves", last_dim);
-            state.tuple_fields.insert(destination.local, vec![src, src]);
+            state.tuple_fields.insert(destination.local, vec![src, src])?;
             return Ok(None);
         }
 
@@ -1866,7 +1866,7 @@ impl<'a> TritonCodegen<'a> {
         mlir_block.append_operation(op);
 
         // Store as tuple fields; return None to skip ssa_values insertion.
-        state.tuple_fields.insert(destination.local, vec![lhs_val, rhs_val]);
+        state.tuple_fields.insert(destination.local, vec![lhs_val, rhs_val])?;
         Ok(None)
     }
 
@@ -2526,7 +2526,7 @@ impl<'a> TritonCodegen<'a> {
 
         state
             .block_ptrs
-            .insert(dest, BlockPtr { base, shape, strides, offsets, block_shape, order });
+            .insert(dest, BlockPtr { base, shape, strides, offsets, block_shape, order })?;
         Ok(None)
     }
 
@@ -2578,7 +2578,7 @@ impl<'a> TritonCodegen<'a> {
                 op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
             mlir_block.append_operation(op);
         }
-        state.block_ptrs.insert(dest, bp);
+        state.block_ptrs.insert(dest, bp)?;
         Ok(None)
     }
 
@@ -2658,7 +2658,7 @@ impl<'a> TritonCodegen<'a> {
             .map_err(|e| Self::unresolved_slice("make_tensor_descriptor", "block_shape", e))?;
         let block_shape: Vec<i64> = block_shape.iter().map(|&v| i64::from(v)).collect();
         // Recorded for descriptor_load, whose result type is the descriptor's block.
-        state.desc_block_shapes.insert(destination.local, block_shape.clone());
+        state.desc_block_shapes.insert(destination.local, block_shape.clone())?;
 
         let base = self.codegen_operand(
             tcx,
@@ -4250,7 +4250,7 @@ impl<'a> TritonCodegen<'a> {
         let new_i = emit(addi(off_i, emit(remsi(ij_in_group, group_rows, location))?, location))?;
         let new_j = emit(divsi(ij_in_group, group_rows, location))?;
 
-        state.tuple_fields.insert(destination.local, vec![new_i, new_j]);
+        state.tuple_fields.insert(destination.local, vec![new_i, new_j])?;
         Ok(None)
     }
 
@@ -4549,7 +4549,7 @@ impl<'a> TritonCodegen<'a> {
             mlir_block,
             state,
         )?;
-        state.tuple_fields.insert(destination.local, vec![value, index]);
+        state.tuple_fields.insert(destination.local, vec![value, index])?;
         Ok(None)
     }
 
@@ -4581,7 +4581,7 @@ impl<'a> TritonCodegen<'a> {
             mlir_block,
             state,
         )?;
-        state.tuple_fields.insert(destination.local, vec![value, index]);
+        state.tuple_fields.insert(destination.local, vec![value, index])?;
         Ok(None)
     }
 
@@ -5940,7 +5940,7 @@ impl<'a> TritonCodegen<'a> {
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<Option<Value<'a, 'a>>, MlirError> {
         let streams = self.philox_streams(tcx, instance, mir, args, location, mlir_block, state)?;
-        state.tuple_fields.insert(destination.local, streams.to_vec());
+        state.tuple_fields.insert(destination.local, streams.to_vec())?;
         Ok(None)
     }
 

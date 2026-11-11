@@ -48,7 +48,7 @@ use rustc_mlir::shared::builtin::{tensor_type, tensor_type_like};
 use rustc_mlir::shared::ub::create_ub_poison;
 use rustc_mlir::triton::tensor::splat;
 use rustc_mlir::triton::{create_func, int_to_ptr, load_triton_dialect};
-use rustc_span::DUMMY_SP;
+use rustc_span::{DUMMY_SP, Span};
 
 use crate::mlir::MlirModule;
 use crate::mlir::codegen::Codegen;
@@ -68,81 +68,114 @@ type SsaValues<'c, 'p> = HashMap<Local, Value<'c, 'p>>;
 /// `None` entry  → the local holds the `None` variant (no inner value).
 /// `Some(v)` entry → the local holds `Some(v)` with this MLIR value as the inner.
 /// These locals are NEVER inserted into `SsaValues`.
-type OptionTable<'c, 'p> = HashMap<Local, Option<Value<'c, 'p>>>;
+type OptionTable<'c, 'p> = LocalTable<Option<Value<'c, 'p>>>;
 
 /// Tracks tuple MIR locals (including the return place `_0` for tuple-returning functions).
 /// The vec contains the individual MLIR values for each tuple field in order.
-type TupleTable<'c, 'p> = HashMap<Local, Vec<Value<'c, 'p>>>;
+type TupleTable<'c, 'p> = LocalTable<Vec<Value<'c, 'p>>>;
 
 /// Constant integer arrays (e.g. shape arrays like `[BLOCK_SIZE]`).
 /// Keyed by the MIR `Local` that holds the array; value is the elements as `i64`.
-type ConstArrays = HashMap<Local, Vec<i64>>;
+type ConstArrays = LocalTable<Vec<i64>>;
 
 /// Maps a raw-pointer local (from `&raw const arr`) to the `ConstArrays` key it was derived from.
-type PtrToConstArray = HashMap<Local, Local>;
+type PtrToConstArray = LocalTable<Local>;
 
 /// Maps a MIR local that holds `&[i32]` (built from a const array via `slice_from_raw_parts` /
 /// `transmute`) to the shape extracted from the underlying `ConstArrays` entry.
-type SliceShape = SliceTable<Vec<i64>>;
+type SliceShape = LocalTable<Vec<i64>>;
 
 /// Runtime (non-constant) arrays: elements are SSA `Value`s instead of `i64` literals.
-type DynArrays<'c, 'p> = HashMap<Local, Vec<Value<'c, 'p>>>;
+type DynArrays<'c, 'p> = LocalTable<Vec<Value<'c, 'p>>>;
 
 /// Maps a raw-pointer local derived from a `dyn_array` to the source array local.
-type PtrToDynArray = HashMap<Local, Local>;
+type PtrToDynArray = LocalTable<Local>;
 
 /// Slice (fat pointer) whose elements are runtime SSA values — parallel to `SliceShape` for
 /// the dynamic case.
-type SliceDynValues<'c, 'p> = SliceTable<Vec<Value<'c, 'p>>>;
+type SliceDynValues<'c, 'p> = LocalTable<Vec<Value<'c, 'p>>>;
 
-/// A slice side table (`SliceShape`, `SliceDynValues`). Like the other side tables it is
-/// flow-insensitive: one entry per local, whichever assignment recorded it. That is only sound
-/// for a local with a single definition, so a local assigned more than once (e.g. a slice
-/// chosen by an `if`) is never recorded, and lookups for it fail instead of returning the
-/// value from one arm.
-pub(crate) struct SliceTable<V> {
+/// A side table for MIR locals whose values have no single SSA form (Options, tuples, constant
+/// and runtime arrays, slices, block pointers, descriptor block shapes). Unlike `ssa_values`,
+/// which gets block arguments at joins and loop headers, these tables are flow-insensitive: one
+/// entry per local. That is only sound for a local with a single definition, so recording a
+/// local that is assigned in more than one reachable place (e.g. chosen by an `if`) is an
+/// error, rather than silently keeping the value from one assignment.
+pub(crate) struct LocalTable<V> {
     entries: HashMap<Local, V>,
-    multiply_assigned: Rc<HashSet<Local>>,
+    multiply_assigned: Rc<MultiplyAssigned>,
+    /// What the table holds, for the error message.
+    kind: &'static str,
 }
 
-impl<V> SliceTable<V> {
-    fn new(multiply_assigned: Rc<HashSet<Local>>) -> Self {
-        Self { entries: HashMap::new(), multiply_assigned }
+impl<V> LocalTable<V> {
+    fn new(kind: &'static str) -> Self {
+        Self { entries: HashMap::new(), multiply_assigned: Rc::default(), kind }
+    }
+
+    fn set_multiply_assigned(&mut self, multiply_assigned: &Rc<MultiplyAssigned>) {
+        self.multiply_assigned = Rc::clone(multiply_assigned);
     }
 
     pub(crate) fn get(&self, local: &Local) -> Option<&V> {
         self.entries.get(local)
     }
 
-    pub(crate) fn insert(&mut self, local: Local, value: V) {
-        if !self.multiply_assigned.contains(&local) {
-            self.entries.insert(local, value);
+    pub(crate) fn contains_key(&self, local: &Local) -> bool {
+        self.entries.contains_key(local)
+    }
+
+    pub(crate) fn insert(&mut self, local: Local, value: V) -> Result<(), MlirError> {
+        if let Some(spans) = self.multiply_assigned.get(&local) {
+            let places: Vec<String> = spans.iter().map(|span| format!("{span:?}")).collect();
+            return Err(MlirError::CodegenFailed {
+                err: format!(
+                    "{local:?} is assigned in more than one place ({}), but its value ({}) has \
+                     no SSA form to merge them; assign it once",
+                    places.join(", "),
+                    self.kind
+                ),
+            });
         }
+        self.entries.insert(local, value);
+        Ok(())
     }
 }
 
-/// Locals with more than one whole-local definition (assignment or call destination) in `mir`.
-fn multiply_assigned_locals(mir: &Body<'_>) -> HashSet<Local> {
-    let definitions = mir.basic_blocks.iter().flat_map(|block| {
+/// Locals with more than one definition, mapped to the source span of each definition.
+type MultiplyAssigned = HashMap<Local, Vec<Span>>;
+
+/// Locals with more than one whole-local definition (assignment or call destination) in the
+/// `reachable` blocks of `mir`. Blocks pruned by constant folding don't count, so a definition in
+/// a dead branch doesn't make a local ambiguous.
+fn multiply_assigned_locals(mir: &Body<'_>, reachable: &HashSet<BasicBlock>) -> MultiplyAssigned {
+    let mut definitions: MultiplyAssigned = HashMap::new();
+    for (bb, block) in mir.basic_blocks.iter_enumerated() {
+        if !reachable.contains(&bb) {
+            continue;
+        }
         let assigned = block.statements.iter().filter_map(|statement| match &statement.kind {
-            StatementKind::Assign(assign) => Some(assign.0),
+            StatementKind::Assign(assign) => Some((assign.0, statement.source_info.span)),
             _ => None,
         });
         let called = block.terminator.as_ref().and_then(|terminator| match &terminator.kind {
-            rustc_middle::mir::TerminatorKind::Call { destination, .. } => Some(*destination),
+            rustc_middle::mir::TerminatorKind::Call { destination, .. } => {
+                Some((*destination, terminator.source_info.span))
+            }
             _ => None,
         });
-        assigned.chain(called)
-    });
-    let mut seen = HashSet::new();
+        for (place, span) in assigned.chain(called) {
+            if place.projection.is_empty() {
+                definitions.entry(place.local).or_default().push(span);
+            }
+        }
+    }
+    definitions.retain(|_, spans| spans.len() > 1);
     definitions
-        .filter(|place| place.projection.is_empty())
-        .filter_map(|place| (!seen.insert(place.local)).then_some(place.local))
-        .collect()
 }
 
 /// Maps a descriptor local to its block shape (the tile dimensions it loads).
-type DescBlockShapes = HashMap<Local, Vec<i64>>;
+type DescBlockShapes = LocalTable<Vec<i64>>;
 
 /// Maps a MIR local to its statically-known discriminant value (u64).
 /// Built by pre-scanning for `SetDiscriminant` and `Discriminant` assignments
@@ -188,7 +221,7 @@ pub(crate) struct CodegenState<'c, 'p> {
     /// Block shapes for tensor descriptors: `desc_local → [dim0, dim1, ...]`.
     pub(crate) desc_block_shapes: DescBlockShapes,
     /// Block pointers, which have no MLIR value (see `BlockPtr`).
-    pub(crate) block_ptrs: HashMap<Local, BlockPtr<'c, 'p>>,
+    pub(crate) block_ptrs: LocalTable<BlockPtr<'c, 'p>>,
     /// When generating inside a `scf.for` body: the MIR basic block that is the loop header.
     /// `codegen_goto` checks this and emits `scf.yield` instead of `cf.br` on the back edge.
     pub(crate) loop_header_bb: Option<BasicBlock>,
@@ -222,19 +255,33 @@ pub(crate) struct CodegenState<'c, 'p> {
 }
 
 impl<'c, 'p> CodegenState<'c, 'p> {
+    /// Gives every `LocalTable` the function's multiply-assigned locals.
+    fn set_multiply_assigned(&mut self, multiply_assigned: &Rc<MultiplyAssigned>) {
+        self.option_table.set_multiply_assigned(multiply_assigned);
+        self.tuple_fields.set_multiply_assigned(multiply_assigned);
+        self.const_arrays.set_multiply_assigned(multiply_assigned);
+        self.ptr_to_const_array.set_multiply_assigned(multiply_assigned);
+        self.slice_shape.set_multiply_assigned(multiply_assigned);
+        self.dyn_arrays.set_multiply_assigned(multiply_assigned);
+        self.ptr_to_dyn_array.set_multiply_assigned(multiply_assigned);
+        self.slice_dyn_values.set_multiply_assigned(multiply_assigned);
+        self.desc_block_shapes.set_multiply_assigned(multiply_assigned);
+        self.block_ptrs.set_multiply_assigned(multiply_assigned);
+    }
+
     fn new() -> Self {
         Self {
             ssa_values: HashMap::new(),
-            option_table: HashMap::new(),
-            tuple_fields: HashMap::new(),
-            const_arrays: HashMap::new(),
-            ptr_to_const_array: HashMap::new(),
-            slice_shape: SliceTable::new(Rc::default()),
-            dyn_arrays: HashMap::new(),
-            ptr_to_dyn_array: HashMap::new(),
-            slice_dyn_values: SliceTable::new(Rc::default()),
-            desc_block_shapes: HashMap::new(),
-            block_ptrs: HashMap::new(),
+            option_table: LocalTable::new("an Option"),
+            tuple_fields: LocalTable::new("a tuple"),
+            const_arrays: LocalTable::new("a constant array"),
+            ptr_to_const_array: LocalTable::new("a pointer to a constant array"),
+            slice_shape: LocalTable::new("a constant slice"),
+            dyn_arrays: LocalTable::new("an array of runtime values"),
+            ptr_to_dyn_array: LocalTable::new("a pointer to a runtime array"),
+            slice_dyn_values: LocalTable::new("a slice of runtime values"),
+            desc_block_shapes: LocalTable::new("a tensor descriptor"),
+            block_ptrs: LocalTable::new("a block pointer"),
             loop_header_bb: None,
             loop_iter_carry_locals: Vec::new(),
             loop_body_bbs: HashSet::new(),
@@ -1725,7 +1772,7 @@ impl<'a> TritonCodegen<'a> {
             // For the Call-header pattern (Rust 1.93+): pre-populate the Range::next result local
             // as Some(iv) in the option_table so that `_induction = ((_next as Some).0)` resolves.
             if let Some(nrl) = loop_info.next_result_local {
-                state.option_table.insert(nrl, Some(iv));
+                state.option_table.insert(nrl, Some(iv))?;
             }
         }
 
@@ -2045,9 +2092,6 @@ impl<'a> TritonCodegen<'a> {
         let mir = tcx.instance_mir(instance.def);
         let location = func_loc;
 
-        let multiply_assigned = Rc::new(multiply_assigned_locals(mir));
-        state.slice_shape = SliceTable::new(Rc::clone(&multiply_assigned));
-        state.slice_dyn_values = SliceTable::new(multiply_assigned);
 
         if func_name.contains("program_id") {
             //println!("[DEBUG] TritonCodegen::codegen_function: mir: {:?}", mir);
@@ -2068,6 +2112,14 @@ impl<'a> TritonCodegen<'a> {
         // Detect all Range-based `for` loops. Loop body blocks live in the scf.for region, not
         // in the function region, so we skip creating MLIR blocks for them here.
         let loop_infos = detect_range_loop(*instance, mir);
+
+        // A `for` loop's `Range::next` result is defined by the scf.for lowering (as
+        // `Some(induction)`), not by the `Some`/`None` assignments of the inlined `next`.
+        let mut multiply_assigned = multiply_assigned_locals(mir, &reachable_bbs);
+        for next_result in loop_infos.iter().filter_map(|l| l.next_result_local) {
+            multiply_assigned.remove(&next_result);
+        }
+        state.set_multiply_assigned(&Rc::new(multiply_assigned));
 
         // The set of MIR blocks that belong to any scf.for region.
         let mut loop_region_blocks: HashSet<BasicBlock> = HashSet::new();
@@ -2155,7 +2207,7 @@ impl<'a> TritonCodegen<'a> {
                 for (param_idx, input_ty) in inputs.iter().enumerate() {
                     let local = Local::from_usize(param_idx + 1);
                     if is_option_ty(tcx, *input_ty) {
-                        state.option_table.insert(local, None);
+                        state.option_table.insert(local, None)?;
                     } else {
                         let value = block.add_argument(arg_types[mlir_arg_idx], location);
                         state.ssa_values.insert(local, value);
@@ -2385,7 +2437,7 @@ impl<'a> TritonCodegen<'a> {
                             todo!("RuntimeChecks operand not yet supported")
                         }
                     };
-                    state.option_table.insert(place.local, opt_value);
+                    state.option_table.insert(place.local, opt_value)?;
                     return Ok(());
                 }
 
@@ -2402,7 +2454,7 @@ impl<'a> TritonCodegen<'a> {
                         )?,
                         Operand::RuntimeChecks(_) => todo!("RuntimeChecks for tuple"),
                     };
-                    state.tuple_fields.insert(place.local, fields);
+                    state.tuple_fields.insert(place.local, fields)?;
                     return Ok(());
                 }
 
@@ -2412,44 +2464,44 @@ impl<'a> TritonCodegen<'a> {
                     if src.projection.is_empty() {
                         // dyn_array copy: _dest = copy _src where _src is in dyn_arrays.
                         if let Some(elems) = state.dyn_arrays.get(&src.local).cloned() {
-                            state.dyn_arrays.insert(place.local, elems);
+                            state.dyn_arrays.insert(place.local, elems)?;
                             return Ok(());
                         }
                         // const_array copy: _dest = copy _src where _src is in const_arrays.
                         // MIR GVN produces this for a repeated shape literal (`&[n]` twice),
                         // and a constant array has no SSA value to fall back on.
                         if let Some(elems) = state.const_arrays.get(&src.local).cloned() {
-                            state.const_arrays.insert(place.local, elems);
+                            state.const_arrays.insert(place.local, elems)?;
                             return Ok(());
                         }
                         // Block pointers have no SSA value either.
                         if let Some(bp) = state.block_ptrs.get(&src.local).cloned() {
-                            state.block_ptrs.insert(place.local, bp);
+                            state.block_ptrs.insert(place.local, bp)?;
                             return Ok(());
                         }
                         // const_array pointer copy.
                         if let Some(&arr_local) = state.ptr_to_const_array.get(&src.local) {
-                            state.ptr_to_const_array.insert(place.local, arr_local);
+                            state.ptr_to_const_array.insert(place.local, arr_local)?;
                             return Ok(());
                         }
                         // dyn_array pointer copy.
                         if let Some(&arr_local) = state.ptr_to_dyn_array.get(&src.local) {
-                            state.ptr_to_dyn_array.insert(place.local, arr_local);
+                            state.ptr_to_dyn_array.insert(place.local, arr_local)?;
                             return Ok(());
                         }
                         // slice_dyn_values copy.
                         if let Some(vals) = state.slice_dyn_values.get(&src.local).cloned() {
-                            state.slice_dyn_values.insert(place.local, vals);
+                            state.slice_dyn_values.insert(place.local, vals)?;
                             return Ok(());
                         }
                         // slice_shape copy.
                         if let Some(shape) = state.slice_shape.get(&src.local).cloned() {
-                            state.slice_shape.insert(place.local, shape);
+                            state.slice_shape.insert(place.local, shape)?;
                             return Ok(());
                         }
                         // ADT/Range locals stored in tuple_fields (e.g. Range moves for for-loops).
                         if let Some(fields) = state.tuple_fields.get(&src.local).cloned() {
-                            state.tuple_fields.insert(place.local, fields);
+                            state.tuple_fields.insert(place.local, fields)?;
                             return Ok(());
                         }
                     }
@@ -2466,7 +2518,7 @@ impl<'a> TritonCodegen<'a> {
                     if let Some(shape) =
                         self.try_read_array_ref_const(tcx, *instance, const_ty, &c.const_)
                     {
-                        state.slice_shape.insert(place.local, shape);
+                        state.slice_shape.insert(place.local, shape)?;
                         // Fall through to codegen_operand to emit a placeholder SSA value.
                     }
                 }
@@ -2497,7 +2549,7 @@ impl<'a> TritonCodegen<'a> {
                 if matches!(cast_kind, CastKind::PtrToPtr) {
                     if let Operand::Copy(src_place) | Operand::Move(src_place) = operand {
                         if let Some(&arr_local) = state.ptr_to_const_array.get(&src_place.local) {
-                            state.ptr_to_const_array.insert(place.local, arr_local);
+                            state.ptr_to_const_array.insert(place.local, arr_local)?;
                             return Ok(());
                         }
                     }
@@ -2507,7 +2559,7 @@ impl<'a> TritonCodegen<'a> {
                 if matches!(cast_kind, CastKind::Transmute) {
                     if let Operand::Copy(src_place) | Operand::Move(src_place) = operand {
                         if let Some(shape) = state.slice_shape.get(&src_place.local).cloned() {
-                            state.slice_shape.insert(place.local, shape);
+                            state.slice_shape.insert(place.local, shape)?;
                             return Ok(());
                         }
                     }
@@ -2528,7 +2580,7 @@ impl<'a> TritonCodegen<'a> {
                         if let Some(shape) =
                             self.try_read_array_ref_const(tcx, *instance, src_ty, &const_op.const_)
                         {
-                            state.slice_shape.insert(place.local, shape);
+                            state.slice_shape.insert(place.local, shape)?;
                             // Fall through to codegen_cast to emit the i64 placeholder value.
                         }
                     } else if let Operand::Copy(p) | Operand::Move(p) = operand {
@@ -2536,19 +2588,19 @@ impl<'a> TritonCodegen<'a> {
                             // Dynamic pointer (from a dyn_array via Ref) → slice_dyn_values.
                             if let Some(&arr_local) = state.ptr_to_dyn_array.get(&p.local) {
                                 if let Some(vals) = state.dyn_arrays.get(&arr_local).cloned() {
-                                    state.slice_dyn_values.insert(place.local, vals);
+                                    state.slice_dyn_values.insert(place.local, vals)?;
                                 } else {
                                 }
                             }
                             // Static pointer (from a const_array via Ref) → slice_shape.
                             if let Some(&arr_local) = state.ptr_to_const_array.get(&p.local) {
                                 if let Some(shape) = state.const_arrays.get(&arr_local).cloned() {
-                                    state.slice_shape.insert(place.local, shape);
+                                    state.slice_shape.insert(place.local, shape)?;
                                 }
                             }
                             // Const array ref assigned directly (e.g. `_x = const &[T; N]`) → slice_shape.
                             if let Some(shape) = state.slice_shape.get(&p.local).cloned() {
-                                state.slice_shape.insert(place.local, shape);
+                                state.slice_shape.insert(place.local, shape)?;
                             }
                         }
                     }
@@ -2594,13 +2646,13 @@ impl<'a> TritonCodegen<'a> {
                         if let Operand::Copy(p) | Operand::Move(p) = first_op {
                             if let Some(&arr_local) = state.ptr_to_const_array.get(&p.local) {
                                 if let Some(shape) = state.const_arrays.get(&arr_local) {
-                                    state.slice_shape.insert(place.local, shape.clone());
+                                    state.slice_shape.insert(place.local, shape.clone())?;
                                     return Ok(());
                                 }
                             }
                             if let Some(&arr_local) = state.ptr_to_dyn_array.get(&p.local) {
                                 if let Some(vals) = state.dyn_arrays.get(&arr_local).cloned() {
-                                    state.slice_dyn_values.insert(place.local, vals);
+                                    state.slice_dyn_values.insert(place.local, vals)?;
                                     return Ok(());
                                 }
                             }
@@ -2614,7 +2666,7 @@ impl<'a> TritonCodegen<'a> {
                             _ => todo!("Tuple aggregate with non-copy/move operand: {:?}", op),
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    state.tuple_fields.insert(place.local, fields);
+                    state.tuple_fields.insert(place.local, fields)?;
                     return Ok(());
                 }
 
@@ -2644,7 +2696,7 @@ impl<'a> TritonCodegen<'a> {
                         })
                         .collect();
                     if let Some(elems) = elems {
-                        state.const_arrays.insert(place.local, elems);
+                        state.const_arrays.insert(place.local, elems)?;
                         return Ok(());
                     }
                     // Non-constant elements: look up each as an SSA value.
@@ -2665,7 +2717,7 @@ impl<'a> TritonCodegen<'a> {
                         })
                         .collect();
                     let dyn_elems = dyn_elems?;
-                    state.dyn_arrays.insert(place.local, dyn_elems);
+                    state.dyn_arrays.insert(place.local, dyn_elems)?;
                     return Ok(());
                 }
 
@@ -2695,7 +2747,7 @@ impl<'a> TritonCodegen<'a> {
                                 }
                             })
                             .collect();
-                        state.tuple_fields.insert(place.local, fields?);
+                        state.tuple_fields.insert(place.local, fields?)?;
                         return Ok(());
                     }
                 }
@@ -2722,11 +2774,11 @@ impl<'a> TritonCodegen<'a> {
                 // downstream slice-coercion and `make_tensor_descriptor` can recover the values.
                 if src_place.projection.is_empty() {
                     if state.const_arrays.contains_key(&src_place.local) {
-                        state.ptr_to_const_array.insert(place.local, src_place.local);
+                        state.ptr_to_const_array.insert(place.local, src_place.local)?;
                         return Ok(());
                     }
                     if state.dyn_arrays.contains_key(&src_place.local) {
-                        state.ptr_to_dyn_array.insert(place.local, src_place.local);
+                        state.ptr_to_dyn_array.insert(place.local, src_place.local)?;
                         return Ok(());
                     }
                 }
@@ -2738,11 +2790,11 @@ impl<'a> TritonCodegen<'a> {
                 // downstream `zeros` / `slice_from_raw_parts` calls can recover the shape.
                 if src_place.projection.is_empty() {
                     if state.const_arrays.contains_key(&src_place.local) {
-                        state.ptr_to_const_array.insert(place.local, src_place.local);
+                        state.ptr_to_const_array.insert(place.local, src_place.local)?;
                         return Ok(());
                     }
                     if state.dyn_arrays.contains_key(&src_place.local) {
-                        state.ptr_to_dyn_array.insert(place.local, src_place.local);
+                        state.ptr_to_dyn_array.insert(place.local, src_place.local)?;
                         return Ok(());
                     }
                 }
@@ -2773,7 +2825,7 @@ impl<'a> TritonCodegen<'a> {
                                 .into();
                         let false_val: Value<'_, '_> = false_op.result(0).unwrap().into();
                         mlir_block.append_operation(false_op);
-                        state.tuple_fields.insert(place.local, vec![result_val, false_val]);
+                        state.tuple_fields.insert(place.local, vec![result_val, false_val])?;
                     }
                 } else {
                     let value = self.codegen_binary_op(
@@ -3092,7 +3144,7 @@ impl<'a> TritonCodegen<'a> {
     ) -> Result<(), MlirError> {
         if variant_index.as_usize() == 0 {
             // None variant — no inner value.
-            state.option_table.insert(place.local, None);
+            state.option_table.insert(place.local, None)?;
         } else {
             // Some(inner) — codegen the single field and stash it.
             let inner_op = index_vec
@@ -3105,7 +3157,7 @@ impl<'a> TritonCodegen<'a> {
             );
             let inner_value = self
                 .codegen_operand(tcx, instance, inner_op, inner_ty, location, mlir_block, state)?;
-            state.option_table.insert(place.local, Some(inner_value));
+            state.option_table.insert(place.local, Some(inner_value))?;
         }
         Ok(())
     }
@@ -3130,7 +3182,7 @@ impl<'a> TritonCodegen<'a> {
         if is_option_ty(tcx, norm_ty) {
             if variant_index.as_usize() == 0 {
                 // Two-phase None: discriminant set to 0.
-                state.option_table.insert(place.local, None);
+                state.option_table.insert(place.local, None)?;
             } else {
                 // Two-phase Some: inner value was written into ssa_values[place.local] by
                 // a preceding field-assignment via Place::Downcast projection.  Promote it.
@@ -3140,7 +3192,7 @@ impl<'a> TritonCodegen<'a> {
                         place.local
                     )
                 });
-                state.option_table.insert(place.local, Some(inner));
+                state.option_table.insert(place.local, Some(inner))?;
             }
             return Ok(());
         }
