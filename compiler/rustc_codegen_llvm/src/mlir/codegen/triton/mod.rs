@@ -3251,7 +3251,7 @@ impl<'a> TritonCodegen<'a> {
                 self.codegen_ptr_to_ptr(tcx, instance, operand, ty, location, mlir_block, state)
             }
             CastKind::IntToInt => {
-                self.codegen_int_to_int(tcx, instance, operand, ty, location, mlir_block, state)
+                self.codegen_int_to_int(tcx, instance, mir, operand, ty, location, mlir_block, state)
             }
             CastKind::IntToFloat => {
                 // For Copy/Move operands, codegen_operand ignores the type and returns the SSA
@@ -3458,10 +3458,14 @@ impl<'a> TritonCodegen<'a> {
         self.codegen_operand(tcx, instance, operand, normalized_ty, location, mlir_block, state)
     }
 
+    /// `x as T` between integer types (including from `bool`): truncate when narrowing, and
+    /// widen by the source's signedness, as Rust does. Integers are signless, so a cast that
+    /// only changes signedness is a no-op.
     fn codegen_int_to_int<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
         operand: &Operand<'tcx>,
         ty: &Ty<'tcx>,
         location: Location<'a>,
@@ -3469,12 +3473,35 @@ impl<'a> TritonCodegen<'a> {
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<Value<'a, 'a>, MlirError> {
         let typing_env = TypingEnv::fully_monomorphized();
-        let normalized_ty = instance.instantiate_mir_and_normalize_erasing_regions(
-            tcx,
-            typing_env,
-            EarlyBinder::bind(tcx, *ty),
-        );
-        self.codegen_operand(tcx, instance, operand, normalized_ty, location, mlir_block, state)
+        let normalize =
+            |ty| instance.instantiate_mir_and_normalize_erasing_regions(tcx, typing_env, ty);
+        let src_ty = normalize(EarlyBinder::bind(tcx, operand.ty(mir, tcx)));
+        let dest_ty = normalize(EarlyBinder::bind(tcx, *ty));
+        let src_val =
+            self.codegen_operand(tcx, instance, operand, src_ty, location, mlir_block, state)?;
+        let dest_mlir_ty = self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty);
+
+        let width = |ty: melior::ir::Type<'a>| {
+            IntegerType::try_from(ty).map(|t| t.width()).map_err(|e| MlirError::InvalidType {
+                msg: format!("int-to-int cast `{src_ty}` as `{dest_ty}`: {e}"),
+            })
+        };
+        let (src_width, dest_width) = (width(src_val.r#type())?, width(dest_mlir_ty)?);
+        let op: Operation<'a> = match src_width.cmp(&dest_width) {
+            std::cmp::Ordering::Equal => return Ok(src_val),
+            std::cmp::Ordering::Greater => {
+                melior::dialect::arith::trunci(src_val, dest_mlir_ty, location).into()
+            }
+            std::cmp::Ordering::Less if Self::is_unsigned(tcx, instance, src_ty) => {
+                melior::dialect::arith::extui(src_val, dest_mlir_ty, location).into()
+            }
+            std::cmp::Ordering::Less => {
+                melior::dialect::arith::extsi(src_val, dest_mlir_ty, location).into()
+            }
+        };
+        let result = op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+        mlir_block.append_operation(op);
+        Ok(result.into())
     }
 
     fn codegen_operand<'tcx>(
