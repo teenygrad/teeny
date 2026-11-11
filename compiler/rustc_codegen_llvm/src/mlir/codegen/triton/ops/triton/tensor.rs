@@ -34,7 +34,6 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv};
 use rustc_mlir::shared::arith::{Int, create_extsi, create_int_constant};
 use rustc_mlir::shared::builtin::tensor_type;
-use rustc_mlir::shared::ub::create_ub_poison;
 use rustc_mlir::triton::program::{ProgramAxis, create_get_num_programs};
 use rustc_target::spec::Arch;
 use rustc_mlir::triton::tensor::{
@@ -43,7 +42,7 @@ use rustc_mlir::triton::tensor::{
     descriptor_load, descriptor_store, dot, dot_scaled, expand_dims, gather, histogram, join, load,
     make_range, make_tensor_descriptor, mulhiui, precise_divf, precise_sqrt,
     print as triton_print, reduce, reduce_return, reshape, scan, scan_return, splat, split, store,
-    trans, zeros_like, bitcast,
+    trans, bitcast,
 };
 use rustc_mlir::triton::{int_to_ptr, pointer_type};
 use rustc_span::Span;
@@ -2350,8 +2349,7 @@ impl<'a> TritonCodegen<'a> {
     }
 
     /// Emit `arith.constant 0.0 / 0` of `elem_ty` and splat to a tensor matching
-    /// the shape of `like_val` (which may be scalar or tensor).  Used by
-    /// `zeros_pointer` and `full`.
+    /// the shape of `like_val` (which may be scalar or tensor).  Used by `full`.
     fn splat_scalar_const(
         &self,
         location: Location<'a>,
@@ -2448,45 +2446,15 @@ impl<'a> TritonCodegen<'a> {
         Ok(out)
     }
 
-    // =========================================================================
-    // Generic stub helpers
-    // =========================================================================
-
-    /// Create a `ub.poison` value of the return type inferred from `destination`.
-    /// Used as a no-semantics stub for operations whose MLIR encoding is not yet
-    /// implemented or whose shapes are not statically known.
-    ///
-    /// Returns `None` if the destination type is `()` (void).
-    pub(crate) fn codegen_ub_stub<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        instance: &Instance<'tcx>,
-        mir: &Body<'tcx>,
-        destination: &Place<'tcx>,
-        location: Location<'a>,
-        mlir_block: &BlockRef<'a, 'a>,
-    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
-        let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
-            tcx,
-            TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(tcx, destination.ty(mir, tcx).ty),
-        );
-
-        // Void (unit) return — no value needed.
-        if let TyKind::Tuple(tys) = dest_ty.kind() {
-            if tys.is_empty() {
-                return Ok(None);
-            }
+    /// The error for a descriptor op whose slice argument can't be resolved to per-dimension
+    /// values, e.g. one chosen at run time.
+    fn unresolved_slice(op: &str, arg: &str, cause: MlirError) -> MlirError {
+        MlirError::CodegenFailed {
+            err: format!(
+                "{op}: cannot resolve `{arg}`; it must be a slice with a single definition \
+                 (not chosen at run time): {cause:?}"
+            ),
         }
-
-        let result_ty = self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty);
-
-        let ub_op: Operation<'a> = create_ub_poison(self.module.context(), location, result_ty)
-            .map_err(|e| MlirError::CreateOperation { err: e })?
-            .into();
-        let val = ub_op.result(0).expect("ub.poison result").into();
-        mlir_block.append_operation(ub_op);
-        Ok(Some(val))
     }
 
     // =========================================================================
@@ -2679,61 +2647,36 @@ impl<'a> TritonCodegen<'a> {
         mlir_block: &BlockRef<'a, 'a>,
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<Option<Value<'a, 'a>>, MlirError> {
-        // args: [base_ptr, &[shape_i64], &[strides_i64], &[block_shape_i32], padding]
-        // Extract and record the block shape FIRST (before any early returns) so that
-        // even if shape/strides are dynamic and we fall back to ub.poison for the descriptor,
-        // we still know the block shape for subsequent descriptor_load calls.
-        if let Some(block_shape_arg) = args.get(3) {
-            println!("[DEBUG-DESC] make_tensor_descriptor: args[3]={:?}", block_shape_arg.node);
-            match self.shape_from_slice_arg_i32(&block_shape_arg.node, state) {
-                Ok(block_shape) => {
-                    let block_shape_i64: Vec<i64> = block_shape.iter().map(|&v| v as i64).collect();
-                    println!(
-                        "[DEBUG-DESC] make_tensor_descriptor: dest={:?} block_shape={:?}",
-                        destination.local, block_shape_i64
-                    );
-                    state.desc_block_shapes.insert(destination.local, block_shape_i64);
-                }
-                Err(e) => {
-                    println!("[DEBUG-DESC] make_tensor_descriptor: block_shape FAILED: {:?}", e);
-                    if let Operand::Copy(p) | Operand::Move(p) = &block_shape_arg.node {
-                        println!(
-                            "[DEBUG-DESC] local={:?} slice_shape={:?} const_arrays={:?}",
-                            p.local,
-                            state.slice_shape.get(&p.local),
-                            state.const_arrays.get(&p.local)
-                        );
-                    }
-                }
-            }
-        } else {
-            println!("[DEBUG-DESC] make_tensor_descriptor: no args[3] (only {} args)", args.len());
-        }
+        // args: [base_ptr, &[shape_i32], &[strides_i32], &[block_shape_i32], padding]
+        let [base_arg, shape_arg, strides_arg, block_shape_arg, _padding] = args else {
+            return Err(MlirError::CodegenFailed {
+                err: format!("make_tensor_descriptor: expected 5 arguments, got {}", args.len()),
+            });
+        };
+        let block_shape = self
+            .shape_from_slice_arg_i32(&block_shape_arg.node, state)
+            .map_err(|e| Self::unresolved_slice("make_tensor_descriptor", "block_shape", e))?;
+        let block_shape: Vec<i64> = block_shape.iter().map(|&v| i64::from(v)).collect();
+        // Recorded for descriptor_load, whose result type is the descriptor's block.
+        state.desc_block_shapes.insert(destination.local, block_shape.clone());
 
         let base = self.codegen_operand(
             tcx,
             instance,
-            &args[0].node,
-            args[0].node.ty(mir, tcx),
+            &base_arg.node,
+            base_arg.node.ty(mir, tcx),
             location,
             mlir_block,
             state,
         )?;
         // shape: Variadic<I32> — use i32 values directly.
-        let shape = match self.slice_as_i32_values(&args[1].node, location, mlir_block, state) {
-            Ok(v) => v,
-            Err(_) => {
-                return self.codegen_ub_stub(tcx, instance, mir, destination, location, mlir_block);
-            }
-        };
+        let shape = self
+            .slice_as_i32_values(&shape_arg.node, location, mlir_block, state)
+            .map_err(|e| Self::unresolved_slice("make_tensor_descriptor", "shape", e))?;
         // strides: Variadic<I64> — get i32 values and sign-extend to i64.
-        let strides_i32 = match self.slice_as_i32_values(&args[2].node, location, mlir_block, state)
-        {
-            Ok(v) => v,
-            Err(_) => {
-                return self.codegen_ub_stub(tcx, instance, mir, destination, location, mlir_block);
-            }
-        };
+        let strides_i32 = self
+            .slice_as_i32_values(&strides_arg.node, location, mlir_block, state)
+            .map_err(|e| Self::unresolved_slice("make_tensor_descriptor", "strides", e))?;
         let i64_ty: melior::ir::Type<'_> = IntegerType::new(self.module.context(), 64).into();
         let strides: Vec<Value<'a, 'a>> = strides_i32
             .into_iter()
@@ -2748,9 +2691,8 @@ impl<'a> TritonCodegen<'a> {
             })
             .collect::<Result<Vec<_>, MlirError>>()?;
 
-        // Build the correct !tt.tensordesc<tensor<BM x BN x T>> result type.
-        // Use the block shape stored during this call (desc_block_shapes was set above).
-        let result_ty = if let Some(block_shape) = state.desc_block_shapes.get(&destination.local) {
+        // Build the !tt.tensordesc<BM x BN x T> result type from the block shape.
+        let result_ty = {
             // Extract element type from the Rust generic type T in LlvmPointer<T>.
             let dest_ty = destination.ty(mir, tcx).ty;
             let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
@@ -2777,18 +2719,9 @@ impl<'a> TritonCodegen<'a> {
             // (src/triton/lib/Dialect/Triton/IR/Types.cpp). The shape and
             // element type go in directly -- !tt.tensordesc<32x32xf32>.
             let type_str = format!("!tt.tensordesc<{}x{}>", shape_str, elem_ty_str);
-            println!("[DEBUG-DESC] make_tensor_descriptor: result_ty={}", type_str);
-            melior::ir::Type::parse(self.module.context(), &type_str)
-                .expect("valid tensordesc type")
-        } else {
-            // Fallback: type mapper (returns !tt.ptr<T>, will likely fail MLIR verification).
-            let dest_ty = destination.ty(mir, tcx).ty;
-            let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
-                tcx,
-                TypingEnv::fully_monomorphized(),
-                EarlyBinder::bind(tcx, dest_ty),
-            );
-            self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty)
+            melior::ir::Type::parse(self.module.context(), &type_str).ok_or_else(|| {
+                MlirError::CodegenFailed { err: format!("invalid tensor descriptor type {type_str}") }
+            })?
         };
 
         use rustc_mlir::triton::tensor::PaddingOption;
@@ -2826,20 +2759,6 @@ impl<'a> TritonCodegen<'a> {
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<Option<Value<'a, 'a>>, MlirError> {
         // args: [desc, &[indices_i32]]
-        {
-            use rustc_middle::mir::Local;
-            let local = match &args[1].node {
-                Operand::Move(p) | Operand::Copy(p) => p.local,
-                _ => Local::from_usize(0),
-            };
-            println!(
-                "[DEBUG-LOAD] load_tensor_descriptor: args[1]={:?} local={:?} slice_dyn={:?} slice_shape={:?}",
-                args[1].node,
-                local,
-                state.slice_dyn_values.get(&local).map(|v| v.len()),
-                state.slice_shape.get(&local),
-            );
-        }
         // Get the descriptor local so we can look up its block shape.
         let desc_local = match &args[0].node {
             Operand::Move(p) | Operand::Copy(p) if p.projection.is_empty() => Some(p.local),
@@ -2854,13 +2773,9 @@ impl<'a> TritonCodegen<'a> {
             mlir_block,
             state,
         )?;
-        let indices = match self.slice_as_i32_values(&args[1].node, location, mlir_block, state) {
-            Ok(v) => v,
-            Err(e) => {
-                println!("[DEBUG-LOAD] slice_as_i32_values FAILED: {:?}", e);
-                return self.codegen_ub_stub(tcx, instance, mir, destination, location, mlir_block);
-            }
-        };
+        let indices = self
+            .slice_as_i32_values(&args[1].node, location, mlir_block, state)
+            .map_err(|e| Self::unresolved_slice("load_tensor_descriptor", "offsets", e))?;
         let dest_ty = destination.ty(mir, tcx).ty;
         let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
@@ -2881,9 +2796,7 @@ impl<'a> TritonCodegen<'a> {
                 } else {
                     elem_ty
                 };
-                let bs: Vec<i64> = block_shape.clone();
-                println!("[DEBUG-LOAD] using block_shape={:?} for descriptor_load result type", bs);
-                tensor_type(&bs, scalar_ty).into()
+                tensor_type(block_shape, scalar_ty).into()
             } else {
                 self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty)
             }
@@ -2934,10 +2847,9 @@ impl<'a> TritonCodegen<'a> {
             mlir_block,
             state,
         )?;
-        let indices = match self.slice_as_i32_values(&args[1].node, location, mlir_block, state) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
-        };
+        let indices = self
+            .slice_as_i32_values(&args[1].node, location, mlir_block, state)
+            .map_err(|e| Self::unresolved_slice("store_tensor_descriptor", "offsets", e))?;
         let src = self.codegen_operand(
             tcx,
             instance,
@@ -2956,119 +2868,8 @@ impl<'a> TritonCodegen<'a> {
         Ok(None)
     }
 
-    /// `triton::Triton::zeros_pointer` — a null/zero-valued tensor of pointer type.
-    pub fn codegen_zeros_pointer_call<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        instance: &Instance<'tcx>,
-        mir: &Body<'tcx>,
-        _func: &Operand<'tcx>,
-        _func_name: &str,
-        args: &[Spanned<Operand<'tcx>>],
-        destination: &Place<'tcx>,
-        _target: &Option<BasicBlock>,
-        _unwind: &UnwindAction,
-        _call_source: &CallSource,
-        _fn_span: &Span,
-        location: Location<'a>,
-        mlir_block: &BlockRef<'a, 'a>,
-        state: &mut CodegenState<'a, 'a>,
-    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
-        // Try to use an existing tensor arg as the "like" template via tt.zeros_like.
-        if let Some(spanned) = args.first() {
-            if let Ok(v) = self.codegen_operand(
-                tcx,
-                instance,
-                &spanned.node,
-                spanned.node.ty(mir, tcx),
-                location,
-                mlir_block,
-                state,
-            ) {
-                let op: Operation<'a> = zeros_like(self.module.context(), location, v)
-                    .map_err(|e| MlirError::CreateOperation { err: e })?
-                    .into();
-                let result =
-                    op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
-                mlir_block.append_operation(op);
-                return Ok(Some(result.into()));
-            }
-        }
-        self.codegen_ub_stub(tcx, instance, mir, destination, location, mlir_block)
-    }
 
-    /// `triton::Triton::load_full` — block-pointer load; delegates to the same
-    /// MLIR operation as a regular `tt.load`.
-    pub fn codegen_load_full_call<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        instance: &Instance<'tcx>,
-        mir: &Body<'tcx>,
-        func: &Operand<'tcx>,
-        func_name: &str,
-        args: &[Spanned<Operand<'tcx>>],
-        destination: &Place<'tcx>,
-        target: &Option<BasicBlock>,
-        unwind: &UnwindAction,
-        call_source: &CallSource,
-        fn_span: &Span,
-        location: Location<'a>,
-        mlir_block: &BlockRef<'a, 'a>,
-        state: &mut CodegenState<'a, 'a>,
-    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
-        self.codegen_load(
-            tcx,
-            instance,
-            mir,
-            func,
-            func_name,
-            args,
-            destination,
-            target,
-            unwind,
-            call_source,
-            fn_span,
-            location,
-            mlir_block,
-            state,
-        )
-    }
 
-    /// `triton::Triton::store_full` — block-pointer store; delegates to `tt.store`.
-    pub fn codegen_store_full_call<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        instance: &Instance<'tcx>,
-        mir: &Body<'tcx>,
-        func: &Operand<'tcx>,
-        func_name: &str,
-        args: &[Spanned<Operand<'tcx>>],
-        destination: &Place<'tcx>,
-        target: &Option<BasicBlock>,
-        unwind: &UnwindAction,
-        call_source: &CallSource,
-        fn_span: &Span,
-        location: Location<'a>,
-        mlir_block: &BlockRef<'a, 'a>,
-        state: &mut CodegenState<'a, 'a>,
-    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
-        self.codegen_store(
-            tcx,
-            instance,
-            mir,
-            func,
-            func_name,
-            args,
-            destination,
-            target,
-            unwind,
-            call_source,
-            fn_span,
-            location,
-            mlir_block,
-            state,
-        )
-    }
 
     // =========================================================================
     // Control-flow / debug ops
@@ -6584,13 +6385,5 @@ impl<'a> TritonCodegen<'a> {
         };
 
         self.splat_scalar_const(location, scalar, result_ty, mlir_block).map(Some)
-    }
-
-    // =========================================================================
-    // Helper: element type from a Type value (non-method, used in atomic_add)
-    // =========================================================================
-
-    fn elem_ty_from_type(&self, ty: melior::ir::Type<'a>) -> melior::ir::Type<'a> {
-        if let Ok(t) = RankedTensorType::try_from(ty) { t.element() } else { ty }
     }
 }

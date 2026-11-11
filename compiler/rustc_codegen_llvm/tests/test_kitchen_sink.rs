@@ -602,4 +602,59 @@ mod tests {
             "no global store in PTX:\n{ptx}"
         );
     }
+
+    // teenyc-32u: tensor descriptor ops with literal (promoted) slice arguments used to fall
+    // back to ub.poison, which silently dropped the copy.
+    #[test]
+    fn test_tensor_descriptor() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_tensor_descriptor.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_tensor_descriptor");
+        assert!(result.is_ok(), "tensor_descriptor compile failed: {:?}", result.err());
+
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        // The tile stores are predicated (`@%p st.global...`).
+        assert!(ptx.contains("st.global"), "no global store in PTX:\n{ptx}");
+    }
+
+    // teenyc-32u: a descriptor op whose slice argument can't be resolved (here, chosen at run
+    // time) must fail to compile; it used to emit ub.poison, or drop the store entirely. A
+    // codegen error panics inside rustc and reaches the test through `run_compiler`.
+    fn compile_dyn_descriptor(site: &str) {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir()
+            .unwrap()
+            .join(format!("tests/data/triton_tensor_descriptor_dyn_{site}.rs"));
+        let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", &format!("test_descriptor_dyn_{site}"));
+    }
+
+    #[test]
+    #[should_panic(expected = "make_tensor_descriptor: cannot resolve `shape`")]
+    fn test_make_tensor_descriptor_dyn_shape_rejected() {
+        compile_dyn_descriptor("shape");
+    }
+
+    #[test]
+    #[should_panic(expected = "load_tensor_descriptor: cannot resolve `offsets`")]
+    fn test_load_tensor_descriptor_dyn_offsets_rejected() {
+        compile_dyn_descriptor("load");
+    }
+
+    #[test]
+    #[should_panic(expected = "store_tensor_descriptor: cannot resolve `offsets`")]
+    fn test_store_tensor_descriptor_dyn_offsets_rejected() {
+        compile_dyn_descriptor("store");
+    }
 }
