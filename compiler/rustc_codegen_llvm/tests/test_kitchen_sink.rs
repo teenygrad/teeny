@@ -440,4 +440,30 @@ mod tests {
             );
         }
     }
+
+    // teenyc-1at: argmax / argmin / max_with_indices / min_with_indices were stubs emitting
+    // ub.poison, so their results were garbage.
+    #[test]
+    fn test_reduce_with_indices() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_reduce_with_indices.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_reduce_with_indices");
+        assert!(result.is_ok(), "reduce_with_indices compile failed: {:?}", result.err());
+
+        // The combines compare values (gt for max, lt for min), compare indices for max's
+        // tie-break, and select both value and index; poison stubs produce none of these.
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        for op in ["setp.gt.f32", "setp.lt.f32", "setp.lt.s32", "selp.b32", "st.global"] {
+            assert!(
+                ptx.lines().any(|l| l.trim_start().starts_with(op)),
+                "no `{op}` instruction in PTX:\n{ptx}"
+            );
+        }
+    }
 }

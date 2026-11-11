@@ -78,6 +78,68 @@ macro_rules! stub_handler {
     };
 }
 
+/// Which extreme an index reduction keeps.
+#[derive(Clone, Copy, Debug)]
+enum Extremum {
+    Max,
+    Min,
+}
+
+/// The value comparisons of an index-reduction combine, chosen from the element type:
+/// ordered float compares, or signed/unsigned integer compares (MLIR integers are signless,
+/// so signedness comes from the Rust element type).
+#[derive(Clone, Copy)]
+enum ValueCompare {
+    Float(melior::dialect::arith::CmpfPredicate),
+    Int(melior::dialect::arith::CmpiPredicate),
+}
+
+impl ValueCompare {
+    fn for_elem(rust_elem: &TyKind<'_>, elem: melior::ir::Type<'_>, extremum: Extremum) -> Self {
+        use melior::dialect::arith::{CmpfPredicate as F, CmpiPredicate as I};
+        match (rust_elem, extremum) {
+            (TyKind::Uint(_), Extremum::Max) => Self::Int(I::Ugt),
+            (TyKind::Uint(_), Extremum::Min) => Self::Int(I::Ult),
+            (TyKind::Int(_), Extremum::Max) => Self::Int(I::Sgt),
+            (TyKind::Int(_), Extremum::Min) => Self::Int(I::Slt),
+            _ if elem.is_integer() || elem.is_index() => match extremum {
+                Extremum::Max => Self::Int(I::Sgt),
+                Extremum::Min => Self::Int(I::Slt),
+            },
+            (_, Extremum::Max) => Self::Float(F::Ogt),
+            (_, Extremum::Min) => Self::Float(F::Olt),
+        }
+    }
+
+    /// `lhs` is strictly better than `rhs` (greater for max, less for min).
+    fn better<'c>(
+        self,
+        context: &'c melior::Context,
+        lhs: Value<'c, '_>,
+        rhs: Value<'c, '_>,
+        location: Location<'c>,
+    ) -> Operation<'c> {
+        match self {
+            Self::Float(p) => melior::dialect::arith::cmpf(context, p, lhs, rhs, location),
+            Self::Int(p) => melior::dialect::arith::cmpi(context, p, lhs, rhs, location),
+        }
+    }
+
+    fn equal<'c>(
+        self,
+        context: &'c melior::Context,
+        lhs: Value<'c, '_>,
+        rhs: Value<'c, '_>,
+        location: Location<'c>,
+    ) -> Operation<'c> {
+        use melior::dialect::arith::{CmpfPredicate, CmpiPredicate, cmpf, cmpi};
+        match self {
+            Self::Float(_) => cmpf(context, CmpfPredicate::Oeq, lhs, rhs, location),
+            Self::Int(_) => cmpi(context, CmpiPredicate::Eq, lhs, rhs, location),
+        }
+    }
+}
+
 impl<'a> TritonCodegen<'a> {
     pub fn codegen_arange<'tcx>(
         &self,
@@ -4436,13 +4498,312 @@ impl<'a> TritonCodegen<'a> {
         )
     }
 
-    // argmax/argmin/max_with_indices/min_with_indices require multi-value reduce
-    // regions with (value, index) pairs — kept as stubs until index-tracking is
-    // implemented.
-    stub_handler!(codegen_max_with_indices_call);
-    stub_handler!(codegen_min_with_indices_call);
-    stub_handler!(codegen_argmax_call);
-    stub_handler!(codegen_argmin_call);
+    // =========================================================================
+    // Reductions with indices: argmax / argmin / max_with_indices / min_with_indices
+    // =========================================================================
+
+    /// `triton::Triton::max_with_indices(x, axis, tie_break_left, keep_dims)`.
+    pub fn codegen_max_with_indices_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        let (value, index) = self.codegen_reduce_with_indices(
+            tcx,
+            instance,
+            mir,
+            args,
+            Extremum::Max,
+            location,
+            mlir_block,
+            state,
+        )?;
+        state.tuple_fields.insert(destination.local, vec![value, index]);
+        Ok(None)
+    }
+
+    /// `triton::Triton::min_with_indices(x, axis, tie_break_left, keep_dims)`.
+    pub fn codegen_min_with_indices_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        let (value, index) = self.codegen_reduce_with_indices(
+            tcx,
+            instance,
+            mir,
+            args,
+            Extremum::Min,
+            location,
+            mlir_block,
+            state,
+        )?;
+        state.tuple_fields.insert(destination.local, vec![value, index]);
+        Ok(None)
+    }
+
+    /// `triton::Triton::argmax(x, axis, tie_break_left, keep_dims)`.
+    pub fn codegen_argmax_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        self.codegen_reduce_with_indices(
+            tcx,
+            instance,
+            mir,
+            args,
+            Extremum::Max,
+            location,
+            mlir_block,
+            state,
+        )
+        .map(|(_, index)| Some(index))
+    }
+
+    /// `triton::Triton::argmin(x, axis, tie_break_left, keep_dims)`.
+    pub fn codegen_argmin_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        self.codegen_reduce_with_indices(
+            tcx,
+            instance,
+            mir,
+            args,
+            Extremum::Min,
+            location,
+            mlir_block,
+            state,
+        )
+        .map(|(_, index)| Some(index))
+    }
+
+    /// Shared lowering of the four `(x, axis, tie_break_left, keep_dims)` index reductions,
+    /// following Triton's `_reduce_with_indices`: reduce `(x, arange)` along `axis` with a
+    /// combine that keeps the extreme value and its index, returning `(value, index)`.
+    fn codegen_reduce_with_indices<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        args: &[Spanned<Operand<'tcx>>],
+        extremum: Extremum,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<(Value<'a, 'a>, Value<'a, 'a>), MlirError> {
+        let fail = |err: String| MlirError::CodegenFailed {
+            err: format!("{extremum:?} reduction with indices: {err}"),
+        };
+        if args.len() != 4 {
+            return Err(fail(format!("expected 4 arguments, got {}", args.len())));
+        }
+        let src = self.codegen_operand(
+            tcx,
+            instance,
+            &args[0].node,
+            args[0].node.ty(mir, tcx),
+            location,
+            mlir_block,
+            state,
+        )?;
+        let axis = self
+            .to_scalar_int(tcx, instance, &args[1].node)
+            .map(|s| s.to_i32())
+            .map_err(|_| fail("`axis` must be a compile-time constant".into()))?;
+        let tie_break_left = self.const_bool_arg(tcx, instance, &args[2].node);
+        let keep_dims = self.const_bool_arg(tcx, instance, &args[3].node);
+
+        let dims = RankedTensorType::try_from(src.r#type())
+            .ok()
+            .and_then(|t| t.dims().ok())
+            .ok_or_else(|| fail(format!("source is not a ranked tensor: {}", src.r#type())))?;
+        let axis_len = usize::try_from(axis)
+            .ok()
+            .and_then(|a| dims.get(a))
+            .copied()
+            .ok_or_else(|| fail(format!("axis {axis} out of range for rank {}", dims.len())))?;
+        let axis_len = i32::try_from(axis_len)
+            .map_err(|_| fail(format!("axis length {axis_len} does not fit in i32")))?;
+        let index = self.index_along_axis(location, axis, axis_len, &dims, mlir_block)?;
+
+        let elem = self.elem_ty(src);
+        let i32_ty: melior::ir::Type<'a> = IntegerType::new(self.module.context(), 32).into();
+        let rust_elem = Self::rust_elem_ty(instance.instantiate_mir_and_normalize_erasing_regions(
+            tcx,
+            TypingEnv::fully_monomorphized(),
+            EarlyBinder::bind(tcx, args[0].node.ty(mir, tcx)),
+        ));
+        let compare = ValueCompare::for_elem(rust_elem.kind(), elem, extremum);
+
+        let value_ty = self.reduce_result_ty(src, axis);
+        let index_ty = self.reduce_result_ty(index, axis);
+        let op: Operation<'a> = reduce(
+            self.module.context(),
+            location,
+            &[src, index],
+            &[value_ty, index_ty],
+            axis,
+            Region::new(),
+        )
+        .map_err(|e| MlirError::CreateOperation { err: e })?
+        .into();
+        self.build_index_combine(&op, elem, i32_ty, compare, tie_break_left, location)?;
+        let value: Value<'a, 'a> =
+            op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
+        let index: Value<'a, 'a> =
+            op.result(1).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
+        mlir_block.append_operation(op);
+
+        if keep_dims {
+            let value = self.keep_reduced_dim(location, src, axis, value, mlir_block)?;
+            let index = self.keep_reduced_dim(location, src, axis, index, mlir_block)?;
+            return Ok((value, index));
+        }
+        Ok((value, index))
+    }
+
+    /// An `i32` tensor of `dims`' shape holding each element's position along `axis`:
+    /// `arange(0, axis_len)` expanded over the other axes and broadcast.
+    fn index_along_axis(
+        &self,
+        location: Location<'a>,
+        axis: i32,
+        axis_len: i32,
+        dims: &[i64],
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        let context = self.module.context();
+        let i32_ty: melior::ir::Type<'a> = IntegerType::new(context, 32).into();
+        let range: Operation<'a> = make_range(context, location, 0, axis_len)
+            .map_err(|e| MlirError::CreateOperation { err: e })?
+            .into();
+        let mut index: Value<'a, 'a> =
+            range.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
+        mlir_block.append_operation(range);
+        if dims.len() == 1 {
+            return Ok(index);
+        }
+
+        // Insert a unit dimension at every position except `axis`, in increasing order, so
+        // that each insertion index is already its final position.
+        let mut shape = vec![i64::from(axis_len)];
+        for d in 0..dims.len() {
+            if d as i32 == axis {
+                continue;
+            }
+            shape.insert(d, 1);
+            let ty = tensor_type(&shape, i32_ty).into();
+            let op: Operation<'a> = expand_dims(context, location, index, d as i32, ty)
+                .map_err(|e| MlirError::CreateOperation { err: e })?
+                .into();
+            index = op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?.into();
+            mlir_block.append_operation(op);
+        }
+        let op: Operation<'a> =
+            broadcast(context, location, index, tensor_type(dims, i32_ty).into())
+                .map_err(|e| MlirError::CreateOperation { err: e })?
+                .into();
+        let index = op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+        mlir_block.append_operation(op);
+        Ok(index.into())
+    }
+
+    /// Fills the combine region of an index reduction. Its block takes `(v1, i1, v2, i2)` and
+    /// keeps the first pair when `v1` is strictly better than `v2`, or, with `tie_break_left`,
+    /// when they are equal and `i1 < i2` (Triton's `_argmax_combine` / `_argmin_combine`).
+    fn build_index_combine(
+        &self,
+        op: &Operation<'a>,
+        elem: melior::ir::Type<'a>,
+        i32_ty: melior::ir::Type<'a>,
+        compare: ValueCompare,
+        tie_break_left: bool,
+        location: Location<'a>,
+    ) -> Result<(), MlirError> {
+        use melior::dialect::arith;
+
+        let context = self.module.context();
+        let to_err = |e: melior::Error| MlirError::CodegenFailed { err: e.to_string() };
+        let region = op.region(0).map_err(to_err)?;
+        let block = region.append_block(Block::new(&[
+            (elem, location),
+            (i32_ty, location),
+            (elem, location),
+            (i32_ty, location),
+        ]));
+        let arg = |i| block.argument(i).map(Value::from).map_err(to_err);
+        let (v1, i1, v2, i2) = (arg(0)?, arg(1)?, arg(2)?, arg(3)?);
+
+        let append = |op: Operation<'a>| -> Result<Value<'a, 'a>, MlirError> {
+            let op = block.append_operation(op);
+            Ok(op.result(0).map_err(to_err)?.into())
+        };
+        let mut keep_first = append(compare.better(context, v1, v2, location))?;
+        if tie_break_left {
+            let equal = append(compare.equal(context, v1, v2, location))?;
+            let lower = append(arith::cmpi(context, arith::CmpiPredicate::Slt, i1, i2, location))?;
+            let tie = append(arith::andi(equal, lower, location))?;
+            keep_first = append(arith::ori(keep_first, tie, location))?;
+        }
+        let value = append(arith::select(keep_first, v1, v2, location))?;
+        let index = append(arith::select(keep_first, i1, i2, location))?;
+        let ret: Operation<'a> = reduce_return(context, location, &[value, index])
+            .map_err(|e| MlirError::CreateOperation { err: e })?
+            .into();
+        block.append_operation(ret);
+        Ok(())
+    }
 
     // =========================================================================
     // Scans (tt.scan)
