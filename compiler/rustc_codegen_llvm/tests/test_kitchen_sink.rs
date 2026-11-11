@@ -294,4 +294,32 @@ mod tests {
         assert!(has_op("max."), "no f32 max instruction in PTX:\n{ptx}");
         assert!(has_op("min."), "no f32 min instruction in PTX:\n{ptx}");
     }
+
+    // teenyc-38c: a repeated shape array that MIR GVN turns into `_b = copy _a` used to panic
+    // with "Value not found for local", because constant arrays are tracked in `const_arrays`
+    // rather than `ssa_values`.
+    #[test]
+    fn test_const_array_copy() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_const_array_copy.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_const_array_copy");
+        assert!(result.is_ok(), "const_array_copy compile failed: {:?}", result.err());
+
+        // The store through the pointers built from the copied shape must survive.
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        assert!(
+            ptx.lines().any(|l| l.trim_start().starts_with("add.") && l.contains(".f32")),
+            "no f32 add in PTX:\n{ptx}"
+        );
+        assert!(
+            ptx.lines().any(|l| l.trim_start().starts_with("st.global")),
+            "no global store in PTX:\n{ptx}"
+        );
+    }
 }

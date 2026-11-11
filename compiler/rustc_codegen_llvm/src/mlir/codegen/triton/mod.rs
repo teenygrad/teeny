@@ -2336,7 +2336,14 @@ impl<'a> TritonCodegen<'a> {
                             state.dyn_arrays.insert(place.local, elems);
                             return Ok(());
                         }
-                        // const_array copy.
+                        // const_array copy: _dest = copy _src where _src is in const_arrays.
+                        // MIR GVN produces this for a repeated shape literal (`&[n]` twice),
+                        // and a constant array has no SSA value to fall back on.
+                        if let Some(elems) = state.const_arrays.get(&src.local).cloned() {
+                            state.const_arrays.insert(place.local, elems);
+                            return Ok(());
+                        }
+                        // const_array pointer copy.
                         if let Some(&arr_local) = state.ptr_to_const_array.get(&src.local) {
                             state.ptr_to_const_array.insert(place.local, arr_local);
                             return Ok(());
