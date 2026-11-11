@@ -142,6 +142,18 @@ mod tests {
             "PTX contains unresolved __nv_* externs (libdevice not linked):\n{}",
             unresolved.join("\n")
         );
+
+        // teenyc-7lq: an unconditional diverging call once let the MIR inliner reduce the whole
+        // kernel to an infinite loop, so the test passed no matter what followed it. The final
+        // `x / maximum(s, eps)` and `x / minimum(s, eps)` stores sit at the end of the kernel,
+        // so their ops in the PTX show that codegen reached it.
+        let has_op = |op: &str, ty: &str| {
+            ptx.lines().any(|l| l.trim_start().starts_with(op) && l.contains(ty))
+        };
+        for (op, ty) in [("ld.global", ""), ("st.global", ""), ("max.", ".f32"), ("min.", ".f32")]
+        {
+            assert!(has_op(op, ty), "no `{op}` {ty} instruction in PTX:\n{ptx}");
+        }
     }
 
     // Fixed: a compound 4-condition early return inside a Triton kernel previously panicked with

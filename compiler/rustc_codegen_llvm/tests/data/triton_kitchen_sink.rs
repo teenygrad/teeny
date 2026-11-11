@@ -48,14 +48,6 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32, const USE_BIAS: bool
     ) -> TT::Tensor<DD> {
         lhs + rhs
     }
-    #[allow(clippy::empty_loop)]
-    fn dummy_bool_tensor<TT: Triton>() -> TT::BoolTensor {
-        loop {}
-    }
-    #[allow(clippy::empty_loop)]
-    fn dummy_value<DD: Dtype>() -> DD {
-        loop {}
-    }
     let _pid_x = T::program_id(Axis::X);
     let _pid_y = T::program_id(Axis::Y);
     let _pid_z = T::program_id(Axis::Z);
@@ -65,11 +57,8 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32, const USE_BIAS: bool
     let _ = r - 1;
     let _ = r * 2;
     let z = T::zeros::<D>(&[BLOCK_SIZE]);
-    if false {
-        let _ = T::full::<D>(&[BLOCK_SIZE], dummy_value::<D>());
-    }
     let zl = T::zeros_like(z);
-    let _ = T::full::<D>(&[BLOCK_SIZE], dummy_value::<D>());
+    let _ = T::full::<D>(&[BLOCK_SIZE], D::from_f64(2.0));
     let casted = T::cast::<D, D>(z, Some(FpDowncastRounding::Rtne), false);
     let _casted_rtz = T::cast::<D, D>(casted, Some(FpDowncastRounding::Rtz), true);
     let cat = T::cat(z, zl, true);
@@ -186,12 +175,10 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32, const USE_BIAS: bool
         Some(EvictionPolicy::NoEvict),
     );
     T::store::<D, 1>(ptrs, loaded, None, &[0], Some(CacheModifier::Cs), None);
-    if false {
-        let cond: T::BoolTensor = dummy_bool_tensor::<T>();
-        let _ = T::where_(cond, loaded, loaded);
-        T::assume(cond);
-        T::device_assert(cond, "kitchen_sink", Some(cond));
-    }
+    let cond = T::lt(loaded, zl);
+    let _ = T::where_(cond, loaded, loaded);
+    T::assume(cond);
+    T::device_assert(cond, "kitchen_sink", Some(cond));
     let fl = T::flip(loaded, Some(0));
     let _ = T::gather(fl, r, 0);
     let _abs = T::abs(loaded);
@@ -275,7 +262,7 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32, const USE_BIAS: bool
     let _eq_sel = T::where_(eq_mask, mconst, zl);
     let _ne_sel = T::where_(ne_mask, mconst, zl);
     // Scalar comparison ops — tensor vs scalar constant (second arg is a scalar D value).
-    let scalar_val = dummy_value::<D>();
+    let scalar_val = D::from_f64(0.5);
     let gt_s = T::gt_scalar(mconst, scalar_val);
     let ge_s = T::ge_scalar(mconst, scalar_val);
     let lt_s = T::lt_scalar(mconst, scalar_val);
@@ -324,7 +311,7 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32, const USE_BIAS: bool
     let x_ptrs = T::zeros::<T::Pointer<D>>(&[N]);
     let x = T::load::<D, 1>(x_ptrs, None, None, &[0], None, None, None, false);
     let s = T::sqrt(T::sum(x * x, Some(0), true));
-    let eps = T::full::<D>(&[N], dummy_value::<D>());
+    let eps = T::full::<D>(&[N], D::from_f64(1e-6));
     T::store::<D, 1>(out_ptrs, x / T::maximum(s, eps), None, &[0], None, None);
     T::store::<D, 1>(out_ptrs, x / T::minimum(s, eps), None, &[0], None, None);
 }
