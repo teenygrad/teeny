@@ -623,6 +623,30 @@ mod tests {
         assert!(ptx.contains("st.global"), "no global store in PTX:\n{ptx}");
     }
 
+    // teenyc-2kk: a descriptor over a non-f32 dtype used to be typed as f32.
+    #[test]
+    fn test_tensor_descriptor_i16() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_tensor_descriptor_i16.rs");
+        let result = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_tensor_descriptor_i16");
+        assert!(result.is_ok(), "tensor_descriptor_i16 compile failed: {:?}", result.err());
+
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        // 16-bit elements are stored as b16 (or packed into wider stores); an f32 descriptor
+        // gives 32-bit element stores with no b16 store anywhere.
+        assert!(ptx.contains("st.global"), "no global store in PTX:\n{ptx}");
+        assert!(
+            ptx.lines().filter(|l| l.contains("st.global")).all(|l| !l.contains(".f32")),
+            "f32 store in an i16 copy:\n{ptx}"
+        );
+    }
+
     // teenyc-32u: a descriptor op whose slice argument is chosen at run time must fail to
     // compile; it used to emit ub.poison, or drop the store entirely. Since teenyc-2m7 the slice
     // local is rejected when it is recorded, before the descriptor op. A codegen error panics

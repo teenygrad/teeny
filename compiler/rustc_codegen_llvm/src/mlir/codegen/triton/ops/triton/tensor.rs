@@ -2700,16 +2700,19 @@ impl<'a> TritonCodegen<'a> {
                 TypingEnv::fully_monomorphized(),
                 EarlyBinder::bind(tcx, dest_ty),
             );
-            // Determine the scalar element type (e.g. f32).
-            let elem_ty_str = match dest_ty.kind() {
-                TyKind::Adt(_, args) if !args.is_empty() => match args[0].expect_ty().kind() {
-                    TyKind::Float(FloatTy::F32) => "f32",
-                    TyKind::Float(FloatTy::F64) => "f64",
-                    TyKind::Int(IntTy::I32) => "i32",
-                    TyKind::Int(IntTy::I64) => "i64",
-                    _ => "f32",
-                },
-                _ => "f32",
+            // The descriptor's element type must match the base pointer's pointee, which is
+            // the same `D`, so map it the same way.
+            let elem_ty = match dest_ty.kind() {
+                TyKind::Adt(_, args) if !args.is_empty() => {
+                    self.type_mapper.map_type(self.module.context(), &tcx, &args[0].expect_ty())
+                }
+                _ => {
+                    return Err(MlirError::CodegenFailed {
+                        err: format!(
+                            "make_tensor_descriptor: expected a Pointer<D> result, got {dest_ty:?}"
+                        ),
+                    });
+                }
             };
             let shape_str: String =
                 block_shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x");
@@ -2718,7 +2721,7 @@ impl<'a> TritonCodegen<'a> {
             // use !tt.tensordesc<shape x element-type[, layout]> instead"
             // (src/triton/lib/Dialect/Triton/IR/Types.cpp). The shape and
             // element type go in directly -- !tt.tensordesc<32x32xf32>.
-            let type_str = format!("!tt.tensordesc<{}x{}>", shape_str, elem_ty_str);
+            let type_str = format!("!tt.tensordesc<{shape_str}x{elem_ty}>");
             melior::ir::Type::parse(self.module.context(), &type_str).ok_or_else(|| {
                 MlirError::CodegenFailed { err: format!("invalid tensor descriptor type {type_str}") }
             })?
