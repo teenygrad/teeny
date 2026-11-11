@@ -104,6 +104,16 @@ pub fn panic_const_rem_overflow() -> ! {
     loop {}
 }
 
+#[lang = "panic_const_div_by_zero"]
+pub fn panic_const_div_by_zero() -> ! {
+    loop {}
+}
+
+#[lang = "panic_const_rem_by_zero"]
+pub fn panic_const_rem_by_zero() -> ! {
+    loop {}
+}
+
 #[lang = "panic_location"]
 pub struct PanicLocation {
     pub file: &'static str,
@@ -382,6 +392,14 @@ pub mod core {
             }
         }
 
+        // Just a dummy, the compiler will generate the correct implementation
+        impl Div for u32 {
+            type Output = u32;
+            fn div(self, rhs: u32) -> Self::Output {
+                0
+            }
+        }
+
         #[lang = "div_assign"]
         pub trait DivAssign<RHS = Self> {
             fn div_assign(&mut self, rhs: RHS);
@@ -410,6 +428,14 @@ pub mod core {
         impl Rem for i32 {
             type Output = i32;
             fn rem(self, rhs: i32) -> Self::Output {
+                0
+            }
+        }
+
+        // Just a dummy, the compiler will generate the correct implementation
+        impl Rem for u32 {
+            type Output = u32;
+            fn rem(self, rhs: u32) -> Self::Output {
                 0
             }
         }
@@ -486,6 +512,21 @@ impl PartialOrd for i32 {
         false
     }
     fn ge(&self, _other: &i32) -> bool {
+        false
+    }
+}
+
+impl PartialOrd for u32 {
+    fn lt(&self, _other: &u32) -> bool {
+        false
+    }
+    fn gt(&self, _other: &u32) -> bool {
+        false
+    }
+    fn le(&self, _other: &u32) -> bool {
+        false
+    }
+    fn ge(&self, _other: &u32) -> bool {
         false
     }
 }

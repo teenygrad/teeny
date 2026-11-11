@@ -40,6 +40,17 @@ impl Predicate {
     pub const ULE: Predicate = Self(7);
     pub const UGT: Predicate = Self(8);
     pub const UGE: Predicate = Self(9);
+
+    /// The predicate to use for these operands: integers are signless, so an ordering
+    /// predicate has a signed and an unsigned form, and `unsigned` picks the latter.
+    /// Equality is the same for both.
+    pub fn for_signedness(self, unsigned: bool) -> Self {
+        // SLT..=SGE are 2..=5, and each unsigned form is 4 higher (ULT..=UGE are 6..=9).
+        match self.0 {
+            2..=5 if unsigned => Self(self.0 + 4),
+            _ => self,
+        }
+    }
 }
 
 impl std::fmt::Display for Predicate {

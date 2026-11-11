@@ -1077,11 +1077,31 @@ impl<'a> TritonCodegen<'a> {
                 melior::dialect::arith::extf(src_value, dest_mlir_ty, location).into()
             }
         } else if src_elem_ty.is_integer() && dst_elem_ty.is_float() {
-            melior::dialect::arith::sitofp(src_value, dest_mlir_ty, location).into()
+            if Self::is_unsigned(tcx, instance, arg0.ty(mir, tcx)) {
+                melior::dialect::arith::uitofp(src_value, dest_mlir_ty, location).into()
+            } else {
+                melior::dialect::arith::sitofp(src_value, dest_mlir_ty, location).into()
+            }
         } else if src_elem_ty.is_float() && dst_elem_ty.is_integer() {
-            melior::dialect::arith::fptosi(src_value, dest_mlir_ty, location).into()
+            if Self::is_unsigned(tcx, instance, dest_rust_ty) {
+                melior::dialect::arith::fptoui(src_value, dest_mlir_ty, location).into()
+            } else {
+                melior::dialect::arith::fptosi(src_value, dest_mlir_ty, location).into()
+            }
         } else {
-            melior::dialect::arith::trunci(src_value, dest_mlir_ty, location).into()
+            let width = |ty: melior::ir::Type<'a>| {
+                IntegerType::try_from(ty)
+                    .map(|t| t.width())
+                    .map_err(|e| MlirError::InvalidType { msg: e.to_string() })
+            };
+            // Equal widths were returned above as a no-op, since the types are signless.
+            if width(dst_elem_ty)? < width(src_elem_ty)? {
+                melior::dialect::arith::trunci(src_value, dest_mlir_ty, location).into()
+            } else if Self::is_unsigned(tcx, instance, arg0.ty(mir, tcx)) {
+                melior::dialect::arith::extui(src_value, dest_mlir_ty, location).into()
+            } else {
+                melior::dialect::arith::extsi(src_value, dest_mlir_ty, location).into()
+            }
         };
         let result = cast_op.result(0).expect("cast result");
         mlir_block.append_operation(cast_op);
@@ -2333,6 +2353,22 @@ impl<'a> TritonCodegen<'a> {
             TyKind::Int(_) => signed_op,
             _ => Self::choose_float_int_op(self.elem_ty(value), float_op, signed_op),
         }
+    }
+
+    /// Whether integer ops on `rust_ty` (a scalar, or a tensor generic over its element) need
+    /// the unsigned form. MLIR integers are signless, so this has to come from the Rust type.
+    /// `bool` counts as unsigned: widening it must zero-extend.
+    pub(crate) fn is_unsigned<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        rust_ty: Ty<'tcx>,
+    ) -> bool {
+        let rust_ty = instance.instantiate_mir_and_normalize_erasing_regions(
+            tcx,
+            TypingEnv::fully_monomorphized(),
+            EarlyBinder::bind(tcx, rust_ty),
+        );
+        matches!(Self::rust_elem_ty(rust_ty).kind(), TyKind::Uint(_) | TyKind::Bool)
     }
 
     /// The element type of a tensor type: `LlvmTensor<D>` (and any wrapper generic over its
@@ -3768,7 +3804,7 @@ impl<'a> TritonCodegen<'a> {
 
         // result = 1.0 / one_plus
         let one_b = scalar_f32(1.0)?;
-        self.codegen_div(tcx, location, one_b, one_plus, mlir_block)
+        self.codegen_div(tcx, false, location, one_b, one_plus, mlir_block)
     }
 
     /// `triton::Triton::softmax` — numerically-stable softmax expanded inline.
@@ -4268,7 +4304,7 @@ impl<'a> TritonCodegen<'a> {
         mir: &Body<'tcx>,
         args: &[Spanned<Operand<'tcx>>],
         combine_op_float: &'static str,
-        combine_op_int: &'static str,
+        [signed_op, unsigned_op]: [&'static str; 2],
         location: Location<'a>,
         mlir_block: &BlockRef<'a, 'a>,
         state: &mut CodegenState<'a, 'a>,
@@ -4302,7 +4338,13 @@ impl<'a> TritonCodegen<'a> {
             }
         };
         let elem = self.elem_ty(input);
-        let combine_op = Self::choose_float_int_op(elem, combine_op_float, combine_op_int);
+        let combine_op = self.choose_signed_op(
+            tcx,
+            instance,
+            args[0].node.ty(mir, tcx),
+            input,
+            [combine_op_float, signed_op, unsigned_op],
+        );
         let region = self.build_reduce_region(location, elem, combine_op);
         let result_ty = self.reduce_result_ty(input, axis);
         let op: Operation<'a> =
@@ -4420,7 +4462,7 @@ impl<'a> TritonCodegen<'a> {
             mir,
             args,
             "arith.addf",
-            "arith.addi",
+            ["arith.addi", "arith.addi"],
             location,
             mlir_block,
             state,
@@ -4451,7 +4493,7 @@ impl<'a> TritonCodegen<'a> {
             mir,
             args,
             "arith.maximumf",
-            "arith.maxsi",
+            ["arith.maxsi", "arith.maxui"],
             location,
             mlir_block,
             state,
@@ -4482,7 +4524,7 @@ impl<'a> TritonCodegen<'a> {
             mir,
             args,
             "arith.minimumf",
-            "arith.minsi",
+            ["arith.minsi", "arith.minui"],
             location,
             mlir_block,
             state,
@@ -4513,7 +4555,7 @@ impl<'a> TritonCodegen<'a> {
             mir,
             args,
             "arith.xori",
-            "arith.xori",
+            ["arith.xori", "arith.xori"],
             location,
             mlir_block,
             state,

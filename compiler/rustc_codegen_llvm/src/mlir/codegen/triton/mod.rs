@@ -2607,7 +2607,7 @@ impl<'a> TritonCodegen<'a> {
                 }
 
                 let result = self.codegen_cast(
-                    tcx, instance, cast_kind, operand, ty, location, mlir_block, state,
+                    tcx, instance, mir, cast_kind, operand, ty, location, mlir_block, state,
                 )?;
 
                 state.ssa_values.insert(place.local, result);
@@ -3090,6 +3090,9 @@ impl<'a> TritonCodegen<'a> {
         let rhs =
             self.codegen_operand(tcx, instance, rhs_op, rhs_ty, location, mlir_block, state)?;
 
+        // `lhs_ty` is already monomorphized, so this only reads its element type.
+        let unsigned = Self::is_unsigned(tcx, instance, lhs_ty);
+        let cmp = |pred: Predicate| pred.for_signedness(unsigned);
         match bin_op {
             BinOp::Add | BinOp::AddUnchecked => {
                 self.codegen_add(tcx, location, lhs, rhs, mlir_block)
@@ -3103,8 +3106,8 @@ impl<'a> TritonCodegen<'a> {
                 self.codegen_mul(tcx, location, lhs, rhs, mlir_block)
             }
             BinOp::MulWithOverflow => todo!("BinOp::MulWithOverflow"),
-            BinOp::Div => self.codegen_div(tcx, location, lhs, rhs, mlir_block),
-            BinOp::Rem => self.codegen_rem(tcx, location, lhs, rhs, mlir_block),
+            BinOp::Div => self.codegen_div(tcx, unsigned, location, lhs, rhs, mlir_block),
+            BinOp::Rem => self.codegen_rem(tcx, unsigned, location, lhs, rhs, mlir_block),
             BinOp::BitXor => self.codegen_xor(tcx, location, lhs, rhs, mlir_block),
             BinOp::BitAnd => self.codegen_and(tcx, location, lhs, rhs, mlir_block),
             BinOp::BitOr => self.codegen_or(tcx, location, lhs, rhs, mlir_block),
@@ -3112,15 +3115,14 @@ impl<'a> TritonCodegen<'a> {
                 self.codegen_shl(tcx, location, lhs, rhs, mlir_block)
             }
             BinOp::Shr | BinOp::ShrUnchecked => {
-                let signed = matches!(lhs_ty.kind(), TyKind::Int(_));
-                self.codegen_shr(tcx, signed, location, lhs, rhs, mlir_block)
+                self.codegen_shr(tcx, !unsigned, location, lhs, rhs, mlir_block)
             }
             BinOp::Eq => self.codegen_cmpi(tcx, Predicate::EQ, location, lhs, rhs, mlir_block),
-            BinOp::Lt => self.codegen_cmpi(tcx, Predicate::SLT, location, lhs, rhs, mlir_block),
-            BinOp::Le => self.codegen_cmpi(tcx, Predicate::SLE, location, lhs, rhs, mlir_block),
+            BinOp::Lt => self.codegen_cmpi(tcx, cmp(Predicate::SLT), location, lhs, rhs, mlir_block),
+            BinOp::Le => self.codegen_cmpi(tcx, cmp(Predicate::SLE), location, lhs, rhs, mlir_block),
             BinOp::Ne => self.codegen_cmpi(tcx, Predicate::NE, location, lhs, rhs, mlir_block),
-            BinOp::Ge => self.codegen_cmpi(tcx, Predicate::SGE, location, lhs, rhs, mlir_block),
-            BinOp::Gt => self.codegen_cmpi(tcx, Predicate::SGT, location, lhs, rhs, mlir_block),
+            BinOp::Ge => self.codegen_cmpi(tcx, cmp(Predicate::SGE), location, lhs, rhs, mlir_block),
+            BinOp::Gt => self.codegen_cmpi(tcx, cmp(Predicate::SGT), location, lhs, rhs, mlir_block),
             BinOp::Cmp => todo!("BinOp::Cmp"),
             BinOp::Offset => todo!("BinOp::Offset"),
         }
@@ -3233,6 +3235,7 @@ impl<'a> TritonCodegen<'a> {
         &self,
         tcx: TyCtxt<'tcx>,
         instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
         cast_kind: &CastKind,
         operand: &Operand<'tcx>,
         ty: &Ty<'tcx>,
@@ -3270,8 +3273,12 @@ impl<'a> TritonCodegen<'a> {
                 let dest_ty =
                     self.type_mapper.map_type(self.module.context(), &tcx, &normalized_ty);
                 let op: Operation<'a> =
-                    melior::dialect::arith::sitofp(src_val, dest_ty, location).into();
-                let result = op.result(0).expect("sitofp result").into();
+                    if Self::is_unsigned(tcx, instance, operand.ty(mir, tcx)) {
+                        melior::dialect::arith::uitofp(src_val, dest_ty, location).into()
+                    } else {
+                        melior::dialect::arith::sitofp(src_val, dest_ty, location).into()
+                    };
+                let result = op.result(0).expect("int-to-float result").into();
                 mlir_block.append_operation(op);
                 Ok(result)
             }
@@ -3292,9 +3299,12 @@ impl<'a> TritonCodegen<'a> {
                 )?;
                 let dest_ty =
                     self.type_mapper.map_type(self.module.context(), &tcx, &normalized_ty);
-                let op: Operation<'a> =
-                    melior::dialect::arith::fptosi(src_val, dest_ty, location).into();
-                let result = op.result(0).expect("fptosi result").into();
+                let op: Operation<'a> = if Self::is_unsigned(tcx, instance, normalized_ty) {
+                    melior::dialect::arith::fptoui(src_val, dest_ty, location).into()
+                } else {
+                    melior::dialect::arith::fptosi(src_val, dest_ty, location).into()
+                };
+                let result = op.result(0).expect("float-to-int result").into();
                 mlir_block.append_operation(op);
                 Ok(result)
             }
