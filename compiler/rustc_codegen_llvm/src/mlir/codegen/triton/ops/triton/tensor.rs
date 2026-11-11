@@ -30,7 +30,7 @@ use rustc_middle::mir::{
     START_BLOCK, StatementKind, TerminatorKind, UnwindAction,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::{EarlyBinder, Instance, TyCtxt, TyKind, TypingEnv};
+use rustc_middle::ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv};
 use rustc_mlir::shared::arith::{Int, create_extsi, create_int_constant};
 use rustc_mlir::shared::builtin::tensor_type;
 use rustc_mlir::shared::ub::create_ub_poison;
@@ -527,9 +527,15 @@ impl<'a> TritonCodegen<'a> {
         // reduction (tensor<1xf32>) against a full tile has to be broadcast first.
         let (lhs, rhs) = self.maybe_broadcast_pair(location, lhs, rhs, mlir_block)?;
 
-        // arith.maximumf for element-wise float maximum (works on scalars and tensors).
+        let op_name = self.choose_signed_op(
+            tcx,
+            instance,
+            args[0].node.ty(mir, tcx),
+            lhs,
+            ["arith.maximumf", "arith.maxsi", "arith.maxui"],
+        );
         let result_ty = lhs.r#type();
-        let max_op: Operation<'a> = OperationBuilder::new("arith.maximumf", location)
+        let max_op: Operation<'a> = OperationBuilder::new(op_name, location)
             .add_operands(&[lhs, rhs])
             .add_results(&[result_ty])
             .build()
@@ -2242,6 +2248,43 @@ impl<'a> TritonCodegen<'a> {
         if elem_ty.is_integer() || elem_ty.is_index() { int_op } else { float_op }
     }
 
+    /// Like `choose_float_int_op`, but also distinguishes signed from unsigned integers
+    /// (`[float_op, signed_op, unsigned_op]`). MLIR integer types are signless, so signedness
+    /// comes from the Rust element type of `rust_ty` (a `Tensor<D>` or a scalar `D`); when that
+    /// is not a primitive integer, the MLIR element type of `value` decides as before.
+    fn choose_signed_op<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        rust_ty: Ty<'tcx>,
+        value: Value<'a, 'a>,
+        [float_op, signed_op, unsigned_op]: [&'static str; 3],
+    ) -> &'static str {
+        let rust_ty = instance.instantiate_mir_and_normalize_erasing_regions(
+            tcx,
+            TypingEnv::fully_monomorphized(),
+            EarlyBinder::bind(tcx, rust_ty),
+        );
+        match Self::rust_elem_ty(rust_ty).kind() {
+            TyKind::Uint(_) => unsigned_op,
+            TyKind::Int(_) => signed_op,
+            _ => Self::choose_float_int_op(self.elem_ty(value), float_op, signed_op),
+        }
+    }
+
+    /// The element type of a tensor type: `LlvmTensor<D>` (and any wrapper generic over its
+    /// element) is followed through its first type argument down to `D`. A type without type
+    /// arguments, scalar or not, is returned as is.
+    fn rust_elem_ty<'tcx>(mut ty: Ty<'tcx>) -> Ty<'tcx> {
+        while let TyKind::Adt(_, args) = ty.kind() {
+            match args.types().next() {
+                Some(inner) => ty = inner,
+                None => break,
+            }
+        }
+        ty
+    }
+
     /// Emit `arith.constant 0.0 / 0` of `elem_ty` and splat to a tensor matching
     /// the shape of `like_val` (which may be scalar or tensor).  Used by
     /// `zeros_pointer` and `full`.
@@ -3885,8 +3928,13 @@ impl<'a> TritonCodegen<'a> {
         )?;
         // Same constraint as codegen_maximum: operands must share the result type.
         let (lhs, rhs) = self.maybe_broadcast_pair(location, lhs, rhs, mlir_block)?;
-        let elem = self.elem_ty(lhs);
-        let op_name = Self::choose_float_int_op(elem, "arith.minimumf", "arith.minsi");
+        let op_name = self.choose_signed_op(
+            tcx,
+            instance,
+            args[0].node.ty(mir, tcx),
+            lhs,
+            ["arith.minimumf", "arith.minsi", "arith.minui"],
+        );
         let result_ty = lhs.r#type();
         let op: Operation<'a> = OperationBuilder::new(op_name, location)
             .add_operands(&[lhs, rhs])
