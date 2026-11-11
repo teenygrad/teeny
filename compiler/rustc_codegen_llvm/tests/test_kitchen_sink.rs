@@ -322,4 +322,31 @@ mod tests {
             "no global store in PTX:\n{ptx}"
         );
     }
+
+    // teenyc-3bk: `T::load` with `other` but no mask used to emit a tt.load that failed
+    // verification ("mask type matches ptr type"), panicking the backend.
+    #[test]
+    fn test_load_other_without_mask() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file =
+            env::current_dir().unwrap().join("tests/data/triton_load_other_without_mask.rs");
+        let result =
+            compiler.compile(&file, "nvptx64-nvidia-cuda", "test_load_other_without_mask");
+        assert!(result.is_ok(), "load_other_without_mask compile failed: {:?}", result.err());
+
+        // The load must survive, feeding the add that is stored.
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        for op in ["ld.global", "add.", "st.global"] {
+            assert!(
+                ptx.lines().any(|l| l.trim_start().starts_with(op)),
+                "no `{op}` instruction in PTX:\n{ptx}"
+            );
+        }
+    }
 }

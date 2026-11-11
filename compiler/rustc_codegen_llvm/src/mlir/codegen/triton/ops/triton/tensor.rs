@@ -274,6 +274,10 @@ impl<'a> TritonCodegen<'a> {
             mlir_block,
             state,
         )?;
+        // tt.load only accepts `other` alongside a mask: its verifier checks the mask slot
+        // whenever there is more than one operand. Without a mask every lane is loaded, so
+        // `other` can never be selected and is dropped rather than emitted.
+        let other = if mask.is_some() { other } else { None };
 
         // Derive result type from the ptr operand's MLIR type.
         // ptr is `tensor<Nx!tt.ptr<T>>` — extract shape [N] and element type T from
