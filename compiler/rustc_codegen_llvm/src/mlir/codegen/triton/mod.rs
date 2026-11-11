@@ -15,6 +15,7 @@
  */
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use melior::ir::attribute::{FloatAttribute, IntegerAttribute};
 use melior::ir::operation::{OperationBuilder, OperationLike};
@@ -82,7 +83,7 @@ type PtrToConstArray = HashMap<Local, Local>;
 
 /// Maps a MIR local that holds `&[i32]` (built from a const array via `slice_from_raw_parts` /
 /// `transmute`) to the shape extracted from the underlying `ConstArrays` entry.
-type SliceShape = HashMap<Local, Vec<i64>>;
+type SliceShape = SliceTable<Vec<i64>>;
 
 /// Runtime (non-constant) arrays: elements are SSA `Value`s instead of `i64` literals.
 type DynArrays<'c, 'p> = HashMap<Local, Vec<Value<'c, 'p>>>;
@@ -92,7 +93,53 @@ type PtrToDynArray = HashMap<Local, Local>;
 
 /// Slice (fat pointer) whose elements are runtime SSA values — parallel to `SliceShape` for
 /// the dynamic case.
-type SliceDynValues<'c, 'p> = HashMap<Local, Vec<Value<'c, 'p>>>;
+type SliceDynValues<'c, 'p> = SliceTable<Vec<Value<'c, 'p>>>;
+
+/// A slice side table (`SliceShape`, `SliceDynValues`). Like the other side tables it is
+/// flow-insensitive: one entry per local, whichever assignment recorded it. That is only sound
+/// for a local with a single definition, so a local assigned more than once (e.g. a slice
+/// chosen by an `if`) is never recorded, and lookups for it fail instead of returning the
+/// value from one arm.
+pub(crate) struct SliceTable<V> {
+    entries: HashMap<Local, V>,
+    multiply_assigned: Rc<HashSet<Local>>,
+}
+
+impl<V> SliceTable<V> {
+    fn new(multiply_assigned: Rc<HashSet<Local>>) -> Self {
+        Self { entries: HashMap::new(), multiply_assigned }
+    }
+
+    pub(crate) fn get(&self, local: &Local) -> Option<&V> {
+        self.entries.get(local)
+    }
+
+    pub(crate) fn insert(&mut self, local: Local, value: V) {
+        if !self.multiply_assigned.contains(&local) {
+            self.entries.insert(local, value);
+        }
+    }
+}
+
+/// Locals with more than one whole-local definition (assignment or call destination) in `mir`.
+fn multiply_assigned_locals(mir: &Body<'_>) -> HashSet<Local> {
+    let definitions = mir.basic_blocks.iter().flat_map(|block| {
+        let assigned = block.statements.iter().filter_map(|statement| match &statement.kind {
+            StatementKind::Assign(assign) => Some(assign.0),
+            _ => None,
+        });
+        let called = block.terminator.as_ref().and_then(|terminator| match &terminator.kind {
+            rustc_middle::mir::TerminatorKind::Call { destination, .. } => Some(*destination),
+            _ => None,
+        });
+        assigned.chain(called)
+    });
+    let mut seen = HashSet::new();
+    definitions
+        .filter(|place| place.projection.is_empty())
+        .filter_map(|place| (!seen.insert(place.local)).then_some(place.local))
+        .collect()
+}
 
 /// Maps a descriptor local to its block shape (the tile dimensions it loads).
 type DescBlockShapes = HashMap<Local, Vec<i64>>;
@@ -182,10 +229,10 @@ impl<'c, 'p> CodegenState<'c, 'p> {
             tuple_fields: HashMap::new(),
             const_arrays: HashMap::new(),
             ptr_to_const_array: HashMap::new(),
-            slice_shape: HashMap::new(),
+            slice_shape: SliceTable::new(Rc::default()),
             dyn_arrays: HashMap::new(),
             ptr_to_dyn_array: HashMap::new(),
-            slice_dyn_values: HashMap::new(),
+            slice_dyn_values: SliceTable::new(Rc::default()),
             desc_block_shapes: HashMap::new(),
             block_ptrs: HashMap::new(),
             loop_header_bb: None,
@@ -1997,6 +2044,10 @@ impl<'a> TritonCodegen<'a> {
 
         let mir = tcx.instance_mir(instance.def);
         let location = func_loc;
+
+        let multiply_assigned = Rc::new(multiply_assigned_locals(mir));
+        state.slice_shape = SliceTable::new(Rc::clone(&multiply_assigned));
+        state.slice_dyn_values = SliceTable::new(multiply_assigned);
 
         if func_name.contains("program_id") {
             //println!("[DEBUG] TritonCodegen::codegen_function: mir: {:?}", mir);
