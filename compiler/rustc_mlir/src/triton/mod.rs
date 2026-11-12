@@ -57,7 +57,8 @@ pub fn pointer_type<'a>(pointee: Type<'a>) -> Type<'a> {
     unsafe { Type::from_raw(mlirCreateTritonPointerType(pointee.to_raw(), 1)) }
 }
 
-// Extracted function for creating a tt.func operation with empty body and tt.divisibility attrs.
+/// Creates a `tt.func` with an empty body. Pointer arguments are declared `tt.divisibility =
+/// divisibility`; scalar arguments get no hint.
 pub fn create_func<'c>(
     context: &'c melior::Context,
     location: Location<'c>,
@@ -70,11 +71,22 @@ pub fn create_func<'c>(
     // Create the function type
     let function_type = TypeAttribute::new(FunctionType::new(context, arg_types, res_types).into());
 
-    // Argument attributes: each gets a dictionary {tt.divisibility = $divisibility : i32}
-    let arg_attrs: Vec<_> = (0..arg_types.len())
-        .map(|_| {
-            Attribute::parse(context, &format!("{{tt.divisibility = {} : i32}}", divisibility))
-                .expect("valid arg attrs")
+    // The hint promises Triton that every value the argument ever takes is a multiple of
+    // `divisibility`, and Triton vectorises on that basis. Upstream Triton only gives it to an
+    // integer argument whose launch value actually is one, specialising per launch; these
+    // kernels are compiled ahead of time, so for a scalar (`n_elements`, a divisor, a stride) it
+    // would be false and miscompile masks and divisions (teenygrad#133). Device allocations are
+    // aligned well beyond 16 bytes, so pointers keep it.
+    let pointer_id = pointer_type(Type::float32(context)).id();
+    let arg_attrs: Vec<_> = arg_types
+        .iter()
+        .map(|ty| {
+            let attrs = if ty.id() == pointer_id {
+                format!("{{tt.divisibility = {divisibility} : i32}}")
+            } else {
+                "{}".to_string()
+            };
+            Attribute::parse(context, &attrs).expect("valid arg attrs")
         })
         .collect();
     let arg_attrs = ArrayAttribute::new(context, &arg_attrs);

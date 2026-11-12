@@ -132,4 +132,58 @@ mod tests {
 
         Ok(())
     }
+
+    // teenyc-2ef (teenygrad#133): every kernel argument used to be declared `tt.divisibility =
+    // 16`. For a scalar like `n_elements` that's false for most launches, and Triton then treats
+    // each thread's 4 contiguous lanes as one for anything derived from it: the bounds mask (and
+    // any division by a scalar) is computed once per group of 4, so masked stores run past the
+    // end. Pointer arguments keep the hint; scalars must not carry it.
+    #[test]
+    fn test_scalar_args_have_no_divisibility_hint() -> Result<(), Box<dyn std::error::Error>> {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        // The pre-Triton MLIR is only written next to an explicitly requested object file, as
+        // teenygrad's compiler driver requests it, so this compiles with `--emit=obj=...` instead
+        // of `LlvmCompiler::compile`.
+        let file = env::current_dir().unwrap().join("tests/data/triton_relu.rs");
+        let obj = PathBuf::from("/tmp/kernel-test_relu_divisibility.o");
+        let args: Vec<String> = [
+            "rustc",
+            &file.display().to_string(),
+            "-Copt-level=3",
+            "-Cpanic=abort",
+            &format!("--emit=obj={}", obj.display()),
+            "--target=nvptx64-nvidia-cuda",
+            "--crate-type=lib",
+            "-Coverflow-checks=off",
+            "--frontend=triton",
+        ]
+        .map(String::from)
+        .to_vec();
+        run_compiler(&args, &mut MlirBackendCallbacks);
+        let mlir = std::fs::read_to_string(obj.with_extension("mlir"))?;
+
+        let signature = mlir
+            .lines()
+            .find(|l| l.contains("@entry_point"))
+            .ok_or_else(|| format!("no entry_point in MLIR:\n{mlir}"))?;
+        // `%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: ..., %arg2: i32 ...`
+        let args: Vec<&str> = signature.split("%arg").skip(1).collect();
+        assert_eq!(args.len(), 3, "expected 3 entry_point args in:\n{signature}");
+        for arg in &args[..2] {
+            assert!(
+                arg.contains("!tt.ptr<f32> {tt.divisibility = 16 : i32}"),
+                "pointer arg lost its divisibility hint:\n{signature}"
+            );
+        }
+        assert!(
+            args[2].starts_with("2: i32") && !args[2].contains("tt.divisibility"),
+            "scalar n_elements must not carry a divisibility hint:\n{signature}"
+        );
+        Ok(())
+    }
 }
