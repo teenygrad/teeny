@@ -2849,10 +2849,7 @@ impl<'a> TritonCodegen<'a> {
                         let val_ty = val.r#type();
                         if val_ty.is_integer() {
                             // integer negation: 0 - x
-                            let zero_op: Operation<'a> =
-                                create_int_constant(self.module.context(), location, Int::I32(0))
-                                    .map_err(|e| MlirError::CreateOperation { err: e })?
-                                    .into();
+                            let zero_op: Operation<'a> = self.zero_constant(location, val_ty);
                             let zero: Value<'a, 'a> = zero_op.result(0).unwrap().into();
                             mlir_block.append_operation(zero_op);
                             let sub_op: Operation<'a> =
