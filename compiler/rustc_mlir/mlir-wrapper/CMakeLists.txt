@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(mlir-wrapper CXX C)
 
-set(CMAKE_CXX_STANDARD 17)
+# Triton 3.9 headers use C++20 (e.g. std::set::contains).
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

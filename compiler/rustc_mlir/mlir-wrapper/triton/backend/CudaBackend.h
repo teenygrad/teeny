@@ -160,7 +160,8 @@ enum CudaPass {
 
   // ttnvgpuir
   ttnvgpuir_to_llvmir,
-  ttnvgpuir_plan_cta,
+  ttnvgpuir_assign_cga_layouts,
+  ttnvgpuir_optimize_cta_locality,
   ttnvgpuir_fence_insertion,
   ttnvgpuir_proxy_fence_insertion,
   ttnvgpuir_tma_lowering,
@@ -174,6 +175,11 @@ enum CudaPass {
   ttnvgpuir_optimize_descriptor_encoding,
   ttnvgpuir_optimize_tmem_layouts,
   ttnvgpuir_interleave_tmem,
+  ttnvgpuir_membar,
+  ttnvgpuir_tmem_barrier_insertion,
+  ttnvgpuir_tmem_wait_insertion,
+  ttnvgpuir_cluster_barrier_mbar_allocator,
+  ttnvgpuir_initialize_ws_cluster_barriers,
 
   // nvws
   nvws_lower_warp_group,
@@ -277,7 +283,16 @@ private:
            ttng::createTritonNvidiaGPUOptimizeTMemLayoutsPass},
           {ttnvgpuir_interleave_tmem,
            ttng::createTritonNvidiaGPUInterleaveTMemPass},
-          {ttnvgpuir_plan_cta, ttng::createTritonNvidiaGPUPlanCTAPass},
+          {ttnvgpuir_assign_cga_layouts,
+           ttng::createTritonNvidiaGPUAssignCGALayoutsPass},
+          {ttnvgpuir_optimize_cta_locality,
+           ttng::createTritonNvidiaGPUOptimizeCTALocalityPass},
+          {ttnvgpuir_tmem_barrier_insertion,
+           ttng::createTritonNvidiaGPUTMemBarrierInsertionPass},
+          {ttnvgpuir_tmem_wait_insertion,
+           ttng::createTritonNvidiaGPUTMemWaitInsertionPass},
+          {ttnvgpuir_cluster_barrier_mbar_allocator,
+           ttng::createTritonNvidiaGPUClusterBarrierMbarAllocatorPass},
 
           // nvws
           {nvws_lower_warp_group, mlir::triton::createNVWSLowerWarpGroup},

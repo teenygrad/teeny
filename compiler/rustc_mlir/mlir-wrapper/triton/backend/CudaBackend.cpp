@@ -269,6 +269,12 @@ std::optional<Error> CudaBackend::addCudaPass(PassManager &pm, CudaPass pass,
   case CudaPass::allocate_shared_memory_nv:
     pm.addPass(mlir::triton::createAllocateSharedMemoryNvPass(arg0, arg1));
     return std::nullopt;
+  case CudaPass::ttnvgpuir_membar:
+    pm.addPass(mlir::triton::createTritonNvidiaGPUMembar({arg0, arg1}));
+    return std::nullopt;
+  case CudaPass::ttnvgpuir_initialize_ws_cluster_barriers:
+    pm.addPass(mlir::triton::createInitializeWSClusterBarriers({arg0, arg1}));
+    return std::nullopt;
   default:
     m_last_error = std::make_optional(Error::InvalidPass);
     m_last_error_string = "Invalid nvidia pass";
@@ -347,10 +353,13 @@ LogicalResult CudaBackend::makeTTGIR(MLIRContext &context, ModuleOp module) {
   addPass(pm, MlirPass::ttgpuir_coalesce);
   addPass(pm, MlirPass::ttgpuir_f32_dot_tc, emuTF32);
 
-  addCudaPass(pm, CudaPass::ttnvgpuir_plan_cta);
+  addCudaPass(pm, CudaPass::ttnvgpuir_assign_cga_layouts);
+  addPass(pm, MlirPass::ttgpuir_remove_layout_conversions);
+  addCudaPass(pm, CudaPass::ttnvgpuir_optimize_cta_locality);
   addPass(pm, MlirPass::ttgpuir_remove_layout_conversions);
   addPass(pm, MlirPass::ttgpuir_optimize_thread_locality);
   addPass(pm, MlirPass::ttgpuir_accelerate_matmul);
+  addCudaPass(pm, CudaPass::ttnvgpuir_check_matmul_two_cta);
   addPass(pm, MlirPass::ttgpuir_remove_layout_conversions);
   addPass(pm, MlirPass::ttgpuir_optimize_dot_operands, capability_major >= 8);
 
@@ -458,20 +467,28 @@ LogicalResult CudaBackend::makeLLIR(MLIRContext &context, ModuleOp module) {
   addCudaPass(pm, CudaPass::allocate_shared_memory_nv, capability,
               ptx_version);
   addCudaPass(pm, CudaPass::ttnvgpuir_allocate_tensor_memory);
-  addCudaPass(pm, CudaPass::ttnvgpuir_check_matmul_two_cta);
-  if (m_options.enable_experimental_consan) {
-    addPass(pm, MlirPass::ttgpuir_concurrency_sanitizer);
-  }
-
-  addPass(pm, MlirPass::ttgpuir_allocate_global_scratch_memory);
-  addCudaPass(pm, CudaPass::ttnvgpuir_proxy_fence_insertion, capability);
 
   if (m_options.instrumentation) {
     // AXM TODO: Implement instrumentation
     // CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
   }
 
+  // Since Triton 3.9 shared-memory barriers come from a separate membar pass
+  // rather than from ttgpuir_to_llvmir; without it reductions that reuse a
+  // scratch buffer race. The order matches upstream's make_llir.
+  addCudaPass(pm, CudaPass::ttnvgpuir_proxy_fence_insertion, capability);
+  addCudaPass(pm, CudaPass::ttnvgpuir_tmem_barrier_insertion);
+  addCudaPass(pm, CudaPass::ttnvgpuir_membar, capability, ptx_version);
+  addCudaPass(pm, CudaPass::ttnvgpuir_tmem_wait_insertion);
+  if (m_options.enable_experimental_consan) {
+    addPass(pm, MlirPass::ttgpuir_concurrency_sanitizer);
+  }
+  addCudaPass(pm, CudaPass::ttnvgpuir_cluster_barrier_mbar_allocator);
+  addPass(pm, MlirPass::ttgpuir_allocate_global_scratch_memory);
+
   addCudaPass(pm, CudaPass::ttnvgpuir_to_llvmir, capability, ptx_version);
+  addCudaPass(pm, CudaPass::ttnvgpuir_initialize_ws_cluster_barriers,
+              capability, ptx_version);
   addPass(pm, MlirPass::canonicalizer);
   addPass(pm, MlirPass::cse);
   addCudaPass(pm, CudaPass::ttnvgpuir_nvgpu_to_llvm);
