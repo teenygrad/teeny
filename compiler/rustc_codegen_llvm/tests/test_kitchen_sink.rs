@@ -682,6 +682,49 @@ mod tests {
         );
     }
 
+    // teenyc-1o1: Triton 3.9 moved shared-memory barrier insertion out of the TTGPU-to-LLVM
+    // conversion into a separate membar pass. Without it, the second of two reductions sharing a
+    // scratch buffer overwrote it while other warps were still reading the first result.
+    #[test]
+    fn test_back_to_back_reductions_synchronise() {
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+
+        let compiler = LlvmCompiler::new();
+        let file =
+            env::current_dir().unwrap().join("tests/data/triton_back_to_back_reductions.rs");
+        let result =
+            compiler.compile(&file, "nvptx64-nvidia-cuda", "test_back_to_back_reductions");
+        assert!(result.is_ok(), "back_to_back_reductions compile failed: {:?}", result.err());
+
+        let ptx = std::fs::read_to_string(result.unwrap()).expect("kernel.asm not written");
+        let shared_ops = ptx.lines().filter(|l| l.contains("ld.shared")).count();
+        assert!(shared_ops >= 2, "expected both reductions to go through shared memory:\n{ptx}");
+
+        // A shared store after a shared load with no barrier between them is a write-after-read
+        // race across warps.
+        let mut unsynchronised_read = None;
+        for (n, line) in ptx.lines().enumerate() {
+            let op = line.trim_start();
+            if op.starts_with("bar.sync") || op.starts_with("barrier.sync") {
+                unsynchronised_read = None;
+            } else if op.starts_with("ld.shared") {
+                unsynchronised_read = Some(n + 1);
+            } else if op.starts_with("st.shared") {
+                if let Some(read) = unsynchronised_read {
+                    panic!(
+                        "shared store on line {} follows the shared load on line {read} with no \
+                         barrier in between:\n{ptx}",
+                        n + 1
+                    );
+                }
+            }
+        }
+    }
+
     // teenyc-32u: tensor descriptor ops with literal (promoted) slice arguments used to fall
     // back to ub.poison, which silently dropped the copy.
     #[test]
