@@ -180,6 +180,33 @@ fn parse_simple_toml(path: &Path) -> HashMap<String, String> {
     map
 }
 
+/// Rerun this build script when the submodule at `src` is checked out at a different commit.
+///
+/// Watching the whole source tree is too expensive, and without any trigger a submodule bump
+/// leaves a stale Triton build in place. Watching the git `HEAD` (and the branch it names)
+/// catches checkouts and new commits. Outside a git checkout, e.g. a source tarball, there is
+/// nothing to watch and the build relies on `triton.toml` alone.
+fn rerun_if_submodule_moved(src: &Path) {
+    let dot_git = src.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let Ok(contents) = std::fs::read_to_string(&dot_git) else { return };
+        let Some(rel) = contents.trim().strip_prefix("gitdir:") else { return };
+        src.join(rel.trim())
+    };
+
+    let head = git_dir.join("HEAD");
+    let Ok(head_contents) = std::fs::read_to_string(&head) else { return };
+    println!("cargo:rerun-if-changed={}", head.display());
+    if let Some(branch_ref) = head_contents.trim().strip_prefix("ref:") {
+        let branch = git_dir.join(branch_ref.trim());
+        if branch.exists() {
+            println!("cargo:rerun-if-changed={}", branch.display());
+        }
+    }
+}
+
 /// Build Triton using cmake, driven by triton.toml config and the LLVM install
 /// pointed to by `llvm_config`. Returns the Triton build output directory.
 ///
@@ -190,6 +217,7 @@ fn build_triton(llvm_config: &Path, workspace_root: &Path) -> PathBuf {
     let triton_src = workspace_root.join("src/triton");
 
     println!("cargo:rerun-if-changed=triton.toml");
+    rerun_if_submodule_moved(&triton_src);
     let cfg = parse_simple_toml(&manifest_dir.join("triton.toml"));
     let build_type = cfg.get("build_type").map(|s| s.as_str()).unwrap_or("Release");
     let backends = cfg.get("backends").map(|s| s.as_str()).unwrap_or("amd;nvidia");
@@ -210,6 +238,15 @@ fn build_triton(llvm_config: &Path, workspace_root: &Path) -> PathBuf {
     let triton_build_out = workspace_root.join("target/build/triton-build");
     std::fs::create_dir_all(&triton_build_out)
         .unwrap_or_else(|e| panic!("failed to create {}: {}", triton_build_out.display(), e));
+
+    // rustc_llvm is built twice in one compiler build: as a dependency of rustc_codegen_llvm and
+    // as a host build-dependency of rustc_mlir. Both runs build into this one directory, and two
+    // concurrent cmake/ninja runs there corrupt each other. Hold the lock for the whole Triton
+    // build so the second run waits and then finds Triton up to date.
+    let lock_path = triton_build_out.join(".build.lock");
+    let _triton_build_lock = std::fs::File::create(&lock_path)
+        .and_then(|lock| lock.lock().map(|()| lock))
+        .unwrap_or_else(|e| panic!("failed to lock {}: {}", lock_path.display(), e));
 
     cmake::Config::new(&triton_src)
         .generator("Ninja")
