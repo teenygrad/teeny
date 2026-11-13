@@ -160,7 +160,8 @@ enum CudaPass {
 
   // ttnvgpuir
   ttnvgpuir_to_llvmir,
-  ttnvgpuir_plan_cta,
+  ttnvgpuir_assign_cga_layouts,
+  ttnvgpuir_optimize_cta_locality,
   ttnvgpuir_fence_insertion,
   ttnvgpuir_proxy_fence_insertion,
   ttnvgpuir_tma_lowering,
@@ -277,7 +278,10 @@ private:
            ttng::createTritonNvidiaGPUOptimizeTMemLayoutsPass},
           {ttnvgpuir_interleave_tmem,
            ttng::createTritonNvidiaGPUInterleaveTMemPass},
-          {ttnvgpuir_plan_cta, ttng::createTritonNvidiaGPUPlanCTAPass},
+          {ttnvgpuir_assign_cga_layouts,
+           ttng::createTritonNvidiaGPUAssignCGALayoutsPass},
+          {ttnvgpuir_optimize_cta_locality,
+           ttng::createTritonNvidiaGPUOptimizeCTALocalityPass},
 
           // nvws
           {nvws_lower_warp_group, mlir::triton::createNVWSLowerWarpGroup},

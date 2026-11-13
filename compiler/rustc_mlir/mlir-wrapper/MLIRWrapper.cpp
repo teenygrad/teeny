@@ -25,7 +25,10 @@ extern "C" MlirType mlirCreateTritonPointerType(MlirType pointee,
                                                 int address_space) {
   auto type = unwrap(pointee);
 
-  auto pointer_type = triton::getPointerType(type, address_space);
+  // The FFI keeps a plain int; Triton 3.9 made the parameter a PtrAddrSpace
+  // enum whose values are the address-space numbers themselves.
+  auto pointer_type = triton::getPointerType(
+      type, static_cast<triton::PtrAddrSpace>(address_space));
 
   return wrap(pointer_type);
 }

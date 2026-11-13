@@ -250,14 +250,14 @@ When working on the MLIR backend:
 ## Triton Integration
 
 Triton compiler is embedded in `src/triton/`:
-- Version 3.6.0
+- Version 3.9.0
 - Full Triton source tree
 - Build with cmake/make (see `src/triton/README.md`)
 - Used for GPU kernel compilation
 
 ## Building Triton from Source
 
-Triton can be built standalone or automatically via the Rust build system. The Triton source is located in `src/triton/` (version 3.6.0).
+Triton can be built standalone or automatically via the Rust build system. The Triton source is located in `src/triton/` (version 3.9.0).
 
 ### Dependencies
 
@@ -265,10 +265,10 @@ Triton can be built standalone or automatically via the Rust build system. The T
 - CMake >= 3.20
 - Ninja >= 1.11.1
 - Python 3 with setuptools, wheel
-- pybind11 >= 2.13.1
+- nanobind == 2.10.2 (`pip install nanobind==2.10.2` into the Python CMake finds; Triton 3.9 replaced pybind11)
 
 **LLVM/MLIR:**
-- LLVM version pinned in `src/triton/cmake/llvm-hash.txt`
+- Upstream's LLVM pin is in `src/triton/cmake/llvm-info.json`; this fork builds against rustc's LLVM instead (see the fork commits on the `src/triton` branch)
 - Can use parent Rust build's LLVM or build custom LLVM
 
 **Optional:**

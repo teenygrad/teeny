@@ -347,10 +347,13 @@ LogicalResult CudaBackend::makeTTGIR(MLIRContext &context, ModuleOp module) {
   addPass(pm, MlirPass::ttgpuir_coalesce);
   addPass(pm, MlirPass::ttgpuir_f32_dot_tc, emuTF32);
 
-  addCudaPass(pm, CudaPass::ttnvgpuir_plan_cta);
+  addCudaPass(pm, CudaPass::ttnvgpuir_assign_cga_layouts);
+  addPass(pm, MlirPass::ttgpuir_remove_layout_conversions);
+  addCudaPass(pm, CudaPass::ttnvgpuir_optimize_cta_locality);
   addPass(pm, MlirPass::ttgpuir_remove_layout_conversions);
   addPass(pm, MlirPass::ttgpuir_optimize_thread_locality);
   addPass(pm, MlirPass::ttgpuir_accelerate_matmul);
+  addCudaPass(pm, CudaPass::ttnvgpuir_check_matmul_two_cta);
   addPass(pm, MlirPass::ttgpuir_remove_layout_conversions);
   addPass(pm, MlirPass::ttgpuir_optimize_dot_operands, capability_major >= 8);
 
@@ -458,7 +461,6 @@ LogicalResult CudaBackend::makeLLIR(MLIRContext &context, ModuleOp module) {
   addCudaPass(pm, CudaPass::allocate_shared_memory_nv, capability,
               ptx_version);
   addCudaPass(pm, CudaPass::ttnvgpuir_allocate_tensor_memory);
-  addCudaPass(pm, CudaPass::ttnvgpuir_check_matmul_two_cta);
   if (m_options.enable_experimental_consan) {
     addPass(pm, MlirPass::ttgpuir_concurrency_sanitizer);
   }
