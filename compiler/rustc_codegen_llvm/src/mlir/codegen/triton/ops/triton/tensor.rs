@@ -142,6 +142,24 @@ enum Flip {
 }
 
 impl<'a> TritonCodegen<'a> {
+    /// `arith.constant 0 : <ty>` for a scalar integer or float type, at that exact type.
+    ///
+    /// Integer zeros must be built at the element's own width: splatting an `i32` zero into a
+    /// `tensor<..xi8>` (or subtracting from an `i16`) fails MLIR verification with "requires the
+    /// same element type for all operands and results" (teenygrad#142).
+    pub(crate) fn zero_constant(
+        &self,
+        location: Location<'a>,
+        ty: melior::ir::Type<'a>,
+    ) -> Operation<'a> {
+        let attr: melior::ir::Attribute<'a> = if ty.is_integer() {
+            melior::ir::attribute::IntegerAttribute::new(ty, 0).into()
+        } else {
+            FloatAttribute::new(self.module.context(), ty, 0.0).into()
+        };
+        melior::dialect::arith::constant(self.module.context(), attr, location)
+    }
+
     pub fn codegen_arange<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -781,15 +799,7 @@ impl<'a> TritonCodegen<'a> {
         }
 
         // Create a scalar zero constant of the element type.
-        let zero_op: Operation<'a> = if elem_mlir_ty.is_integer() {
-            create_int_constant(self.module.context(), location, Int::I32(0))
-                .map_err(|e| MlirError::CreateOperation { err: e })?
-                .into()
-        } else {
-            // Float zero: emit `arith.constant 0.0 : <float_ty>`
-            let zero_attr = FloatAttribute::new(self.module.context(), elem_mlir_ty, 0.0);
-            melior::dialect::arith::constant(self.module.context(), zero_attr.into(), location)
-        };
+        let zero_op: Operation<'a> = self.zero_constant(location, elem_mlir_ty);
         let zero_val = zero_op.result(0).expect("zero constant result");
         mlir_block.append_operation(zero_op);
 
@@ -870,14 +880,7 @@ impl<'a> TritonCodegen<'a> {
         }
 
         // Create a zero constant of the element type.
-        let zero_op: Operation<'a> = if elem_ty.is_integer() {
-            create_int_constant(self.module.context(), location, Int::I32(0))
-                .map_err(|e| MlirError::CreateOperation { err: e })?
-                .into()
-        } else {
-            let zero_attr = FloatAttribute::new(self.module.context(), elem_ty, 0.0);
-            melior::dialect::arith::constant(self.module.context(), zero_attr.into(), location)
-        };
+        let zero_op: Operation<'a> = self.zero_constant(location, elem_ty);
         let zero_val = zero_op.result(0).expect("zero constant result");
         mlir_block.append_operation(zero_op);
 
@@ -2022,18 +2025,7 @@ impl<'a> TritonCodegen<'a> {
             Some(v) => v,
             None => {
                 // Build a zeros splat of shape [M×N].
-                let zero_op: Operation<'a> = if elem_ty.is_integer() {
-                    create_int_constant(self.module.context(), location, Int::I32(0))
-                        .map_err(|e| MlirError::CreateOperation { err: e })?
-                        .into()
-                } else {
-                    let zero_attr = FloatAttribute::new(self.module.context(), elem_ty, 0.0);
-                    melior::dialect::arith::constant(
-                        self.module.context(),
-                        zero_attr.into(),
-                        location,
-                    )
-                };
+                let zero_op: Operation<'a> = self.zero_constant(location, elem_ty);
                 let zero_val = zero_op.result(0).expect("zero constant");
                 mlir_block.append_operation(zero_op);
 
@@ -2231,18 +2223,7 @@ impl<'a> TritonCodegen<'a> {
         let c = match acc_opt {
             Some(v) => v,
             None => {
-                let zero_op: Operation<'a> = if elem_ty.is_integer() {
-                    create_int_constant(self.module.context(), location, Int::I32(0))
-                        .map_err(|e| MlirError::CreateOperation { err: e })?
-                        .into()
-                } else {
-                    let zero_attr = FloatAttribute::new(self.module.context(), elem_ty, 0.0);
-                    melior::dialect::arith::constant(
-                        self.module.context(),
-                        zero_attr.into(),
-                        location,
-                    )
-                };
+                let zero_op: Operation<'a> = self.zero_constant(location, elem_ty);
                 let zero_val = zero_op.result(0).expect("zero constant");
                 mlir_block.append_operation(zero_op);
 
