@@ -32,7 +32,7 @@ struct MlirBackendCallbacks;
 
 impl Callbacks for MlirBackendCallbacks {
     fn config(&mut self, config: &mut interface::Config) {
-        config.make_codegen_backend = Some(Box::new(|_sess: &rustc_session::Session| {
+        config.make_codegen_backend = Some(Box::new(|_sess: &rustc_session::EarlySession| {
             rustc_codegen_llvm::mlir::MlirCodegenBackend::new()
         }));
     }

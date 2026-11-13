@@ -66,6 +66,7 @@ WORKDIR /build
 COPY scripts/musl.sh /build
 COPY scripts/musl-cve-2026-6042.diff /build/
 COPY scripts/musl-cve-2026-40200.diff /build/
+COPY scripts/musl-cve-2026-107891.diff /build/
 RUN env \
     CC=arm-linux-gnueabi-gcc-9 CFLAGS="-march=armv7-a" \
     CXX=arm-linux-gnueabi-g++-9 CXXFLAGS="-march=armv7-a" \
@@ -79,9 +80,9 @@ RUN /tmp/build-fuchsia-toolchain.sh
 COPY host-x86_64/dist-various-2/build-x86_64-fortanix-unknown-sgx-toolchain.sh /tmp/
 RUN /tmp/build-x86_64-fortanix-unknown-sgx-toolchain.sh
 
-RUN curl -L https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz | \
+RUN curl -L https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz | \
   tar -xz
-ENV WASI_SDK_PATH=/tmp/wasi-sdk-33.0-x86_64-linux
+ENV WASI_SDK_PATH=/tmp/wasi-sdk-34.0-x86_64-linux
 
 COPY scripts/freebsd-toolchain.sh /tmp/
 RUN /tmp/freebsd-toolchain.sh i686
@@ -104,6 +105,7 @@ ENV TARGETS=$TARGETS,wasm32-unknown-unknown
 ENV TARGETS=$TARGETS,wasm32-wasip1
 ENV TARGETS=$TARGETS,wasm32-wasip1-threads
 ENV TARGETS=$TARGETS,wasm32-wasip2
+ENV TARGETS=$TARGETS,wasm32-wasip3
 ENV TARGETS=$TARGETS,wasm32v1-none
 ENV TARGETS=$TARGETS,x86_64-unknown-linux-gnux32
 ENV TARGETS=$TARGETS,x86_64-fortanix-unknown-sgx

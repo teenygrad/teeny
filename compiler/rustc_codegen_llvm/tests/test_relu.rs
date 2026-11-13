@@ -31,7 +31,7 @@ impl Callbacks for MlirBackendCallbacks {
         debug!("MlirBackendCallbacks::config called - registering backend");
         // Register the MLIR codegen backend programmatically
         // This closure will be called when rustc needs to create the codegen backend
-        config.make_codegen_backend = Some(Box::new(|_sess: &rustc_session::Session| {
+        config.make_codegen_backend = Some(Box::new(|_sess: &rustc_session::EarlySession| {
             debug!("make_codegen_backend closure called - creating MlirCodegenBackend");
             // Create and return the MLIR codegen backend
             rustc_codegen_llvm::mlir::MlirCodegenBackend::new()

@@ -1,5 +1,4 @@
 #![cfg(test)]
-#![allow(unused_attributes)]
 #![unstable(feature = "alloctests", issue = "none")]
 #![no_std]
 // Lints:
@@ -14,9 +13,8 @@
 //
 // Library features:
 // tidy-alphabetical-start
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 #![feature(array_into_iter_constructors)]
-#![feature(assert_matches)]
 #![feature(char_internals)]
 #![feature(const_alloc_error)]
 #![feature(const_cmp)]
@@ -39,7 +37,6 @@
 #![feature(maybe_uninit_uninit_array_transpose)]
 #![feature(ptr_alignment_type)]
 #![feature(ptr_cast_slice)]
-#![feature(ptr_internals)]
 #![feature(rev_into_inner)]
 #![feature(sized_type_properties)]
 #![feature(slice_iter_mut_as_mut_slice)]
@@ -63,7 +60,6 @@
 #![feature(const_trait_impl)]
 #![feature(dropck_eyepatch)]
 #![feature(min_specialization)]
-#![feature(never_type)]
 #![feature(optimize_attribute)]
 #![feature(prelude_import)]
 #![feature(rustc_attrs)]

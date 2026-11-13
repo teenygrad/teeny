@@ -251,6 +251,9 @@ impl<'tcx> MirVisitor<'tcx> {
             ProjectionElem::UnwrapUnsafeBinder(ty) => {
                 self.log(&format!("[{}] UnwrapUnsafeBinder({:?})", idx, ty));
             }
+            ProjectionElem::PhantomDeref => {
+                self.log(&format!("[{}] PhantomDeref", idx));
+            }
         }
     }
 

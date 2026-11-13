@@ -45,7 +45,7 @@ use rustc_errors::DiagCtxtHandle;
 use rustc_middle::dep_graph;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId, WorkProductMap};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::{IncrCompSession, Session};
+use rustc_session::{EarlySession, IncrCompSession, Session};
 use rustc_session::config::{self, OutputFilenames, PrintKind, PrintRequest};
 use rustc_span::Symbol;
 use rustc_target::spec::Arch;
@@ -87,6 +87,8 @@ impl ExtraBackendMethods for MlirCodegenBackend {
         &self,
         tcx: TyCtxt<'_>,
         cgu_name: Symbol,
+        // The MLIR backend never emits LLVM bitcode, so there is nothing to skip.
+        _bitcode_needed: bool,
     ) -> (ModuleCodegen<Self::Module>, u64) {
         let start_time = Instant::now();
 
@@ -266,7 +268,6 @@ impl WriteBackendMethods for MlirCodegenBackend {
         &self,
         _sess: &Session,
         _opt_level: config::OptLevel,
-        _target_features: &[String],
     ) -> TargetMachineFactoryFn<Self> {
         // The MLIR backend has no LLVM TargetMachine of its own (Self::TargetMachine = ());
         // target-specific configuration is threaded through MlirModule instead.
@@ -468,7 +469,6 @@ fn write_compiled_module(
         bytecode: None,
         assembly,
         llvm_ir: None,
-        links_from_incr_cache: Vec::new(),
     }
 }
 
@@ -481,7 +481,7 @@ impl CodegenBackend for MlirCodegenBackend {
         crate::llvm_util::target_cpu(sess).to_string()
     }
 
-    fn target_config(&self, sess: &Session) -> TargetConfig {
+    fn target_config(&self, sess: &EarlySession) -> TargetConfig {
         // The LLVM backend asks an LLVM target machine which features its base
         // cpu enables. This backend's target cpus (`generic-rvv1.0`, `sm_90`)
         // are not LLVM cpu names -- LLVM's RISC-V backend aborts on them -- so
@@ -506,6 +506,7 @@ impl CodegenBackend for MlirCodegenBackend {
             internal_target_features,
             has_reliable_f16: false,
             has_reliable_f16_math: false,
+            has_reliable_f16b: false,
             has_reliable_f128: false,
             has_reliable_f128_math: false,
         }
