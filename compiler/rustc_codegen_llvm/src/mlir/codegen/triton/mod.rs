@@ -34,6 +34,7 @@ use rustc_middle::mir::{
     ConstValue, Local, NonDivergingIntrinsic, Operand, Place, ProjectionElem, Rvalue, Statement,
     StatementKind, UnOp, UnevaluatedConst as MirUnevaluatedConst,
 };
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::MaybeResult;
 use rustc_middle::ty::{
     self, AdtDef, ConstKind, EarlyBinder, GenericArg, Instance, ParamConst, ScalarInt, Ty, TyCtxt,

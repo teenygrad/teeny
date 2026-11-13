@@ -10,8 +10,8 @@ This is a custom fork of the Rust compiler (rustc) with experimental MLIR codege
 
 - **rustc_codegen_mlir**: A new MLIR-based codegen backend for Rust (`compiler/rustc_codegen_mlir/`)
 - **Triton integration**: OpenAI's Triton compiler embedded in `src/triton/`
-- **LLVM 23.1**: Uses LLVM version 23.1.1 (rust-lang/llvm-project `rustc/23.1-2026-07-22`)
-- **Base version**: Built on top of Rust 1.99.0 (upstream `beta`)
+- **LLVM 23.1**: Uses LLVM version 23.1.5 (rust-lang/llvm-project `rustc/23.1-2026-07-22`)
+- **Base version**: Built on top of Rust 1.100.0 (upstream stable release)
 
 This repository requires understanding of both the Rust compiler internals and MLIR/Triton ecosystem.
 
@@ -418,7 +418,7 @@ When built via Rust integration, outputs go to `target/build/triton-build/build/
 
 - Never skip hooks (`--no-verify`, etc.) unless explicitly required
 - Be careful with control flow changes (may affect profiling/debug info per LLVM's copilot-instructions)
-- This repository is based on Rust 1.99.0 (upstream beta), not the latest upstream main
+- This repository is based on Rust 1.100.0 (upstream stable release), not the latest upstream main
 - MLIR backend and Triton integration are custom additions not in upstream Rust
 
 <!-- bv-agent-instructions-v1 -->

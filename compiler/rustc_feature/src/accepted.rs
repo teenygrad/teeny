@@ -46,6 +46,8 @@ declare_features! (
 
     /// Allows `#[target_feature(...)]` on aarch64 platforms
     (accepted, aarch64_target_feature, "1.61.0", Some(44839)),
+    /// Allows `extern "custom" fn()`.
+    (accepted, abi_custom, "1.100.0", Some(140829)),
     /// Allows using the `efiapi` ABI.
     (accepted, abi_efiapi, "1.68.0", Some(65815)),
     /// Allows the sysV64 ABI to be specified on all platforms
@@ -276,7 +278,7 @@ declare_features! (
     /// Allows some increased flexibility in the name resolution rules,
     /// especially around globs and shadowing (RFC 1560).
     (accepted, item_like_imports, "1.15.0", Some(35120)),
-    // Allows using the `kl` and `widekl` target features and the associated intrinsics
+    /// Allows using the `kl` and `widekl` target features and the associated intrinsics
     (accepted, keylocker_x86, "1.89.0", Some(134813)),
     /// Allows `'a: { break 'a; }`.
     (accepted, label_break_value, "1.65.0", Some(48594)),
@@ -333,6 +335,8 @@ declare_features! (
     (accepted, native_link_modifiers_verbatim, "1.67.0", Some(81490)),
     /// Allows specifying the whole-archive link modifier
     (accepted, native_link_modifiers_whole_archive, "1.61.0", Some(81490)),
+    /// Allows the `!` type.
+    (accepted, never_type, "1.100.0", Some(35121)),
     /// Allows using non lexical lifetimes (RFC 2094).
     (accepted, nll, "1.63.0", Some(43234)),
     /// Allows using `#![no_std]`.

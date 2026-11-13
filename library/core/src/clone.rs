@@ -732,7 +732,7 @@ mod impls {
         bool char
     }
 
-    #[unstable(feature = "never_type", issue = "35121")]
+    #[stable(feature = "never_type", since = "1.100.0")]
     #[rustc_const_unstable(feature = "const_clone", issue = "142757")]
     const impl Clone for ! {
         #[inline]
@@ -781,7 +781,7 @@ mod impls {
         #[inline(always)]
         #[rustc_diagnostic_item = "noop_method_clone"]
         fn clone(&self) -> Self {
-            *self
+            self
         }
     }
 
