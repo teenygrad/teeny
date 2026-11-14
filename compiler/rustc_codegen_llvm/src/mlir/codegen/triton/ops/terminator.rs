@@ -15,6 +15,7 @@
  */
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use melior::dialect::scf;
 use melior::ir::attribute::IntegerAttribute;
@@ -36,7 +37,7 @@ use rustc_span::Span;
 use rustc_span::Spanned;
 
 use crate::mlir::codegen::triton::location::span_to_location;
-use crate::mlir::codegen::triton::{CodegenState, TritonCodegen};
+use crate::mlir::codegen::triton::{CodegenState, LoopNest, TritonCodegen};
 use crate::mlir::errors::MlirError;
 
 // Used inside codegen_terminator_call where 'a and 'tcx are concrete — no HRTB needed.
@@ -1134,21 +1135,9 @@ impl<'a> TritonCodegen<'a> {
         let loop_body_bbs = state.loop_body_bbs.clone();
         let iter_carry_locals = state.loop_iter_carry_locals.clone();
 
-        let true_chain = collect_arm_chain(mir, true_target, back_edge_bb, &loop_body_bbs);
-        let false_chain = collect_arm_chain(mir, false_target, back_edge_bb, &loop_body_bbs);
-
-        // An arm is lowered as a straight chain of blocks, so a loop it reaches can't be built
-        // here; lowering the chain anyway would drop the loop and miscompile silently.
-        if let Some(&init_bb) =
-            true_chain.iter().chain(&false_chain).find(|bb| state.nested_loop_inits.contains(bb))
-        {
-            return Err(MlirError::CodegenFailed {
-                err: format!(
-                    "a loop entered at {init_bb:?} is inside an `if` (or follows one) in a loop \
-                     body, which isn't supported yet (teenyc-9nm)"
-                ),
-            });
-        }
+        let nest = Rc::clone(&state.loop_nest);
+        let true_chain = collect_arm_chain(mir, true_target, back_edge_bb, &loop_body_bbs, &nest);
+        let false_chain = collect_arm_chain(mir, false_target, back_edge_bb, &loop_body_bbs, &nest);
 
         let iter_carry_types: Vec<melior::ir::Type<'a>> = iter_carry_locals
             .iter()
@@ -1176,6 +1165,20 @@ impl<'a> TritonCodegen<'a> {
         let then_region = if_op.region(0).expect("scf.if then region");
         let then_block_ref = then_region.append_block(Block::new(&[]));
         for &bb in &true_chain {
+            // A loop in the arm: built here, and the chain carries on at its exit block.
+            let nested = self.codegen_nested_loop(
+                tcx,
+                instance,
+                mir,
+                bb,
+                &then_block_ref,
+                state,
+                basic_blocks,
+                location,
+            )?;
+            if nested.is_some() {
+                continue;
+            }
             let bb_data = &mir.basic_blocks[bb];
             for stmt in &bb_data.statements {
                 self.codegen_statement(tcx, instance, mir, stmt, &then_block_ref, state)?;
@@ -1228,6 +1231,20 @@ impl<'a> TritonCodegen<'a> {
         let else_region = if_op.region(1).expect("scf.if else region");
         let else_block_ref = else_region.append_block(Block::new(&[]));
         for &bb in &false_chain {
+            // A loop in the arm: built here, and the chain carries on at its exit block.
+            let nested = self.codegen_nested_loop(
+                tcx,
+                instance,
+                mir,
+                bb,
+                &else_block_ref,
+                state,
+                basic_blocks,
+                location,
+            )?;
+            if nested.is_some() {
+                continue;
+            }
             let bb_data = &mir.basic_blocks[bb];
             for stmt in &bb_data.statements {
                 self.codegen_statement(tcx, instance, mir, stmt, &else_block_ref, state)?;
@@ -1324,7 +1341,8 @@ impl<'a> TritonCodegen<'a> {
 
 /// Collect a linear chain of body blocks starting from `start`, up to and including
 /// `back_edge_bb` if the chain reaches it. Follows Goto and Call (normal) terminators
-/// within the body, stopping at SwitchInt or when the successor leaves the loop body.
+/// within the body, stopping at SwitchInt or when the successor leaves the loop body. A loop
+/// nested in the body is stepped over, from its init block (kept in the chain) to its exit.
 ///
 /// Including `back_edge_bb` is important when it contains statements (e.g. `acc = move _9`)
 /// that must execute inside the scf.if arm before the arm's yield collects the updated value.
@@ -1333,6 +1351,7 @@ fn collect_arm_chain<'tcx>(
     start: BasicBlock,
     back_edge_bb: BasicBlock,
     body_bbs: &HashSet<BasicBlock>,
+    nest: &LoopNest,
 ) -> Vec<BasicBlock> {
     if start == back_edge_bb {
         return Vec::new();
@@ -1351,6 +1370,11 @@ fn collect_arm_chain<'tcx>(
         // Include back_edge_bb for its statements but do not follow its outgoing edge.
         if current == back_edge_bb {
             break;
+        }
+        // A nested loop's init block stands for the whole loop, which the arm builds in place.
+        if let Some(exit_bb) = nest.exit_of_loop_entered_at(current) {
+            current = exit_bb;
+            continue;
         }
         match &mir.basic_blocks[current].terminator().kind {
             TerminatorKind::Goto { target } => {

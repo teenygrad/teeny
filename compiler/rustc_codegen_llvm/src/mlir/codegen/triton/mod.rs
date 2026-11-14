@@ -239,9 +239,9 @@ pub(crate) struct CodegenState<'c, 'p> {
     /// Body blocks already processed inline inside a `scf.if` arm by the loop-body SwitchInt
     /// handler. `codegen_scf_for_loop` skips these in its outer body loop.
     pub(crate) skip_bbs: HashSet<BasicBlock>,
-    /// Blocks that enter a loop nested in another loop's body. Only `codegen_loop_body` can
-    /// build those loops; the loop-body SwitchInt handler rejects an arm that reaches one.
-    pub(crate) nested_loop_inits: HashSet<BasicBlock>,
+    /// Every loop in the function, so that a loop body, or an `scf.if` arm in one, can build
+    /// the loops nested in it.
+    pub(crate) loop_nest: Rc<LoopNest>,
     /// Statically-known discriminant values for Option<T> locals (from SetDiscriminant).
     /// Used by `codegen_switch_int` to constant-fold branches on Option discriminants.
     pub(crate) const_disc_locals: ConstDiscLocals,
@@ -312,7 +312,7 @@ impl<'c, 'p> CodegenState<'c, 'p> {
             loop_body_bbs: HashSet::new(),
             loop_back_edge_bb: None,
             skip_bbs: HashSet::new(),
-            nested_loop_inits: HashSet::new(),
+            loop_nest: Rc::default(),
             const_disc_locals: HashMap::new(),
             phi_join_locals: HashMap::new(),
             phi_block_args: HashMap::new(),
@@ -395,9 +395,10 @@ enum LoopExit {
 
 /// Every detected loop with the block that enters it and the blocks it owns, so that a loop body
 /// can build the loops nested inside it (teenygrad#155).
-struct LoopNest<'l> {
-    ranges: &'l [RangeLoopInfo],
-    whiles: &'l [WhileLoopInfo],
+#[derive(Default)]
+pub(crate) struct LoopNest {
+    ranges: Vec<RangeLoopInfo>,
+    whiles: Vec<WhileLoopInfo>,
     /// The block that enters each loop with a `goto` to its header.
     inits: HashMap<BasicBlock, LoopRef>,
     /// The init blocks of the outermost loops, which the function body lowers itself.
@@ -406,9 +407,9 @@ struct LoopNest<'l> {
     regions: Vec<(BasicBlock, Vec<BasicBlock>)>,
 }
 
-impl<'l> LoopNest<'l> {
-    fn new(mir: &Body<'_>, ranges: &'l [RangeLoopInfo], whiles: &'l [WhileLoopInfo]) -> Self {
-        let loops = ranges
+impl LoopNest {
+    fn new(mir: &Body<'_>, ranges: Vec<RangeLoopInfo>, whiles: Vec<WhileLoopInfo>) -> Self {
+        let loops: Vec<_> = ranges
             .iter()
             .enumerate()
             .map(|(i, l)| (LoopRef::Range(i), l.header_bb, l.own_blocks()))
@@ -417,7 +418,8 @@ impl<'l> LoopNest<'l> {
                     .iter()
                     .enumerate()
                     .map(|(i, l)| (LoopRef::While(i), l.header_bb, l.own_blocks())),
-            );
+            )
+            .collect();
         let mut init_list = Vec::new();
         let mut regions = Vec::new();
         for (loop_ref, header_bb, own) in loops {
@@ -438,6 +440,14 @@ impl<'l> LoopNest<'l> {
         nest.top_level_inits =
             init_list.into_iter().filter(|(init_bb, _)| !loop_blocks.contains(init_bb)).collect();
         nest
+    }
+
+    /// The block where lowering carries on after the loop entered at `init_bb`.
+    pub(crate) fn exit_of_loop_entered_at(&self, init_bb: BasicBlock) -> Option<BasicBlock> {
+        Some(match *self.inits.get(&init_bb)? {
+            LoopRef::Range(i) => self.ranges[i].exit_bb,
+            LoopRef::While(i) => self.whiles[i].exit_bb,
+        })
     }
 
     /// Every block owned by some loop.
@@ -1899,10 +1909,8 @@ impl<'a> TritonCodegen<'a> {
         tcx: TyCtxt<'tcx>,
         instance: &Instance<'tcx>,
         mir: &Body<'tcx>,
-        nest: &LoopNest<'_>,
         loop_info: &RangeLoopInfo,
         init_mlir_block: &BlockRef<'a, 'a>,
-        func_op: &Operation<'a>,
         state: &mut CodegenState<'a, 'a>,
         outer_basic_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
         location: Location<'a>,
@@ -2011,10 +2019,8 @@ impl<'a> TritonCodegen<'a> {
             tcx,
             instance,
             mir,
-            nest,
             &loop_info.body_bbs,
             &body_block_ref,
-            func_op,
             state,
             &combined_blocks,
             location,
@@ -2060,10 +2066,8 @@ impl<'a> TritonCodegen<'a> {
         tcx: TyCtxt<'tcx>,
         instance: &Instance<'tcx>,
         mir: &Body<'tcx>,
-        nest: &LoopNest<'_>,
         loop_info: &WhileLoopInfo,
         init_mlir_block: &BlockRef<'a, 'a>,
-        func_op: &Operation<'a>,
         state: &mut CodegenState<'a, 'a>,
         outer_basic_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
         location: Location<'a>,
@@ -2179,15 +2183,16 @@ impl<'a> TritonCodegen<'a> {
         state.loop_header_bb = Some(loop_info.header_bb);
         state.loop_iter_carry_locals = loop_info.iter_carry_locals.clone();
         state.loop_body_bbs = loop_info.body_bbs.iter().copied().collect();
+        // The loop-body SwitchInt handler lowers an `if` in the body as an scf.if whose arms run
+        // up to the back edge; without it, any `if` in a `while` body panicked.
+        state.loop_back_edge_bb = Some(loop_info.back_edge_bb);
 
         self.codegen_loop_body(
             tcx,
             instance,
             mir,
-            nest,
             &loop_info.body_bbs,
             &after_block_ref,
-            func_op,
             state,
             &combined_blocks,
             location,
@@ -2197,6 +2202,8 @@ impl<'a> TritonCodegen<'a> {
         state.loop_header_bb = None;
         state.loop_iter_carry_locals.clear();
         state.loop_body_bbs.clear();
+        state.loop_back_edge_bb = None;
+        state.skip_bbs.clear();
 
         // Collect scf.while results (post-loop values of the loop-carried locals).
         let while_results: Vec<Value<'a, 'a>> = (0..loop_info.iter_carry_locals.len())
@@ -2235,72 +2242,96 @@ impl<'a> TritonCodegen<'a> {
         tcx: TyCtxt<'tcx>,
         instance: &Instance<'tcx>,
         mir: &Body<'tcx>,
-        nest: &LoopNest<'_>,
         body_bbs: &[BasicBlock],
         body_block: &BlockRef<'a, 'a>,
-        func_op: &Operation<'a>,
         state: &mut CodegenState<'a, 'a>,
         body_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
         location: Location<'a>,
     ) -> Result<(), MlirError> {
-        let nested_blocks = nest.nested_blocks(body_bbs);
+        let nested_blocks = state.loop_nest.nested_blocks(body_bbs);
         for &body_bb in body_bbs {
             // Already lowered inside an scf.if arm by the loop-body SwitchInt handler, or lowered
             // by the nested loop that owns it.
             if state.skip_bbs.contains(&body_bb) || nested_blocks.contains(&body_bb) {
                 continue;
             }
-            let bb_data = &mir.basic_blocks[body_bb];
-            let Some(&nested) = nest.inits.get(&body_bb) else {
-                self.codegen_basic_block(
-                    tcx,
-                    instance,
-                    mir,
-                    body_bb,
-                    bb_data,
-                    func_op,
-                    state,
-                    body_blocks,
-                )?;
-                continue;
-            };
-            // The init block's statements, then the nested loop in place of its `goto header`.
-            for stmt in &bb_data.statements {
-                self.codegen_statement(tcx, instance, mir, stmt, body_block, state)?;
+            let nested = self.codegen_nested_loop(
+                tcx,
+                instance,
+                mir,
+                body_bb,
+                body_block,
+                state,
+                body_blocks,
+                location,
+            )?;
+            if nested.is_none() {
+                let bb_data = &mir.basic_blocks[body_bb];
+                self.codegen_basic_block(tcx, instance, mir, body_bb, bb_data, state, body_blocks)?;
             }
-            let enclosing = state.take_loop_context();
-            let result = match nested {
-                LoopRef::Range(i) => self.codegen_scf_for_loop(
-                    tcx,
-                    instance,
-                    mir,
-                    nest,
-                    &nest.ranges[i],
-                    body_block,
-                    func_op,
-                    state,
-                    body_blocks,
-                    location,
-                    LoopExit::FallThrough,
-                ),
-                LoopRef::While(i) => self.codegen_scf_while_loop(
-                    tcx,
-                    instance,
-                    mir,
-                    nest,
-                    &nest.whiles[i],
-                    body_block,
-                    func_op,
-                    state,
-                    body_blocks,
-                    location,
-                    LoopExit::FallThrough,
-                ),
-            };
-            state.restore_loop_context(enclosing);
-            result?;
         }
         Ok(())
+    }
+
+    /// If `init_bb` enters a loop nested in the active one, lower its statements into `block`,
+    /// then build the loop there in place of its `goto header`, and return the loop's exit
+    /// block, where lowering carries on in `block`. Otherwise do nothing and return `None`.
+    ///
+    /// `block` is the enclosing loop's body, or an `scf.if` arm in it (teenyc-9nm).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn codegen_nested_loop<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        init_bb: BasicBlock,
+        block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+        basic_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
+        location: Location<'a>,
+    ) -> Result<Option<BasicBlock>, MlirError> {
+        let nest = Rc::clone(&state.loop_nest);
+        let Some(&nested) = nest.inits.get(&init_bb) else {
+            return Ok(None);
+        };
+        for stmt in &mir.basic_blocks[init_bb].statements {
+            self.codegen_statement(tcx, instance, mir, stmt, block, state)?;
+        }
+        let enclosing = state.take_loop_context();
+        let (result, exit_bb) = match nested {
+            LoopRef::Range(i) => {
+                let loop_info = &nest.ranges[i];
+                let result = self.codegen_scf_for_loop(
+                    tcx,
+                    instance,
+                    mir,
+                    loop_info,
+                    block,
+                    state,
+                    basic_blocks,
+                    location,
+                    LoopExit::FallThrough,
+                );
+                (result, loop_info.exit_bb)
+            }
+            LoopRef::While(i) => {
+                let loop_info = &nest.whiles[i];
+                let result = self.codegen_scf_while_loop(
+                    tcx,
+                    instance,
+                    mir,
+                    loop_info,
+                    block,
+                    state,
+                    basic_blocks,
+                    location,
+                    LoopExit::FallThrough,
+                );
+                (result, loop_info.exit_bb)
+            }
+        };
+        state.restore_loop_context(enclosing);
+        result.map(|()| Some(exit_bb))
     }
 
     fn codegen_function<'tcx>(
@@ -2427,15 +2458,14 @@ impl<'a> TritonCodegen<'a> {
         let while_loop_infos = detect_while_loop(mir, &range_loop_headers);
 
         // Loop bodies live in scf.for / scf.while regions, not in the function region.
-        let nest = LoopNest::new(mir, &loop_infos, &while_loop_infos);
+        let nest = Rc::new(LoopNest::new(mir, loop_infos, while_loop_infos));
+        state.loop_nest = Rc::clone(&nest);
         let loop_region_blocks = nest.loop_blocks();
 
         // Outermost loops, by the block that enters them: its `goto → header_bb` is intercepted
         // to emit the loop. Loops whose init block lies in another loop's body are built by that
         // loop.
         let top_level_inits = &nest.top_level_inits;
-        state.nested_loop_inits =
-            nest.inits.keys().filter(|bb| !top_level_inits.contains_key(bb)).copied().collect();
 
         // Compute phi (block-argument) locals for join blocks in the non-loop CFG.
         let phi_join_locals =
@@ -2497,10 +2527,8 @@ impl<'a> TritonCodegen<'a> {
                         tcx,
                         instance,
                         mir,
-                        &nest,
-                        &loop_infos[i],
+                        &nest.ranges[i],
                         &init_mlir_block,
-                        &func_op,
                         &mut state,
                         &basic_blocks,
                         location,
@@ -2510,10 +2538,8 @@ impl<'a> TritonCodegen<'a> {
                         tcx,
                         instance,
                         mir,
-                        &nest,
-                        &while_loop_infos[i],
+                        &nest.whiles[i],
                         &init_mlir_block,
-                        &func_op,
                         &mut state,
                         &basic_blocks,
                         location,
@@ -2529,7 +2555,6 @@ impl<'a> TritonCodegen<'a> {
                 &mir,
                 bb,
                 bb_data,
-                &func_op,
                 &mut state,
                 &basic_blocks,
             )?;
@@ -2547,7 +2572,6 @@ impl<'a> TritonCodegen<'a> {
         mir: &Body<'tcx>,
         bb: BasicBlock,
         bb_data: &BasicBlockData<'tcx>,
-        _func_op: &Operation<'_>,
         state: &mut CodegenState<'a, 'a>,
         basic_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
     ) -> Result<(), MlirError> {
