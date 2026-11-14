@@ -367,19 +367,40 @@ fn while_loop_around_a_for_loop_stays_a_while_loop_for_every_target() {
 }
 
 #[test]
-fn loop_inside_an_if_inside_a_loop_is_rejected_for_every_target() {
-    // teenyc-9nm: an `if` arm in a loop body is lowered as a straight chain of blocks, which
-    // can't hold a loop. It must fail to compile rather than drop the loop.
+fn loops_inside_or_after_an_if_in_a_loop_lower_as_nested_loops_for_every_target() {
+    // teenyc-9nm: an `if` arm in a loop body was lowered as a straight chain of blocks, which
+    // couldn't hold a loop, so the inner loop (in the arm, or after the `if`, whose join each arm
+    // runs into) was rejected.
     for (target, name) in LOOP_TARGETS {
-        let output_name = format!("{name}_loop_in_if");
-        let mlir_path = format!("/tmp/kernel-{output_name}.mlir");
-        let _ = std::fs::remove_file(&mlir_path);
-        let result =
-            try_compile(&data_file("triton_loop_in_if_in_loop.rs"), target, &output_name, &[]);
-        assert!(result.is_err(), "expected a loop in an if in a loop to be rejected on {target}");
+        let mlir =
+            compile_to_mlir("triton_loop_in_if_in_loop.rs", target, &format!("{name}_loop_in_if"));
+        let depths: Vec<usize> = loop_nesting(&mlir).into_iter().map(|(_, depth)| depth).collect();
+        // The first nest: the inner loop inside the scf.if, one level deeper again.
+        assert_eq!(depths.first(), Some(&0), "no outer loop on {target}:\n{mlir}");
         assert!(
-            !std::path::Path::new(&mlir_path).exists(),
-            "MLIR was emitted for a loop in an if in a loop on {target}"
+            depths.contains(&2),
+            "the loop in the `if` isn't nested in the scf.if in the loop on {target}:\n{mlir}"
+        );
+        // Every inner loop runs over `0..%arg1` (b), not a single iteration.
+        let inner_loops =
+            mlir.lines().filter(|l| l.contains(" = scf.for ") && l.contains(" to %arg1 ")).count();
+        assert!(inner_loops >= 2, "expected both inner loops over b on {target}:\n{mlir}");
+    }
+}
+
+#[test]
+fn loop_inside_an_if_inside_a_while_loop_lowers_for_every_target() {
+    for (target, name) in LOOP_TARGETS {
+        let mlir = compile_to_mlir(
+            "triton_loop_in_if_in_while.rs",
+            target,
+            &format!("{name}_loop_in_if_in_while"),
+        );
+        // The scf.for sits in an scf.if arm, two levels inside the scf.while.
+        assert_eq!(
+            loop_nesting(&mlir),
+            [("scf.while", 0), ("scf.for", 2)],
+            "expected an scf.for in an scf.if in an scf.while on {target}:\n{mlir}"
         );
     }
 }
