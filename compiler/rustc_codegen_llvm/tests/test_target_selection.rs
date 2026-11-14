@@ -539,6 +539,42 @@ fn a_loop_counter_keeps_its_exit_value_for_every_target() {
     }
 }
 
+#[test]
+fn a_countdown_while_loop_lowers_as_an_scf_for_for_every_target() {
+    // teenyc-1zz: `while hi > 5 { ..; hi -= 3 }` stayed an scf.while, since
+    // scf::upliftWhileToForLoop only matches loops that count up, and Triton only pipelines
+    // scf.for. The loop now counts its iterations up from zero and rebuilds `hi` from them. Its
+    // start comes from a loop before it, so it only reaches the form the uplift matches once that
+    // loop has been uplifted and canonicalized.
+    for (target, name) in LOOP_TARGETS {
+        let mlir = compile_to_ttir("triton_countdown_while.rs", target, &format!("{name}_countdown"));
+        // The loop counting up to the count's start, then the countdown.
+        assert_eq!(
+            loop_nesting(&mlir),
+            [("scf.for", 0), ("scf.for", 0)],
+            "expected both loops as scf.for on {target}:\n{mlir}"
+        );
+        assert_store_is_computed(&mlir, target);
+    }
+}
+
+#[test]
+fn a_countdown_loop_counter_keeps_its_exit_value_for_every_target() {
+    // teenyc-1zz: `while i > 6 { i -= 3 }` from 20 leaves `i` at 5. Rebuilt as an scf.for, the
+    // counter after the loop is `start - trips * step`; the kernel stores it, folded to a constant.
+    for (target, op) in [("nvptx64-nvidia-cuda", "mov.b32"), ("riscv64-generic", "vmv.v.i")] {
+        let name = format!("countdown-exit-{target}");
+        compile_to_mlir("triton_countdown_exit.rs", target, &name);
+        let asm = std::fs::read_to_string(format!("/tmp/kernel-{name}.asm"))
+            .unwrap_or_else(|e| panic!("read the assembly for {target}: {e}"));
+        let stored: Vec<&str> = asm.lines().filter(|l| l.trim_start().starts_with(op)).collect();
+        assert!(
+            stored.iter().any(|l| l.trim_end().ends_with(", 5;") || l.trim_end().ends_with(", 5")),
+            "expected the kernel to store 5 on {target}, found {stored:?}:\n{asm}"
+        );
+    }
+}
+
 /// The kernel stores a value it computed (a loop's result, or one merged from both arms of an
 /// `if`), not a constant (`%cst`).
 fn assert_store_is_computed(mlir: &str, target: &str) {
