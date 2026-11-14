@@ -2455,7 +2455,10 @@ impl<'a> TritonCodegen<'a> {
 
         // Detect all Range-based `for` loops. Loop body blocks live in the scf.for region, not
         // in the function region, so we skip creating MLIR blocks for them here.
-        let loop_infos = detect_range_loop(tcx, *instance, mir);
+        // SPIKE(teenyc-3a1): lower every loop as plain cf branches.
+        let spike_no_loops = std::env::var_os("TEENYC_SPIKE_NO_LOOPS").is_some();
+        let loop_infos =
+            if spike_no_loops { Vec::new() } else { detect_range_loop(tcx, *instance, mir) };
 
         // A `for` loop's `Range::next` result is defined by the scf.for lowering (as
         // `Some(induction)`), not by the `Some`/`None` assignments of the inlined `next`.
@@ -2468,7 +2471,11 @@ impl<'a> TritonCodegen<'a> {
         // Detect while loops (after range loops, so they don't claim a `for` loop's header).
         let range_loop_headers: HashSet<BasicBlock> =
             loop_infos.iter().map(|l| l.header_bb).collect();
-        let while_loop_infos = detect_while_loop(mir, &range_loop_headers);
+        let while_loop_infos = if spike_no_loops {
+            Vec::new()
+        } else {
+            detect_while_loop(mir, &range_loop_headers)
+        };
 
         // Loop bodies live in scf.for / scf.while regions, not in the function region.
         let nest = Rc::new(LoopNest::new(mir, loop_infos, while_loop_infos));

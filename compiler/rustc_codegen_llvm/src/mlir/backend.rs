@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use melior::diagnostic::{Diagnostic, DiagnosticSeverity};
+use melior::ir::operation::OperationLike;
 use melior::pass;
 use melior::pass::PassManager;
 use rustc_codegen_ssa::back::lto::{ThinModule, ThinShared};
@@ -143,6 +144,13 @@ fn compile_codegen_unit_impl(
         triton_codegen.codegen(tcx, mono_item).expect("Failed to generate MLIR for instance");
     }
 
+    // SPIKE(teenyc-3a1): dump the MLIR as codegen produced it, before any pass.
+    if let Some(path) = std::env::var_os("TEENYC_SPIKE_DUMP_PRE") {
+        let flags = melior::ir::operation::OperationPrintingFlags::new().print_generic_operation_form();
+        let text = mlir_module.llmod().as_operation().to_string_with_flags(flags).unwrap_or_default();
+        let _ = std::fs::write(path, text);
+    }
+
     // Panics with the error's text rather than `expect`'s `Debug` form, which would escape the
     // quotes and newlines in the verifier diagnostics it carries.
     if let Err(e) = cleanup_mlir_module(&mut mlir_module) {
@@ -185,13 +193,19 @@ fn cleanup_mlir_module(mlir_module: &mut MlirModule<'static>) -> Result<(), Mlir
             is_error
         }
     });
-    let result = pass_manager.run(mlir_module.llmod_mut());
+    // Verify what codegen built before any pass runs. The canonicalizer can fold away malformed
+    // IR, such as ops left after a loop body's terminator, which turned codegen bugs into kernels
+    // that compiled and silently computed the wrong result (teenyc-2uq, teenyc-3a1).
+    let result = if mlir_module.llmod().as_operation().verify() {
+        pass_manager.run(mlir_module.llmod_mut()).map_err(|e| e.to_string())
+    } else {
+        Err("codegen produced invalid MLIR".to_string())
+    };
     mlir_module.context().detach_diagnostic_handler(handler);
 
     result.map_err(|e| {
         let errors = errors.take();
-        let err =
-            if errors.is_empty() { e.to_string() } else { format!("{e}:\n{}", errors.join("\n")) };
+        let err = if errors.is_empty() { e } else { format!("{e}:\n{}", errors.join("\n")) };
         MlirError::CodegenFailed { err }
     })
 }
