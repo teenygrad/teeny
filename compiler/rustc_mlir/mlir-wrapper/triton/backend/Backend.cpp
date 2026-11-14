@@ -32,6 +32,7 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Transforms/CFGToSCF.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -154,6 +155,119 @@ void replacePoisonWithZeros(ModuleOp module) {
   }
 }
 
+/// Uplifts `loop` to `scf.for` if it counts down by a constant step,
+/// `while (iv > bound) { ...; iv -= step }`, which `scf::upliftWhileToForLoop`
+/// doesn't match: it only takes `iv < ub` advanced by `arith.addi`. Triton
+/// only pipelines `scf.for`. The `scf.for` counts the iterations up from zero
+/// and rebuilds `iv` from them as `start - k * step`.
+///
+/// It edits the IR through an `OpBuilder` rather than a rewriter, whose vtable
+/// needs typeinfo that LLVM, built without RTTI, doesn't have (see
+/// UpliftWhileToFor.h).
+void upliftCountdownWhileToFor(scf::WhileOp loop) {
+  Block *before = loop.getBeforeBody();
+  if (!llvm::hasSingleElement(before->without_terminator()))
+    return;
+  auto cmp = dyn_cast<arith::CmpIOp>(before->front());
+  scf::ConditionOp condition = loop.getConditionOp();
+  // Every `before` argument must reach `after` unchanged and in order, so the
+  // `scf.while` results are just the values the loop carries.
+  if (!cmp || !cmp->hasOneUse() ||
+      condition.getCondition() != cmp.getResult() ||
+      ValueRange(before->getArguments()) != condition.getArgs())
+    return;
+
+  // `iv > bound`, written either way round.
+  Value ivOperand;
+  Value bound;
+  switch (cmp.getPredicate()) {
+  case arith::CmpIPredicate::sgt:
+    ivOperand = cmp.getLhs();
+    bound = cmp.getRhs();
+    break;
+  case arith::CmpIPredicate::slt:
+    ivOperand = cmp.getRhs();
+    bound = cmp.getLhs();
+    break;
+  default:
+    return;
+  }
+  auto iv = dyn_cast<BlockArgument>(ivOperand);
+  if (!iv || iv.getOwner() != before || !llvm::hasNItems(iv.getUses(), 2) ||
+      !DominanceInfo().properlyDominates(bound, loop))
+    return;
+
+  // A constant positive step: the trip count below divides by it.
+  unsigned ivIndex = iv.getArgNumber();
+  Block *after = loop.getAfterBody();
+  auto next =
+      loop.getYieldOp().getResults()[ivIndex].getDefiningOp<arith::SubIOp>();
+  APInt step;
+  if (!next || next.getLhs() != after->getArgument(ivIndex) ||
+      !matchPattern(next.getRhs(), m_ConstantInt(&step)) ||
+      !step.isStrictlyPositive())
+    return;
+
+  Location loc = loop.getLoc();
+  Type type = iv.getType();
+  OpBuilder builder(loop);
+  auto constant = [&](int64_t value) -> Value {
+    if (isa<IndexType>(type))
+      return arith::ConstantIndexOp::create(builder, loc, value);
+    return arith::ConstantIntOp::create(builder, loc, type, value);
+  };
+  Value start = loop.getInits()[ivIndex];
+  Value stepValue = constant(step.getSExtValue());
+  // max(ceildiv(start - bound, step), 0): none when `start <= bound`.
+  Value distance = arith::SubIOp::create(builder, loc, start, bound);
+  distance = arith::AddIOp::create(builder, loc, distance,
+                                   constant(step.getSExtValue() - 1));
+  Value trips = arith::DivSIOp::create(builder, loc, distance, stepValue);
+  trips = arith::MaxSIOp::create(builder, loc, trips, constant(0));
+
+  SmallVector<Value> inits;
+  for (auto [index, init] : llvm::enumerate(loop.getInits()))
+    if (index != ivIndex)
+      inits.push_back(init);
+  // An empty body builder, so the body gets no terminator: the `after`
+  // block's `scf.yield` becomes it.
+  auto forOp = scf::ForOp::create(
+      builder, loc, constant(0), trips, constant(1), inits,
+      [](OpBuilder &, Location, Value, ValueRange) {});
+
+  Block *body = forOp.getBody();
+  builder.setInsertionPointToStart(body);
+  Value advance = arith::MulIOp::create(builder, loc,
+                                        forOp.getInductionVar(), stepValue);
+  Value ivValue = arith::SubIOp::create(builder, loc, start, advance);
+  ValueRange iterArgs = forOp.getRegionIterArgs();
+  for (auto [index, arg] : llvm::enumerate(after->getArguments())) {
+    Value replacement = index == ivIndex
+                            ? ivValue
+                            : iterArgs[index < ivIndex ? index : index - 1];
+    arg.replaceAllUsesWith(replacement);
+  }
+  body->getOperations().splice(body->end(), after->getOperations());
+
+  auto yield = cast<scf::YieldOp>(body->getTerminator());
+  SmallVector<Value> yields;
+  for (auto [index, value] : llvm::enumerate(yield.getResults()))
+    if (index != ivIndex)
+      yields.push_back(value);
+  builder.setInsertionPoint(yield);
+  scf::YieldOp::create(builder, yield.getLoc(), yields);
+  yield.erase();
+
+  // The value that failed the condition: `start` when the loop doesn't run.
+  builder.setInsertionPointAfter(forOp);
+  Value exitAdvance = arith::MulIOp::create(builder, loc, trips, stepValue);
+  Value exit = arith::SubIOp::create(builder, loc, start, exitAdvance);
+  SmallVector<Value> results(forOp.getResults());
+  results.insert(results.begin() + ivIndex, exit);
+  loop->replaceAllUsesWith(results);
+  loop.erase();
+}
+
 } // namespace
 
 /// Replace every `cf.cond_br %c, ^bb, ^bb` with `cf.br ^bb` in the module.
@@ -246,12 +360,33 @@ LogicalResult Backend::structureControlFlow(MLIRContext &context,
   if (failed(pm.run(module.getOperation())))
     return failure();
 
-  upliftWhileLoopsToFor(module);
-  // Folds the uplift's leftovers (the unused exit computations among them).
-  PassManager cleanup(&context);
-  cleanup.addPass(createCanonicalizerPass());
-  if (failed(cleanup.run(module.getOperation())))
-    return failure();
+  // Uplifting one loop can bring another into a form the uplift matches,
+  // once canonicalization folds what the first left behind: teeny-kernels'
+  // maxpool2d counts a loop down from where a loop counting up before it
+  // stops. So uplift until a round changes no loop; each round that does
+  // removes an `scf.while`.
+  auto countWhileLoops = [&] {
+    unsigned count = 0;
+    module.walk([&](scf::WhileOp) { ++count; });
+    return count;
+  };
+  for (unsigned remaining = countWhileLoops(); remaining != 0;) {
+    upliftWhileLoopsToFor(module);
+    // Post-order, so inner loops are uplifted before the loops around them.
+    SmallVector<scf::WhileOp> countdowns;
+    module.walk([&](scf::WhileOp loop) { countdowns.push_back(loop); });
+    for (scf::WhileOp loop : countdowns)
+      upliftCountdownWhileToFor(loop);
+    // Folds the uplift's leftovers (the unused exit computations among them).
+    PassManager cleanup(&context);
+    cleanup.addPass(createCanonicalizerPass());
+    if (failed(cleanup.run(module.getOperation())))
+      return failure();
+    unsigned left = countWhileLoops();
+    if (left == remaining)
+      break;
+    remaining = left;
+  }
 
   replacePoisonWithZeros(module);
   return success();
