@@ -404,3 +404,37 @@ fn loop_inside_an_if_inside_a_while_loop_lowers_for_every_target() {
         );
     }
 }
+
+#[test]
+fn nested_ifs_in_a_loop_lower_as_nested_scf_ifs_for_every_target() {
+    // teenyc-2uq: an `if` inside an `if` arm in a loop body was ignored, the rest of the body was
+    // lowered after the loop's yield, and the loop was folded away: the kernel stored zeros.
+    for (target, name) in LOOP_TARGETS {
+        let mlir =
+            compile_to_mlir("triton_nested_if_in_loop.rs", target, &format!("{name}_nested_if"));
+        assert_eq!(loop_nesting(&mlir), [("scf.for", 0)], "no loop on {target}:\n{mlir}");
+        assert_stores_loop_result(&mlir, target);
+
+        // An if/else with code after it, and a loop in an inner `if`.
+        let mlir =
+            compile_to_mlir("triton_nested_ifs_in_loop.rs", target, &format!("{name}_nested_ifs"));
+        let loops = loop_nesting(&mlir);
+        assert_eq!(loops.first(), Some(&("scf.for", 0)), "no outer loop on {target}:\n{mlir}");
+        assert!(loops.len() > 1, "the inner loop was lost on {target}:\n{mlir}");
+        // The inner loop sits in the innermost `if`, inside the outer two.
+        assert!(
+            loops[1..].iter().all(|&(op, depth)| op == "scf.for" && depth >= 3),
+            "expected the inner loop in the nested scf.ifs on {target}:\n{mlir}"
+        );
+        assert_stores_loop_result(&mlir, target);
+    }
+}
+
+/// The kernel stores what its loop accumulated, not the initial zeros (`%cst`).
+fn assert_stores_loop_result(mlir: &str, target: &str) {
+    let store = mlir.lines().find(|l| l.contains("tt.store")).unwrap_or_default();
+    assert!(
+        !store.contains("%cst"),
+        "the store doesn't use the loop's result on {target}:\n{mlir}"
+    );
+}
