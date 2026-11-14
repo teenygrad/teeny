@@ -26,6 +26,7 @@ use melior::ir::{
 use melior::utility::register_all_llvm_translations;
 use rustc_abi::{FieldIdx, FieldsShape, Size as AbiSize};
 use rustc_ast::{FloatTy, IntTy, UintTy};
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_index::IndexVec;
 use rustc_middle::mir::interpret::{CtfeProvenance, GlobalAlloc, Scalar, alloc_range};
 use rustc_middle::mono::MonoItem;
@@ -49,7 +50,7 @@ use rustc_mlir::shared::builtin::{tensor_type, tensor_type_like};
 use rustc_mlir::shared::ub::create_ub_poison;
 use rustc_mlir::triton::tensor::splat;
 use rustc_mlir::triton::{create_func, int_to_ptr, load_triton_dialect};
-use rustc_span::{DUMMY_SP, Span};
+use rustc_span::{DUMMY_SP, Span, Spanned};
 
 use crate::mlir::MlirModule;
 use crate::mlir::codegen::Codegen;
@@ -312,10 +313,10 @@ struct RangeLoopInfo {
     exit_bb: BasicBlock,
     /// The Range.start local that is incremented each iteration.
     counter_local: Local,
-    /// The loop upper-bound local (Range.end / k_tiles). None when bound is a constant.
-    bound_local: Option<Local>,
-    /// The loop upper-bound as a compile-time constant. None when bound is a runtime local.
-    bound_const: Option<i64>,
+    /// The first value of the induction variable (Range.start).
+    start: LoopBound,
+    /// The exclusive upper bound of the induction variable (Range.end).
+    end: LoopBound,
     /// The "k" induction local (pre-increment counter, extracted from Some).
     induction_local: Local,
     /// Locals that carry values across iterations (loop-carried values).
@@ -330,6 +331,14 @@ struct RangeLoopInfo {
     /// work (scf.for's own induction var supersedes them) but must still be excluded from the
     /// outer function's flat block map, since nothing outside the loop ever branches into them.
     extra_loop_region_bbs: Vec<BasicBlock>,
+}
+
+/// One end of a `for` loop's range: a compile-time constant, or a local whose value on loop entry
+/// is the bound.
+#[derive(Debug, Clone, Copy)]
+enum LoopBound {
+    Const(i64),
+    Local(Local),
 }
 
 /// Information about a detected `while cond { body }` loop in the MIR.
@@ -788,7 +797,11 @@ fn find_loop_init_bb(
 }
 
 /// Detect all Range-based `for` loops in the MIR body.
-fn detect_range_loop<'tcx>(instance: Instance<'tcx>, mir: &Body<'tcx>) -> Vec<RangeLoopInfo> {
+fn detect_range_loop<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    mir: &Body<'tcx>,
+) -> Vec<RangeLoopInfo> {
     use rustc_middle::mir::TerminatorKind;
 
     let mut loops = Vec::new();
@@ -799,7 +812,7 @@ fn detect_range_loop<'tcx>(instance: Instance<'tcx>, mir: &Body<'tcx>) -> Vec<Ra
                 let header_bb = *target;
                 let back_edge_bb = bb;
                 if let Some(info) =
-                    try_build_range_loop_info(instance, mir, header_bb, back_edge_bb)
+                    try_build_range_loop_info(tcx, instance, mir, header_bb, back_edge_bb)
                 {
                     loops.push(info);
                 }
@@ -953,6 +966,7 @@ fn try_detect_convergent_option_switch<'tcx>(
 }
 
 fn try_build_range_loop_info<'tcx>(
+    tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     mir: &Body<'tcx>,
     header_bb: BasicBlock,
@@ -966,8 +980,8 @@ fn try_build_range_loop_info<'tcx>(
         body_entry_bb: BasicBlock,
         exit_bb: BasicBlock,
         counter_local_hint: Option<Local>,
-        bound_local: Option<Local>,
-        bound_const: Option<i64>,
+        start: LoopBound,
+        end: LoopBound,
         switch_bb: Option<BasicBlock>,
         next_result_local: Option<Local>,
         extra_loop_region_bbs: Vec<BasicBlock>,
@@ -983,9 +997,12 @@ fn try_build_range_loop_info<'tcx>(
                 if let Operand::Move(p) | Operand::Copy(p) = discr {
                     if p.projection.is_empty() {
                         let discr_local = p.local;
-                        if let Some((counter_local, bl, bc)) =
+                        if let Some((counter_local, end)) =
                             find_lt_locals_in_stmts(&header_data.statements, discr_local, instance)
                         {
+                            // The counter's value on entry is the range's start; the header only
+                            // compares it against the end.
+                            let start = LoopBound::Local(counter_local);
                             // Sub-pattern 1b: the two branches converge on a shared
                             // discriminant-switch block (inlined `Iterator::next`).
                             if let Some((switch_bb, exit_bb, body_entry_bb, next_result_local)) =
@@ -999,8 +1016,8 @@ fn try_build_range_loop_info<'tcx>(
                                     body_entry_bb,
                                     exit_bb,
                                     counter_local_hint: Some(counter_local),
-                                    bound_local: bl,
-                                    bound_const: bc,
+                                    start,
+                                    end,
                                     switch_bb: Some(switch_bb),
                                     next_result_local: Some(next_result_local),
                                     extra_loop_region_bbs: vec![raw_exit_bb, raw_body_entry_bb],
@@ -1010,8 +1027,8 @@ fn try_build_range_loop_info<'tcx>(
                                 body_entry_bb: raw_body_entry_bb,
                                 exit_bb: raw_exit_bb,
                                 counter_local_hint: Some(counter_local),
-                                bound_local: bl,
-                                bound_const: bc,
+                                start,
+                                end,
                                 switch_bb: None,
                                 next_result_local: None,
                                 extra_loop_region_bbs: vec![],
@@ -1023,7 +1040,7 @@ fn try_build_range_loop_info<'tcx>(
         }
 
         // Pattern 2: Call header (Range::next) followed by SwitchInt on discriminant (Rust 1.93+).
-        if let TerminatorKind::Call { target: Some(switch_bb_cand), destination, .. } =
+        if let TerminatorKind::Call { target: Some(switch_bb_cand), destination, args, .. } =
             &header_data.terminator().kind
         {
             let switch_data = &mir.basic_blocks[*switch_bb_cand];
@@ -1038,13 +1055,16 @@ fn try_build_range_loop_info<'tcx>(
                     let exit_bb = cases[0].1;
                     let body_entry_bb = cases[1].1;
                     let next_result_local = destination.local;
-                    if let Some((bc, bl)) = find_range_bound(mir, header_bb) {
+                    if let [iter_ref] = &args[..]
+                        && let Some((start, end)) =
+                            find_loop_range(tcx, instance, mir, &iter_ref.node)
+                    {
                         break 'detect HeaderInfo {
                             body_entry_bb,
                             exit_bb,
                             counter_local_hint: None,
-                            bound_local: bl,
-                            bound_const: bc,
+                            start,
+                            end,
                             switch_bb: Some(*switch_bb_cand),
                             next_result_local: Some(next_result_local),
                             extra_loop_region_bbs: vec![],
@@ -1084,8 +1104,8 @@ fn try_build_range_loop_info<'tcx>(
         back_edge_bb,
         exit_bb: hinfo.exit_bb,
         counter_local,
-        bound_local: hinfo.bound_local,
-        bound_const: hinfo.bound_const,
+        start: hinfo.start,
+        end: hinfo.end,
         induction_local,
         iter_carry_locals,
         switch_bb: hinfo.switch_bb,
@@ -1094,42 +1114,125 @@ fn try_build_range_loop_info<'tcx>(
     })
 }
 
-/// Extract the loop upper bound from the Range aggregate that feeds the iterator in the
-/// blocks preceding `header_bb`. Returns `(bound_const, bound_local)` where exactly one
-/// of the two `Option`s is `Some`.
-fn find_range_bound<'tcx>(
+/// The `(start, end)` of the `Range` a Call-header loop iterates, traced from the `&mut iter`
+/// passed to `Iterator::next` back through `IntoIterator::into_iter` and plain moves to the
+/// `Range { start, end }` literal.
+///
+/// Following this loop's own iterator, rather than picking any range-shaped literal by block
+/// order, keeps one loop from taking another's bounds (teenyc-5lf). Anything the trace can't
+/// follow unambiguously (a local assigned more than once, an adapter like `rev()`) gives `None`,
+/// so the loop isn't lowered as a plain counted `scf.for`.
+fn find_loop_range<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
     mir: &Body<'tcx>,
-    header_bb: BasicBlock,
-) -> Option<(Option<i64>, Option<Local>)> {
-    use rustc_middle::mir::StatementKind;
-    for bb_idx in 0..header_bb.index() {
-        let bb = BasicBlock::from_usize(bb_idx);
-        for stmt in &mir.basic_blocks[bb].statements {
-            if let StatementKind::Assign(assign) = &stmt.kind {
-                let (_, rvalue) = assign.as_ref();
-                if let Rvalue::Aggregate(kind, fields) = rvalue
-                    && matches!(kind.as_ref(), AggregateKind::Adt(..))
-                {
-                    if fields.len() == 2 {
-                        // Treat [start, end] → look at index 1 (end).
-                        let end_op = &fields[FieldIdx::from_usize(1)];
-                        match end_op {
-                            Operand::Constant(c) => {
-                                if let Some(v) = try_const_operand_as_i64(c) {
-                                    return Some((Some(v), None));
-                                }
-                            }
-                            Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => {
-                                return Some((None, Some(p.local)));
-                            }
-                            _ => {}
-                        }
-                    }
+    iter_ref: &Operand<'tcx>,
+) -> Option<(LoopBound, LoopBound)> {
+    let LocalDef::Assign(Rvalue::Ref(_, _, iter)) =
+        unique_local_def(mir, operand_local(iter_ref)?)?
+    else {
+        return None;
+    };
+    if !iter.projection.is_empty() {
+        return None;
+    }
+    let mut local = iter.local;
+    // Each step goes back one assignment; real chains are two or three long.
+    for _ in 0..8 {
+        match unique_local_def(mir, local)? {
+            LocalDef::Assign(Rvalue::Aggregate(kind, fields)) => {
+                let AggregateKind::Adt(def_id, ..) = kind.as_ref() else {
+                    return None;
+                };
+                if !tcx.is_lang_item(*def_id, LangItem::Range) || fields.len() != 2 {
+                    return None;
                 }
+                let start = operand_as_loop_bound(&fields[FieldIdx::from_u32(0)], instance)?;
+                let end = operand_as_loop_bound(&fields[FieldIdx::from_u32(1)], instance)?;
+                return Some((start, end));
             }
+            LocalDef::Assign(Rvalue::Use(op, ..)) => local = operand_local(op)?,
+            LocalDef::Call { func, args: [arg] } => {
+                let ty::FnDef(callee, _) = func.ty(mir, tcx).kind() else {
+                    return None;
+                };
+                if !tcx.is_lang_item(*callee, LangItem::IntoIterIntoIter) {
+                    return None;
+                }
+                local = operand_local(&arg.node)?;
+            }
+            _ => return None,
         }
     }
     None
+}
+
+/// How a local gets its value, when it is assigned in exactly one place.
+enum LocalDef<'a, 'tcx> {
+    Assign(&'a Rvalue<'tcx>),
+    Call { func: &'a Operand<'tcx>, args: &'a [Spanned<Operand<'tcx>>] },
+}
+
+/// The single place `local` is assigned as a whole, or `None` if it is assigned more than once,
+/// through a projection, or not at all.
+fn unique_local_def<'a, 'tcx>(mir: &'a Body<'tcx>, local: Local) -> Option<LocalDef<'a, 'tcx>> {
+    use rustc_middle::mir::TerminatorKind;
+
+    let mut found = None;
+    for bb_data in mir.basic_blocks.iter() {
+        let assigns = bb_data.statements.iter().filter_map(|stmt| match &stmt.kind {
+            StatementKind::Assign(assign) => Some((&assign.0, LocalDef::Assign(&assign.1))),
+            _ => None,
+        });
+        let call = match &bb_data.terminator().kind {
+            TerminatorKind::Call { func, args, destination, .. } => {
+                Some((destination, LocalDef::Call { func, args }))
+            }
+            _ => None,
+        };
+        for (place, def) in assigns.chain(call) {
+            if place.local != local {
+                continue;
+            }
+            if !place.projection.is_empty() || found.is_some() {
+                return None;
+            }
+            found = Some(def);
+        }
+    }
+    found
+}
+
+/// The local an operand reads, if it reads a whole local.
+fn operand_local(op: &Operand<'_>) -> Option<Local> {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => Some(p.local),
+        _ => None,
+    }
+}
+
+/// A range bound operand as a [`LoopBound`]: a whole local, an integer constant, or a const
+/// generic parameter resolved through `instance`.
+fn operand_as_loop_bound<'tcx>(op: &Operand<'tcx>, instance: Instance<'tcx>) -> Option<LoopBound> {
+    use rustc_middle::mir::Const as MirConst;
+
+    let Operand::Constant(c) = op else {
+        return operand_local(op).map(LoopBound::Local);
+    };
+    if let Some(v) = try_const_operand_as_i64(c) {
+        return Some(LoopBound::Const(v));
+    }
+    let MirConst::Ty(ty, const_val) = c.const_ else {
+        return None;
+    };
+    let ConstKind::Param(param) = const_val.kind() else {
+        return None;
+    };
+    if !ty.is_integral() {
+        return None;
+    }
+    let leaf = instance.args.const_at(param.index as usize).to_value().try_to_leaf()?;
+    Some(LoopBound::Const(leaf.to_bits_unchecked() as i64))
 }
 
 /// Try to extract a constant integer value from a `ConstOperand` without needing tcx/instance.
@@ -1138,61 +1241,29 @@ fn try_const_operand_as_i64(c: &ConstOperand<'_>) -> Option<i64> {
     c.const_.try_to_scalar_int().map(|s| s.to_bits_unchecked() as i64)
 }
 
-/// Find the Lt statement that assigns `discr_local` and extract
-/// `(counter_local, bound_local_or_const)` where the bound is either a local or a constant.
-/// Returns `(counter, Some(bound_local), None)` or `(counter, None, Some(bound_const))`.
+/// Find the Lt statement that assigns `discr_local` and extract `(counter_local, end)`, where
+/// `end` is the bound the counter is compared against.
 fn find_lt_locals_in_stmts<'tcx>(
     stmts: &[Statement<'tcx>],
     discr_local: Local,
     instance: Instance<'tcx>,
-) -> Option<(Local, Option<Local>, Option<i64>)> {
-    for stmt in stmts {
-        if let StatementKind::Assign(assign) = &stmt.kind {
-            let (dest, rvalue) = assign.as_ref();
-            if dest.local == discr_local && dest.projection.is_empty() {
-                if let Rvalue::BinaryOp(BinOp::Lt, operands) = rvalue {
-                    let (lhs, rhs) = operands.as_ref();
-                    let counter_copy = match lhs {
-                        Operand::Move(p) | Operand::Copy(p) if p.projection.is_empty() => p.local,
-                        _ => return None,
-                    };
-                    let counter_local =
-                        find_copy_source_in_stmts(stmts, counter_copy).unwrap_or(counter_copy);
-                    match rhs {
-                        Operand::Move(p) | Operand::Copy(p) if p.projection.is_empty() => {
-                            return Some((counter_local, Some(p.local), None));
-                        }
-                        Operand::Constant(c) => {
-                            // Try simple scalar first (works for literal constants)
-                            if let Some(v) = try_const_operand_as_i64(c) {
-                                return Some((counter_local, None, Some(v)));
-                            }
-                            // Handle ConstKind::Param (const generic — resolve via instance substs)
-                            use rustc_middle::mir::Const as MirConst;
-                            if let MirConst::Ty(ty, const_val) = c.const_ {
-                                if ty.is_integral() {
-                                    if let ConstKind::Param(param) = const_val.kind() {
-                                        let subst = instance.args.const_at(param.index as usize);
-                                        let cv = subst.to_value();
-                                        if let Some(si) = cv.try_to_leaf() {
-                                            return Some((
-                                                counter_local,
-                                                None,
-                                                Some(si.to_bits_unchecked() as i64),
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                            return None;
-                        }
-                        _ => return None,
-                    }
-                }
-            }
+) -> Option<(Local, LoopBound)> {
+    stmts.iter().find_map(|stmt| {
+        let StatementKind::Assign(assign) = &stmt.kind else {
+            return None;
+        };
+        let (dest, rvalue) = assign.as_ref();
+        if dest.local != discr_local || !dest.projection.is_empty() {
+            return None;
         }
-    }
-    None
+        let Rvalue::BinaryOp(BinOp::Lt, operands) = rvalue else {
+            return None;
+        };
+        let (lhs, rhs) = operands.as_ref();
+        let counter_copy = operand_local(lhs)?;
+        let counter_local = find_copy_source_in_stmts(stmts, counter_copy).unwrap_or(counter_copy);
+        Some((counter_local, operand_as_loop_bound(rhs, instance)?))
+    })
 }
 
 /// Find the source local if `local` is assigned `copy src` in the statements.
@@ -1700,43 +1771,31 @@ impl<'a> TritonCodegen<'a> {
         let ctx = self.module.context();
         let i32_ty: melior::ir::Type<'_> = IntegerType::new(ctx, 32).into();
 
-        // Emit lb = 0 and step = 1
-        let lb_op: Operation<'a> = melior::dialect::arith::constant(
-            ctx,
-            IntegerAttribute::new(i32_ty, 0).into(),
-            location,
-        )
-        .into();
-        let lb: Value<'a, 'a> = lb_op.result(0).unwrap().into();
-        init_mlir_block.append_operation(lb_op);
-
-        let step_op: Operation<'a> = melior::dialect::arith::constant(
-            ctx,
-            IntegerAttribute::new(i32_ty, 1).into(),
-            location,
-        )
-        .into();
-        let step: Value<'a, 'a> = step_op.result(0).unwrap().into();
-        init_mlir_block.append_operation(step_op);
-
-        // Upper bound: either a compile-time constant or a runtime local.
-        let ub: Value<'a, 'a> = if let Some(const_val) = loop_info.bound_const {
-            let op: Operation<'a> = melior::dialect::arith::constant(
-                ctx,
-                IntegerAttribute::new(i32_ty, const_val).into(),
-                location,
-            )
-            .into();
-            let v: Value<'a, 'a> = op.result(0).unwrap().into();
-            init_mlir_block.append_operation(op);
-            v
-        } else if let Some(bound_local) = loop_info.bound_local {
-            *state.ssa_values.get(&bound_local).unwrap_or_else(|| {
-                panic!("scf.for: bound local {:?} not in ssa_values", bound_local)
-            })
-        } else {
-            panic!("RangeLoopInfo has neither bound_local nor bound_const")
+        let bound_value = |bound: LoopBound| -> Result<Value<'a, 'a>, MlirError> {
+            match bound {
+                LoopBound::Const(v) => {
+                    let op: Operation<'a> = melior::dialect::arith::constant(
+                        ctx,
+                        IntegerAttribute::new(i32_ty, v).into(),
+                        location,
+                    )
+                    .into();
+                    let value: Value<'a, 'a> = op.result(0).unwrap().into();
+                    init_mlir_block.append_operation(op);
+                    Ok(value)
+                }
+                // Read before the loop maps the counter to the induction variable below, so this
+                // is the local's value on entry.
+                LoopBound::Local(local) => {
+                    state.ssa_values.get(&local).copied().ok_or_else(|| MlirError::CodegenFailed {
+                        err: format!("scf.for: range bound {local:?} has no value on loop entry"),
+                    })
+                }
+            }
         };
+        let lb = bound_value(loop_info.start)?;
+        let ub = bound_value(loop_info.end)?;
+        let step = bound_value(LoopBound::Const(1))?;
 
         // Iter-arg initial values and types
         let iter_arg_inits: Vec<Value<'a, 'a>> = loop_info
@@ -2134,7 +2193,7 @@ impl<'a> TritonCodegen<'a> {
 
         // Detect all Range-based `for` loops. Loop body blocks live in the scf.for region, not
         // in the function region, so we skip creating MLIR blocks for them here.
-        let loop_infos = detect_range_loop(*instance, mir);
+        let loop_infos = detect_range_loop(tcx, *instance, mir);
 
         // A `for` loop's `Range::next` result is defined by the scf.for lowering (as
         // `Some(induction)`), not by the `Some`/`None` assignments of the inlined `next`.
