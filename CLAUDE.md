@@ -19,6 +19,8 @@ This repository requires understanding of both the Rust compiler internals and M
 
 The build system uses `x.py` (Python-based bootstrap system). All commands should be run via `./x.py` or the platform-specific wrapper (`x` on Unix, `x.ps1` on Windows).
 
+**Always pass `-j 4` to any `./x.py build` or `./x.py test` that builds the compiler** (for example `./x.py build --stage 1 -j 4 compiler`). Left to choose its own parallelism, the build runs out of memory on this machine. `-j` also caps the C++ builds of LLVM, Triton and the MLIR wrapper, because their build scripts take their job count from Cargo.
+
 ### Common Build Commands
 
 ```bash
@@ -26,12 +28,12 @@ The build system uses `x.py` (Python-based bootstrap system). All commands shoul
 ./x.py setup
 
 # Build the compiler and standard library
-./x.py build
+./x.py build -j 4
 
 # Build specific components
-./x.py build compiler/rustc_codegen_mlir  # Build MLIR codegen backend
-./x.py build library/std                   # Build standard library
-./x.py build compiler                      # Build compiler only
+./x.py build -j 4 compiler/rustc_codegen_mlir  # Build MLIR codegen backend
+./x.py build -j 4 library/std                   # Build standard library
+./x.py build -j 4 compiler                      # Build compiler only
 
 # Check compilation without producing artifacts (faster)
 ./x.py check
@@ -300,7 +302,7 @@ Triton is automatically built when building the MLIR codegen backend:
 
 ```bash
 # Triton is built as part of rustc_codegen_mlir
-./x.py build compiler/rustc_codegen_mlir
+./x.py build -j 4 compiler/rustc_codegen_mlir
 ```
 
 The parent Rust build system configures Triton via `compiler/rustc_llvm/triton.toml`:
@@ -401,6 +403,7 @@ When built via Rust integration, outputs go to `target/build/triton-build/build/
 ## Performance Considerations
 
 - Initial build takes 1-2 hours (download prebuilt LLVM to speed up)
+- Build with `-j 4`: the default parallelism runs out of memory
 - Incremental builds are much faster with `--keep-stage`
 - Use `./x.py check` instead of `build` during development
 - Stage 1 is sufficient for most development; stage 2 for final testing
