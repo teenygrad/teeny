@@ -807,15 +807,6 @@ impl<'a> TritonCodegen<'a> {
         let otherwise_bb = targets.otherwise();
         let cases: Vec<(u128, BasicBlock)> = targets.iter().collect();
 
-        // Save a snapshot of ssa_values for every branch target so that sibling branches
-        // (processed earlier in DFS) cannot corrupt the SSA state of later siblings.
-        // The snapshot is taken once here, before any phi-arg collection mutates state.
-        let snapshot = state.ssa_values.clone();
-        for (_, target) in targets.iter() {
-            state.branch_snapshots.entry(target).or_insert_with(|| snapshot.clone());
-        }
-        state.branch_snapshots.entry(targets.otherwise()).or_insert_with(|| snapshot.clone());
-
         match cases.as_slice() {
             [] => self.codegen_goto(location, &otherwise_bb, mlir_block, basic_blocks, state),
             [(val, target_bb)] => self.codegen_switch_binary(
@@ -941,61 +932,8 @@ impl<'a> TritonCodegen<'a> {
         let true_block = *basic_blocks.get(&target_bb).expect("switch target block");
         let false_block = *basic_blocks.get(&otherwise_bb).expect("switch otherwise block");
 
-        // Collect phi args with lazy block-arg creation and stale-value detection.
-        // Mirrors codegen_goto: if the join block was already processed (DFS visited
-        // it before this predecessor), ssa_values may hold the join's own block arg
-        // (stale). Fall back to pre_join_ssa_values in that case.
-        let make_phi_args = |target: &BasicBlock,
-                             target_block: BlockRef<'a, 'a>,
-                             state: &mut CodegenState<'a, 'a>|
-         -> Vec<Value<'a, 'a>> {
-            if let Some(phi_locals) = state.phi_join_locals.get(target).cloned() {
-                phi_locals
-                    .iter()
-                    .map(|local| {
-                        if let Some(&existing_arg) =
-                            state.phi_block_args.get(&(*target, *local))
-                        {
-                            let current = state.ssa_values.get(local).copied();
-                            if current == Some(existing_arg) {
-                                *state
-                                    .pre_join_ssa_values
-                                    .get(&(*target, *local))
-                                    .unwrap_or_else(|| {
-                                        panic!(
-                                            "cond_br: stale phi local {:?} at {:?} but no pre-join save",
-                                            local, target
-                                        )
-                                    })
-                            } else {
-                                current.unwrap_or_else(|| {
-                                    panic!(
-                                        "cond_br: phi local {:?} not in ssa_values at branch to {:?}",
-                                        local, target
-                                    )
-                                })
-                            }
-                        } else {
-                            let ssa_val =
-                                *state.ssa_values.get(local).unwrap_or_else(|| {
-                                    panic!(
-                                        "cond_br: phi local {:?} not in ssa_values",
-                                        local
-                                    )
-                                });
-                            let phi_val =
-                                target_block.add_argument(ssa_val.r#type(), location);
-                            state.phi_block_args.insert((*target, *local), phi_val);
-                            ssa_val
-                        }
-                    })
-                    .collect()
-            } else {
-                vec![]
-            }
-        };
-        let true_phi_args = make_phi_args(&target_bb, true_block, state);
-        let false_phi_args = make_phi_args(&otherwise_bb, false_block, state);
+        let true_phi_args = branch_operands(target_bb, true_block, state, location)?;
+        let false_phi_args = branch_operands(otherwise_bb, false_block, state, location)?;
 
         let cond_br_op = melior::dialect::cf::cond_br(
             ctx,
@@ -1048,54 +986,7 @@ impl<'a> TritonCodegen<'a> {
             )
         });
 
-        // Collect phi values when branching to a join block.
-        // Phi block args are created lazily here (first predecessor wins) so tensor locals
-        // get their concrete shape type from the actual SSA value rather than the generic
-        // tensor<?xf32> that the MIR type declaration would produce.
-        let phi_args: Vec<Value<'a, 'a>> = if let Some(phi_locals) =
-            state.phi_join_locals.get(target).cloned()
-        {
-            phi_locals
-                    .iter()
-                    .map(|local| {
-                        if let Some(&existing_arg) = state.phi_block_args.get(&(*target, *local)) {
-                            // Block arg already created by an earlier predecessor.
-                            // We are a later predecessor (processed after the join block in DFS).
-                            // ssa_values may hold the join block's own arg (stale) — use the
-                            // saved pre-join value instead if available.
-                            let current = state.ssa_values.get(local).copied();
-                            if current == Some(existing_arg) {
-                                // Stale: ssa_values has the join block's own arg.
-                                // Use the pre-join saved value from before the join was processed.
-                                *state.pre_join_ssa_values.get(&(*target, *local))
-                                    .unwrap_or_else(|| panic!(
-                                        "codegen_goto: stale phi local {:?} at {:?} but no pre-join save",
-                                        local, target
-                                    ))
-                            } else {
-                                // The predecessor redefined this local on its path — use that.
-                                current.unwrap_or_else(|| panic!(
-                                    "codegen_goto: phi local {:?} not in ssa_values at branch to {:?}",
-                                    local, target
-                                ))
-                            }
-                        } else {
-                            // First predecessor to reach this join block — create the block arg.
-                            let ssa_val = *state.ssa_values.get(local).unwrap_or_else(|| {
-                                panic!(
-                                    "codegen_goto: phi local {:?} not in ssa_values at branch to {:?}",
-                                    local, target
-                                )
-                            });
-                            let phi_val = target_block.add_argument(ssa_val.r#type(), location);
-                            state.phi_block_args.insert((*target, *local), phi_val);
-                            ssa_val
-                        }
-                    })
-                    .collect()
-        } else {
-            vec![]
-        };
+        let phi_args = branch_operands(*target, target_block, state, location)?;
 
         let br_op: Operation<'a> = if phi_args.is_empty() {
             create_cf_br(self.module.context(), location, &*target_block)
@@ -1219,10 +1110,6 @@ impl<'a> TritonCodegen<'a> {
         for &bb in &false_chain {
             state.skip_bbs.insert(bb);
         }
-
-        // Remove any stale branch_snapshot for back_edge_bb: its SSA state is now
-        // determined by the scf.if result above, not the pre-branch snapshot.
-        state.branch_snapshots.remove(&back_edge_bb);
 
         // If back_edge_bb was absorbed into one of the arm chains (newly added to skip_bbs),
         // the outer scf.for body loop will never reach it to emit the back-edge scf.yield.
@@ -1406,4 +1293,42 @@ fn collect_arm_chain<'tcx>(
         }
     }
     chain
+}
+
+/// The operands of a branch to `target`: the value of each local that `target` merges, in the
+/// order of its block arguments.
+///
+/// The first branch lowered into a block fixes its arguments: one per merged local that has an
+/// SSA value there, typed like that value, so a tensor gets its concrete shape rather than the
+/// generic one its MIR type maps to. A merged local with no SSA value (an `Option` or a tuple,
+/// kept in side tables) gets none. In reverse postorder that first branch precedes the block
+/// itself, so its arguments exist by the time it is lowered.
+pub(crate) fn branch_operands<'a>(
+    target: BasicBlock,
+    target_block: BlockRef<'a, 'a>,
+    state: &mut CodegenState<'a, 'a>,
+    location: Location<'a>,
+) -> Result<Vec<Value<'a, 'a>>, MlirError> {
+    let Some(phi_locals) = state.phi_join_locals.get(&target).cloned() else {
+        return Ok(Vec::new());
+    };
+    let first_branch = state.phi_blocks_entered.insert(target);
+    let mut operands = Vec::with_capacity(phi_locals.len());
+    for local in phi_locals {
+        let value = state.ssa_values.get(&local).copied();
+        if first_branch {
+            let Some(value) = value else { continue };
+            let arg = target_block.add_argument(value.r#type(), location);
+            state.phi_block_args.insert((target, local), arg);
+            operands.push(value);
+        } else if state.phi_block_args.contains_key(&(target, local)) {
+            operands.push(value.ok_or_else(|| MlirError::CodegenFailed {
+                err: format!(
+                    "{local:?} has no value on this branch to {target:?}, which merges it from \
+                     another path"
+                ),
+            })?);
+        }
+    }
+    Ok(operands)
 }

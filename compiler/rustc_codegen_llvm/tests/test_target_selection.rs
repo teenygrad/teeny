@@ -430,6 +430,30 @@ fn nested_ifs_in_a_loop_lower_as_nested_scf_ifs_for_every_target() {
     }
 }
 
+#[test]
+fn do_while_loop_carries_its_accumulator() {
+    // teenyc-3a1: a `loop { ..; if cond { break } }` isn't a `for` or `while` loop, so it is
+    // lowered as plain branches. Its header merged only the counter: the accumulator assigned in
+    // the loop got no block argument, so each iteration restarted from zeros. SSA construction
+    // gives every local assigned in the loop and live at its header a block argument there.
+    let mlir = compile_to_mlir("triton_do_while_loop.rs", "nvptx64-nvidia-cuda", "do-while-cuda");
+    let header = mlir.lines().find(|l| l.trim_start().starts_with("^bb1(")).unwrap_or_default();
+    assert!(
+        header.contains("tensor<16xf32>"),
+        "the loop header doesn't carry the accumulator:\n{mlir}"
+    );
+
+    // The RISC-V pipeline can't yet lower a tensor carried through plain branches; it must fail
+    // with an error rather than crash in its LLVM conversion.
+    let result = try_compile(
+        &data_file("triton_do_while_loop.rs"),
+        "riscv64-generic",
+        "do-while-riscv",
+        &["--emit=asm"],
+    );
+    assert!(result.is_err(), "expected the RISC-V backend to reject the do-while loop");
+}
+
 /// The kernel stores what its loop accumulated, not the initial zeros (`%cst`).
 fn assert_stores_loop_result(mlir: &str, target: &str) {
     let store = mlir.lines().find(|l| l.contains("tt.store")).unwrap_or_default();

@@ -28,7 +28,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use melior::diagnostic::{Diagnostic, DiagnosticSeverity};
+use melior::ir::block::BlockLike;
 use melior::ir::operation::OperationLike;
+use melior::ir::r#type::RankedTensorType;
+use melior::ir::{RegionLike, RegionRef, ValueLike};
 use melior::pass;
 use melior::pass::PassManager;
 use rustc_codegen_ssa::back::lto::{ThinModule, ThinShared};
@@ -153,6 +156,15 @@ fn compile_codegen_unit_impl(
         }
     }
 
+    if matches!(tcx.sess.target.arch, Arch::RiscV32 | Arch::RiscV64)
+        && let Err(e) = check_no_tensor_branch_args(&mlir_module)
+    {
+        match e {
+            MlirError::CodegenFailed { err } => panic!("{err}"),
+            e => panic!("{e:?}"),
+        }
+    }
+
     mlir_module.mlir_source = Some(mlir_module.llmod().as_operation().to_string());
 
     compile_module(&mut mlir_module).expect("Triton passes failed");
@@ -202,6 +214,52 @@ fn cleanup_mlir_module(mlir_module: &mut MlirModule<'static>) -> Result<(), Mlir
         let err = if errors.is_empty() { e } else { format!("{e}:\n{}", errors.join("\n")) };
         MlirError::CodegenFailed { err }
     })
+}
+
+/// Fails if a tensor is passed through a branch, i.e. is an argument of a block other than its
+/// region's entry block.
+///
+/// The RISC-V backend's TritonCPU pipeline turns tensors into vectors only inside structured
+/// control flow (`scf`), so such a block argument crashes its conversion to LLVM (SIGILL in
+/// `FuncOpToLLVM`). Codegen produces them for loops it lowers as plain branches, which it can now
+/// do correctly; structuring those as `scf` too will lift this (teenyc-3a1, phase C).
+fn check_no_tensor_branch_args(mlir_module: &MlirModule<'static>) -> Result<(), MlirError> {
+    fn check_region(region: RegionRef<'_, '_>) -> Result<(), MlirError> {
+        let mut block = region.first_block();
+        let mut is_entry = true;
+        while let Some(current) = block {
+            let tensor_arg = (0..current.argument_count())
+                .filter_map(|i| current.argument(i).ok())
+                .find(|arg| RankedTensorType::try_from(arg.r#type()).is_ok());
+            if !is_entry && let Some(arg) = tensor_arg {
+                let location = current
+                    .first_operation()
+                    .map_or_else(|| "unknown location".to_string(), |op| op.location().to_string());
+                return Err(MlirError::CodegenFailed {
+                    err: format!(
+                        "a tensor ({}) is carried through unstructured control flow at {location}, \
+                         which the RISC-V backend can't lower yet; this usually means a loop \
+                         that isn't a `for` or `while` loop (teenyc-3a1)",
+                        arg.r#type()
+                    ),
+                });
+            }
+            let mut op = current.first_operation();
+            while let Some(current_op) = op {
+                for nested in current_op.regions() {
+                    check_region(nested)?;
+                }
+                op = current_op.next_in_block();
+            }
+            block = current.next_in_region();
+            is_entry = false;
+        }
+        Ok(())
+    }
+    for region in mlir_module.llmod().as_operation().regions() {
+        check_region(region)?;
+    }
+    Ok(())
 }
 
 /// Formats `diagnostic` the way MLIR prints it to stderr, `loc(...): error: <message>`, with its

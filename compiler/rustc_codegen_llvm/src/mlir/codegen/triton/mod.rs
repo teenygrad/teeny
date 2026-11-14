@@ -60,6 +60,7 @@ use crate::mlir::errors::MlirError;
 
 mod location;
 mod ops;
+mod ssa;
 mod types;
 
 use types::is_option_ty;
@@ -248,18 +249,14 @@ pub(crate) struct CodegenState<'c, 'p> {
     /// Statically-known discriminant values for Option<T> locals (from SetDiscriminant).
     /// Used by `codegen_switch_int` to constant-fold branches on Option discriminants.
     pub(crate) const_disc_locals: ConstDiscLocals,
-    /// Join blocks (2+ predecessors) → list of MIR locals that need phi block args there.
+    /// The MIR locals that need a block argument (a phi) at each block of the function body,
+    /// from SSA construction (see `ssa`).
     pub(crate) phi_join_locals: HashMap<BasicBlock, Vec<Local>>,
-    /// (join_block, local) → the MLIR block argument value representing the phi node.
+    /// (block, local) → the block argument holding that local's merged value.
     pub(crate) phi_block_args: HashMap<(BasicBlock, Local), Value<'c, 'p>>,
-    /// Saves the ssa_values for phi locals just before the join block is processed.
-    /// Later predecessors (processed after the join in DFS) use these saved values
-    /// instead of the stale join-block arg values that are now in ssa_values.
-    pub(crate) pre_join_ssa_values: HashMap<(BasicBlock, Local), Value<'c, 'p>>,
-    /// Snapshot of ssa_values taken at each SwitchInt/cond_br point, keyed by target block.
-    /// Restored at the start of each target block so that sibling branches (processed first
-    /// in DFS) cannot pollute the SSA state seen by later siblings.
-    pub(crate) branch_snapshots: HashMap<BasicBlock, HashMap<Local, Value<'c, 'p>>>,
+    /// Blocks with phis whose arguments are fixed: the first branch lowered into a block creates
+    /// them (see `branch_operands`).
+    pub(crate) phi_blocks_entered: HashSet<BasicBlock>,
 }
 
 impl<'c, 'p> CodegenState<'c, 'p> {
@@ -320,8 +317,7 @@ impl<'c, 'p> CodegenState<'c, 'p> {
             const_disc_locals: HashMap::new(),
             phi_join_locals: HashMap::new(),
             phi_block_args: HashMap::new(),
-            pre_join_ssa_values: HashMap::new(),
-            branch_snapshots: HashMap::new(),
+            phi_blocks_entered: HashSet::new(),
         }
     }
 }
@@ -451,6 +447,14 @@ impl LoopNest {
         Some(match *self.inits.get(&init_bb)? {
             LoopRef::Range(i) => self.ranges[i].exit_bb,
             LoopRef::While(i) => self.whiles[i].exit_bb,
+        })
+    }
+
+    /// The blocks owned by the loop entered at `init_bb`, its nested loops' included.
+    fn blocks_of_loop_entered_at(&self, init_bb: BasicBlock) -> Option<Vec<BasicBlock>> {
+        Some(match *self.inits.get(&init_bb)? {
+            LoopRef::Range(i) => self.ranges[i].own_blocks(),
+            LoopRef::While(i) => self.whiles[i].own_blocks(),
         })
     }
 
@@ -674,253 +678,43 @@ fn compute_reachable_blocks<'tcx>(
         }
         reachable.insert(bb);
         ordered.push(bb);
-        match &bb_data.terminator().kind {
-            TerminatorKind::Goto { target } => {
-                queue.push(*target);
-            }
-            TerminatorKind::SwitchInt { discr, targets } => {
-                // Constant-fold when the discriminant is statically known.
-                if let Some(const_val) =
-                    extract_switch_const(tcx, instance, discr, const_disc_locals)
-                {
-                    let target = targets
-                        .iter()
-                        .find(|(val, _)| *val == const_val as u128)
-                        .map(|(_, bb)| bb)
-                        .unwrap_or_else(|| targets.otherwise());
-                    queue.push(target);
-                    continue;
-                }
-                // Non-constant: all successors are reachable.
-                for (_, target) in targets.iter() {
-                    queue.push(target);
-                }
-                queue.push(targets.otherwise());
-            }
-            TerminatorKind::Return | TerminatorKind::Unreachable => {}
-            TerminatorKind::Call { target, .. } => {
-                if let Some(t) = target {
-                    queue.push(*t);
-                }
-            }
-            TerminatorKind::Drop { target, .. } => {
-                queue.push(*target);
-            }
-            TerminatorKind::Assert { target, .. } => {
-                queue.push(*target);
-            }
-            _ => {
-                for succ in bb_data.terminator().successors() {
-                    queue.push(succ);
-                }
-            }
-        }
+        queue.extend(block_successors(tcx, instance, mir, bb, const_disc_locals));
     }
 
     (reachable, ordered)
 }
 
-/// For each join block (2+ reachable non-loop predecessors), collect the set of MIR locals
-/// that are assigned via simple `Assign` statements in any direct predecessor block.
-/// These locals need MLIR block arguments (phi nodes) at the join block so that the SSA
-/// value used after the join is dominated by its definition regardless of the taken path.
-///
-/// Locals tracked as Option or tuple are excluded — those are managed via separate tables.
-///
-/// This function traces backward through single-predecessor linear chains from each
-/// predecessor of the join block, so it catches assignments that are a few hops back.
-///
-/// A fixpoint iteration is used to propagate phi locals through nested join blocks:
-/// when tracing from a predecessor stops at an inner join block, that inner join's
-/// already-computed phi locals are included (so outer joins can detect values that flow
-/// through an inner join without a direct `Assign` statement in the intermediate block).
-fn compute_phi_join_locals<'tcx>(
+/// The blocks control can pass to from `bb`: every successor, except that a `SwitchInt` on a
+/// statically known discriminant goes to the one target it selects.
+fn block_successors<'tcx>(
     tcx: TyCtxt<'tcx>,
+    instance: &Instance<'tcx>,
     mir: &Body<'tcx>,
-    reachable_bbs: &HashSet<BasicBlock>,
-    loop_region_blocks: &HashSet<BasicBlock>,
-) -> HashMap<BasicBlock, Vec<Local>> {
-    // Build a predecessor map restricted to non-loop reachable blocks.
-    let mut pred_map: HashMap<BasicBlock, HashSet<BasicBlock>> = HashMap::new();
-    for &bb in reachable_bbs {
-        if loop_region_blocks.contains(&bb) {
-            continue;
-        }
-        for succ in mir.basic_blocks[bb].terminator().successors() {
-            if reachable_bbs.contains(&succ) && !loop_region_blocks.contains(&succ) {
-                pred_map.entry(succ).or_default().insert(bb);
-            }
-        }
+    bb: BasicBlock,
+    const_disc_locals: &HashMap<Local, u64>,
+) -> Vec<BasicBlock> {
+    use rustc_middle::mir::TerminatorKind;
+
+    let terminator = mir.basic_blocks[bb].terminator();
+    if let TerminatorKind::SwitchInt { discr, targets } = &terminator.kind
+        && let Some(const_val) = extract_switch_const(tcx, instance, discr, const_disc_locals)
+    {
+        let target = targets
+            .iter()
+            .find(|(val, _)| *val == const_val as u128)
+            .map(|(_, bb)| bb)
+            .unwrap_or_else(|| targets.otherwise());
+        return vec![target];
     }
-
-    // Helper: collect all locals assigned in the linear chain starting at `start`,
-    // tracing backward through single-predecessor blocks.  Stops when we reach:
-    //   • a block that is also a direct predecessor of the join block (the divergence pt)
-    //   • a block with multiple forward successors (another branch point)
-    //   • a block with multiple predecessors (another join point)
-    //   • an already-visited block
-    // When stopping at a multi-predecessor block (inner join), `known_phis[current]`
-    // is included: these are phi locals that the inner join already merges, so they
-    // "flow through" to the outer join without a new `Assign` statement.
-    let collect_chain_locals = |start: BasicBlock,
-                                join_preds: &HashSet<BasicBlock>,
-                                known_phis: &HashMap<BasicBlock, Vec<Local>>|
-     -> HashSet<Local> {
-        let mut locals: HashSet<Local> = HashSet::new();
-        let mut current = start;
-        let mut visited: HashSet<BasicBlock> = HashSet::new();
-        loop {
-            if !visited.insert(current) {
-                break;
-            }
-            // Collect all assignments in this block.
-            for stmt in &mir.basic_blocks[current].statements {
-                if let StatementKind::Assign(assign) = &stmt.kind {
-                    let (place, _) = assign.as_ref();
-                    if place.projection.is_empty() {
-                        locals.insert(place.local);
-                    }
-                }
-            }
-            // Count forward successors (in the filtered graph).
-            let succ_count = mir.basic_blocks[current]
-                .terminator()
-                .successors()
-                .filter(|&s| reachable_bbs.contains(&s) && !loop_region_blocks.contains(&s))
-                .count();
-            if succ_count != 1 {
-                // Divergence point (multiple successors = branch block).
-                // Also trace backward through its single-predecessor ancestor chain to
-                // find locals defined BEFORE this branch.  These pre-branch definitions
-                // are live on ALL paths through the branch, so they count as "defined"
-                // for every predecessor chain of the outer join.
-                // Stop the ancestor trace at the next join (multiple preds) or branch.
-                let mut ancestor = current;
-                loop {
-                    let anc_preds: Vec<BasicBlock> = pred_map
-                        .get(&ancestor)
-                        .map(|ps| {
-                            ps.iter()
-                                .filter(|&&b| {
-                                    reachable_bbs.contains(&b) && !loop_region_blocks.contains(&b)
-                                })
-                                .copied()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if anc_preds.len() != 1 {
-                        break; // join block or entry — stop
-                    }
-                    let prev = anc_preds[0];
-                    // Collect pre-branch assignments.
-                    for stmt in &mir.basic_blocks[prev].statements {
-                        if let StatementKind::Assign(assign) = &stmt.kind {
-                            let (place, _) = assign.as_ref();
-                            if place.projection.is_empty() {
-                                locals.insert(place.local);
-                            }
-                        }
-                    }
-                    // Stop if prev is itself another branch point (to avoid
-                    // collecting locals from unrelated sibling branches).
-                    let prev_succ_count = mir.basic_blocks[prev]
-                        .terminator()
-                        .successors()
-                        .filter(|&s| reachable_bbs.contains(&s) && !loop_region_blocks.contains(&s))
-                        .count();
-                    if prev_succ_count != 1 {
-                        break;
-                    }
-                    ancestor = prev;
-                }
-                break;
-            }
-            // Follow the single backward predecessor.
-            let filtered_preds: Vec<BasicBlock> = pred_map
-                .get(&current)
-                .map(|ps| {
-                    ps.iter()
-                        .filter(|&&b| {
-                            reachable_bbs.contains(&b) && !loop_region_blocks.contains(&b)
-                        })
-                        .copied()
-                        .collect()
-                })
-                .unwrap_or_default();
-            if filtered_preds.len() != 1 {
-                // Inner join block — propagate its known phi locals to the outer join.
-                if let Some(inner_phis) = known_phis.get(&current) {
-                    for &l in inner_phis {
-                        locals.insert(l);
-                    }
-                }
-                break;
-            }
-            let prev = filtered_preds[0];
-            // Stop when we reach another direct predecessor of the join block
-            // (that is the divergence point shared by all paths).
-            if join_preds.contains(&prev) {
-                break;
-            }
-            current = prev;
+    match &terminator.kind {
+        TerminatorKind::Return | TerminatorKind::Unreachable => Vec::new(),
+        // A call's unwind edge never runs: kernels are built with `panic=abort`.
+        TerminatorKind::Call { target, .. } => target.iter().copied().collect(),
+        TerminatorKind::Drop { target, .. } | TerminatorKind::Assert { target, .. } => {
+            vec![*target]
         }
-        locals
-    };
-
-    // Fixpoint: recompute phi locals until no new ones are discovered.
-    // Inner joins (e.g. the `else if` sub-merge) are computed first; their phi locals
-    // then propagate via `known_phis` into outer joins on subsequent iterations.
-    let mut result: HashMap<BasicBlock, Vec<Local>> = HashMap::new();
-    loop {
-        let known_phis = result.clone();
-        let mut new_result: HashMap<BasicBlock, Vec<Local>> = HashMap::new();
-
-        for (join_bb, preds) in &pred_map {
-            if preds.len() < 2 {
-                continue;
-            }
-            // Count how many predecessor chains each local appears in.
-            // A local is only a valid phi if it's redefined on 2+ distinct paths — otherwise
-            // it has no value on the "other" path and can't be passed as a block arg.
-            let mut chain_count: HashMap<Local, usize> = HashMap::new();
-            let mut local_order: Vec<Local> = Vec::new();
-            for &pred_bb in preds {
-                for local in collect_chain_locals(pred_bb, preds, &known_phis) {
-                    let entry = chain_count.entry(local).or_insert(0);
-                    if *entry == 0 {
-                        local_order.push(local);
-                    }
-                    *entry += 1;
-                }
-            }
-            let mut phi_locals: Vec<Local> = Vec::new();
-            for local in local_order {
-                if chain_count[&local] < preds.len() {
-                    continue; // Only redefined on some paths — no phi needed at this join.
-                }
-                let raw_ty = mir.local_decls[local].ty;
-                // Skip Option and Tuple locals — tracked in separate tables.
-                if is_option_ty(tcx, raw_ty) {
-                    continue;
-                }
-                if matches!(raw_ty.kind(), rustc_middle::ty::TyKind::Tuple(_)) {
-                    continue;
-                }
-                phi_locals.push(local);
-            }
-            if !phi_locals.is_empty() {
-                new_result.insert(*join_bb, phi_locals);
-            }
-        }
-
-        let old_total: usize = result.values().map(|v| v.len()).sum();
-        let new_total: usize = new_result.values().map(|v| v.len()).sum();
-        result = new_result;
-        if new_total == old_total {
-            break;
-        }
+        _ => terminator.successors().collect(),
     }
-    result
 }
 
 /// The block outside the loop that enters it at `header_bb` with a plain `goto`. For a nested
@@ -1616,6 +1410,62 @@ fn operand_uses_local(op: &Operand<'_>, local: Local) -> bool {
     }
 }
 
+/// SSA construction for the blocks lowered in the function's own region (see `ssa`).
+///
+/// The loops that `codegen_scf_for_loop` / `codegen_scf_while_loop` build stand in for their
+/// blocks: the block entering a loop goes straight to the loop's exit and assigns every local
+/// the loop does. Liveness is taken from the whole MIR, loops included.
+fn plan_function_ssa<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: &Instance<'tcx>,
+    mir: &Body<'tcx>,
+    reachable_order: &[BasicBlock],
+    reachable: &HashSet<BasicBlock>,
+    const_disc_locals: &HashMap<Local, u64>,
+    nest: &LoopNest,
+) -> ssa::SsaPlan {
+    let successors: HashMap<BasicBlock, Vec<BasicBlock>> = reachable_order
+        .iter()
+        .map(|&bb| {
+            let succs = block_successors(tcx, instance, mir, bb, const_disc_locals)
+                .into_iter()
+                .filter(|succ| reachable.contains(succ))
+                .collect();
+            (bb, succs)
+        })
+        .collect();
+    let use_def: HashMap<BasicBlock, ssa::UseDef> =
+        reachable_order.iter().map(|&bb| (bb, ssa::block_use_def(mir, bb))).collect();
+    let live_in = ssa::live_in(reachable_order, &successors, &use_def);
+
+    let loop_blocks = nest.loop_blocks();
+    let blocks: Vec<BasicBlock> =
+        reachable_order.iter().copied().filter(|bb| !loop_blocks.contains(bb)).collect();
+    let mut region_succs: HashMap<BasicBlock, Vec<BasicBlock>> = HashMap::new();
+    let mut defs: HashMap<BasicBlock, HashSet<Local>> = HashMap::new();
+    for &bb in &blocks {
+        let mut block_defs = use_def[&bb].defs.clone();
+        let succs = if let Some(exit_bb) = nest
+            .top_level_inits
+            .contains_key(&bb)
+            .then(|| nest.exit_of_loop_entered_at(bb))
+            .flatten()
+        {
+            for loop_bb in nest.blocks_of_loop_entered_at(bb).into_iter().flatten() {
+                if let Some(loop_use_def) = use_def.get(&loop_bb) {
+                    block_defs.extend(&loop_use_def.defs);
+                }
+            }
+            vec![exit_bb]
+        } else {
+            successors[&bb].iter().copied().filter(|succ| !loop_blocks.contains(succ)).collect()
+        };
+        region_succs.insert(bb, succs);
+        defs.insert(bb, block_defs);
+    }
+    ssa::plan(&blocks, &region_succs, &defs, &live_in)
+}
+
 pub(crate) struct TritonCodegen<'a> {
     module: &'a MlirModule<'static>,
     type_mapper: TypeMapper,
@@ -2051,12 +1901,14 @@ impl<'a> TritonCodegen<'a> {
         }
 
         if exit == LoopExit::Branch {
-            let exit_block = *outer_basic_blocks.get(&loop_info.exit_bb).unwrap_or_else(|| {
-                panic!("scf.for: exit block {:?} not in basic_blocks", loop_info.exit_bb)
-            });
-            let br_op = rustc_mlir::shared::cf::create_cf_br(ctx, location, &exit_block)
-                .map_err(|e| MlirError::CreateOperation { err: e })?;
-            init_mlir_block.append_operation(br_op.into());
+            // Through codegen_goto, so an exit block that merges values gets their operands.
+            self.codegen_goto(
+                location,
+                &loop_info.exit_bb,
+                init_mlir_block,
+                outer_basic_blocks,
+                state,
+            )?;
         }
 
         Ok(())
@@ -2077,8 +1929,6 @@ impl<'a> TritonCodegen<'a> {
         location: Location<'a>,
         exit: LoopExit,
     ) -> Result<(), MlirError> {
-        let ctx = self.module.context();
-
         // Collect initial values and their MLIR types for each loop-carried local.
         let init_vals: Vec<Value<'a, 'a>> = loop_info
             .iter_carry_locals
@@ -2223,12 +2073,14 @@ impl<'a> TritonCodegen<'a> {
         }
 
         if exit == LoopExit::Branch {
-            let exit_block = *outer_basic_blocks.get(&loop_info.exit_bb).unwrap_or_else(|| {
-                panic!("scf.while: exit block {:?} not in basic_blocks", loop_info.exit_bb)
-            });
-            let br_op = rustc_mlir::shared::cf::create_cf_br(ctx, location, &exit_block)
-                .map_err(|e| MlirError::CreateOperation { err: e })?;
-            init_mlir_block.append_operation(br_op.into());
+            // Through codegen_goto, so an exit block that merges values gets their operands.
+            self.codegen_goto(
+                location,
+                &loop_info.exit_bb,
+                init_mlir_block,
+                outer_basic_blocks,
+                state,
+            )?;
         }
 
         Ok(())
@@ -2480,10 +2332,16 @@ impl<'a> TritonCodegen<'a> {
         // loop.
         let top_level_inits = &nest.top_level_inits;
 
-        // Compute phi (block-argument) locals for join blocks in the non-loop CFG.
-        let phi_join_locals =
-            compute_phi_join_locals(tcx, mir, &reachable_bbs, &loop_region_blocks);
-        state.phi_join_locals = phi_join_locals;
+        let ssa_plan = plan_function_ssa(
+            tcx,
+            instance,
+            mir,
+            &bfs_ordered_bbs,
+            &reachable_bbs,
+            &const_disc_locals,
+            &nest,
+        );
+        state.phi_join_locals = ssa_plan.phis.clone();
 
         // Create MLIR blocks for all non-loop-region, reachable MIR blocks.
         // Index order is fine for block *creation* — MLIR blocks just need to exist before
@@ -2520,13 +2378,20 @@ impl<'a> TritonCodegen<'a> {
             basic_blocks.insert(bb, block_ref);
         }
 
-        // Process all non-loop-region, reachable MIR blocks in BFS order so that SSA values
-        // defined in a block are always available when successor blocks are processed,
-        // even when a successor has a lower MIR block index than its predecessor.
-        for &bb in &bfs_ordered_bbs {
+        // Lower the blocks in reverse postorder, each starting from the values at the end of
+        // its immediate dominator, plus its block arguments. Every value a block reads is then
+        // defined in a block that dominates it, whatever path reached it. (Loop regions aren't
+        // in the plan: codegen_scf_for_loop / codegen_scf_while_loop lower them.)
+        let mut values_at_end: HashMap<BasicBlock, SsaValues<'_, '_>> = HashMap::new();
+        for &bb in &ssa_plan.order {
             let bb_data = &mir.basic_blocks[bb];
-            if loop_region_blocks.contains(&bb) {
-                continue; // Handled inside codegen_scf_for_loop / codegen_scf_while_loop.
+            if let Some(idom) = ssa_plan.idom.get(&bb) {
+                state.ssa_values = values_at_end[idom].clone();
+            }
+            for local in ssa_plan.phis.get(&bb).into_iter().flatten() {
+                if let Some(&arg) = state.phi_block_args.get(&(bb, *local)) {
+                    state.ssa_values.insert(*local, arg);
+                }
             }
 
             if let Some(&loop_ref) = top_level_inits.get(&bb) {
@@ -2559,18 +2424,18 @@ impl<'a> TritonCodegen<'a> {
                         LoopExit::Branch,
                     )?,
                 }
-                continue;
+            } else {
+                self.codegen_basic_block(
+                    tcx,
+                    instance,
+                    &mir,
+                    bb,
+                    bb_data,
+                    &mut state,
+                    &basic_blocks,
+                )?;
             }
-
-            self.codegen_basic_block(
-                tcx,
-                instance,
-                &mir,
-                bb,
-                bb_data,
-                &mut state,
-                &basic_blocks,
-            )?;
+            values_at_end.insert(bb, state.ssa_values.clone());
         }
 
         self.module.mlir.body().append_operation(func_op.into());
@@ -2589,32 +2454,6 @@ impl<'a> TritonCodegen<'a> {
         basic_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
     ) -> Result<(), MlirError> {
         let mlir_block = basic_blocks.get(&bb).expect("block not found");
-
-        // If a branch snapshot was saved for this block (at the SwitchInt that targets it),
-        // restore ssa_values from that snapshot so sibling branches processed earlier in DFS
-        // don't pollute the SSA state seen here.  Phi block args (applied below) override
-        // the snapshot for join-block locals.
-        if let Some(snapshot) = state.branch_snapshots.remove(&bb) {
-            state.ssa_values = snapshot;
-        }
-
-        // At join blocks, the phi block args represent merged values for locals.
-        // Before overwriting, save the current ssa_values for each phi local so that
-        // any predecessor block processed *after* this join (in DFS order) can still
-        // find the correct "pre-join" value when building its branch to this block.
-        // Then update ssa_values so subsequent statements in this and successor blocks
-        // see the phi block arg value.
-        if let Some(phi_locals) = state.phi_join_locals.get(&bb).cloned() {
-            for phi_local in &phi_locals {
-                if let Some(&phi_val) = state.phi_block_args.get(&(bb, *phi_local)) {
-                    // Save old value before overwriting.
-                    if let Some(&old_val) = state.ssa_values.get(phi_local) {
-                        state.pre_join_ssa_values.entry((bb, *phi_local)).or_insert(old_val);
-                    }
-                    state.ssa_values.insert(*phi_local, phi_val);
-                }
-            }
-        }
 
         // Codegen each MIR statement in order.
         for stmt in &bb_data.statements {
