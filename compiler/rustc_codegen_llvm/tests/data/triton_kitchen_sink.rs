@@ -81,8 +81,11 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32, const USE_BIAS: bool
     let dot = T::dot::<D, D>(lhs, rhs, None, Some(InputPrecision::TF32), Some(1));
     let _dot_tf32x3 = T::dot::<D, D>(dot, dot, None, Some(InputPrecision::TF32x3), None);
     let _dot_ieee = T::dot::<D, D>(dot, dot, None, Some(InputPrecision::IEEE), None);
-    let scale = zl;
-    let _dot_scaled = T::dot_scaled::<D, D, D>(
+    // One scale per 32 elements along K: `dot` is 32x32, so `[M, K / 32]` = [32, 1].
+    let scale = T::zeros::<i8>(&[32, 1]);
+    // Packed fp4 (`E2M1x2`) holds two values per element along K, so K is 64: [32, 2].
+    let fp4_scale = T::zeros::<i8>(&[32, 2]);
+    let _dot_scaled = T::dot_scaled::<D, i8, D>(
         dot,
         scale,
         DotFormat::E4M3,
@@ -92,34 +95,24 @@ fn kitchen_sink<T: Triton, D: Float, const BLOCK_SIZE: i32, const USE_BIAS: bool
         None,
         true,
     );
-    let _ = T::dot_scaled::<D, D, D>(
+    let _ = T::dot_scaled::<D, i8, D>(
         dot,
-        scale,
+        fp4_scale,
         DotFormat::E2M1x2,
         dot,
-        scale,
-        DotFormat::E2M1x4,
+        fp4_scale,
+        DotFormat::E2M1x2,
         None,
         false,
     );
-    let _ = T::dot_scaled::<D, D, D>(
+    let _ = T::dot_scaled::<D, i8, D>(
         dot,
         scale,
         DotFormat::BF16x2,
         dot,
         scale,
-        DotFormat::Int8,
-        None,
-        false,
-    );
-    let _ = T::dot_scaled::<D, D, D>(
-        dot,
-        scale,
-        DotFormat::UInt8,
-        dot,
-        scale,
         DotFormat::E4M3,
-        None,
+        Some(dot),
         false,
     );
     let block_ptr = T::make_block_ptr(x_ptr, &[BLOCK_SIZE], &[1], &[0], &[BLOCK_SIZE], &[0]);

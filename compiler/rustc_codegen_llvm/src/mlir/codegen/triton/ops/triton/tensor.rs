@@ -2075,6 +2075,46 @@ impl<'a> TritonCodegen<'a> {
         Ok(Some(result))
     }
 
+    /// The `tt.dot_scaled` element type for a `DotFormat` argument, which must be a constant.
+    ///
+    /// The discriminant follows `DotFormat`'s declaration order: E4M3, E5M2, E2M1x2, E2M1x4,
+    /// BF16x2, Int8, UInt8. It was used to index Triton's `ScaleDotElemType` list, whose order
+    /// differs, so e.g. `BF16x2` was lowered as fp4 `E2M1`.
+    fn dot_scaled_elem_type<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        format: &Operand<'tcx>,
+        operand: &str,
+    ) -> Result<ScaleDotElemType, MlirError> {
+        // DotFormat is a fieldless enum of size 1, so read its bits without `to_i32`'s size check.
+        let discriminant = self
+            .to_scalar_int(tcx, instance, format)
+            .map(|s| s.to_bits_unchecked())
+            .map_err(|_| MlirError::CodegenFailed {
+                err: format!("dot_scaled: the {operand} format must be a constant `DotFormat`"),
+            })?;
+        let unsupported = |name: &str| MlirError::CodegenFailed {
+            err: format!(
+                "dot_scaled: {operand} format `DotFormat::{name}` has no `tt.dot_scaled` element \
+                 type (Triton supports E4M3, E5M2, E2M1x2 and BF16x2)"
+            ),
+        };
+        match discriminant {
+            0 => Ok(ScaleDotElemType::E4M3),
+            1 => Ok(ScaleDotElemType::E5M2),
+            // Two fp4 values per byte along K: Triton's default `k_pack` packing.
+            2 => Ok(ScaleDotElemType::E2M1),
+            3 => Err(unsupported("E2M1x4")),
+            4 => Ok(ScaleDotElemType::BF16),
+            5 => Err(unsupported("Int8")),
+            6 => Err(unsupported("UInt8")),
+            other => Err(MlirError::CodegenFailed {
+                err: format!("dot_scaled: unknown {operand} `DotFormat` discriminant {other}"),
+            }),
+        }
+    }
+
     // -------------------------------------------------------------------------
     // `triton::Triton::dot_scaled` — scaled mixed-precision matrix multiply (tt.dot_scaled).
     //
@@ -2170,29 +2210,8 @@ impl<'a> TritonCodegen<'a> {
             }
         };
 
-        // Read DotFormat discriminant for lhs_format (args[2]).
-        // DotFormat is a fieldless enum whose discriminant fits in u8 (size 1),
-        // so we use to_bits_unchecked() to avoid the size assertion in to_i32().
-        let lhs_fmt_int = self
-            .to_scalar_int(tcx, instance, &args[2].node)
-            .map(|s| s.to_bits_unchecked() as usize)
-            .unwrap_or(0);
-        let rhs_fmt_int = self
-            .to_scalar_int(tcx, instance, &args[5].node)
-            .map(|s| s.to_bits_unchecked() as usize)
-            .unwrap_or(0);
-
-        let all_types = [
-            ScaleDotElemType::E4M3,
-            ScaleDotElemType::E5M2,
-            ScaleDotElemType::E2M3,
-            ScaleDotElemType::E3M2,
-            ScaleDotElemType::E2M1,
-            ScaleDotElemType::BF16,
-            ScaleDotElemType::FP16,
-        ];
-        let lhs_elem_type = all_types.get(lhs_fmt_int).copied().unwrap_or(ScaleDotElemType::E4M3);
-        let rhs_elem_type = all_types.get(rhs_fmt_int).copied().unwrap_or(ScaleDotElemType::E5M2);
+        let lhs_elem_type = self.dot_scaled_elem_type(tcx, instance, &args[2].node, "lhs")?;
+        let rhs_elem_type = self.dot_scaled_elem_type(tcx, instance, &args[5].node, "rhs")?;
 
         // fast_math (args[7]): bool has size 1, use to_bits_unchecked().
         let fast_math = self
@@ -3253,7 +3272,7 @@ impl<'a> TritonCodegen<'a> {
         _func: &Operand<'tcx>,
         _func_name: &str,
         args: &[Spanned<Operand<'tcx>>],
-        destination: &Place<'tcx>,
+        _destination: &Place<'tcx>,
         _target: &Option<BasicBlock>,
         _unwind: &UnwindAction,
         _call_source: &CallSource,
@@ -3284,13 +3303,19 @@ impl<'a> TritonCodegen<'a> {
         let axis =
             self.to_scalar_int(tcx, instance, &args[2].node).map(|s| s.to_i32()).unwrap_or(0);
 
-        let dest_ty = destination.ty(mir, tcx).ty;
-        let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
-            tcx,
-            TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(tcx, dest_ty),
-        );
-        let result_ty = self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty);
+        // The result has the indices' shape and the source's element type. The MIR destination,
+        // a generic `Tensor<D>`, maps to a dynamically shaped tensor, which `tt.gather` rejects.
+        let tensor_of = |value: Value<'a, 'a>, what: &str| {
+            RankedTensorType::try_from(value.r#type()).map_err(|_| MlirError::CodegenFailed {
+                err: format!("gather: the {what} must be a ranked tensor, got {}", value.r#type()),
+            })
+        };
+        let indices_ty = tensor_of(indices, "indices")?;
+        let src_ty = tensor_of(src, "source")?;
+        let indices_shape = indices_ty
+            .dims()
+            .map_err(|e| MlirError::CodegenFailed { err: format!("gather: indices shape: {e}") })?;
+        let result_ty = tensor_type(&indices_shape, src_ty.element()).into();
 
         let op: Operation<'a> =
             gather(self.module.context(), location, src, indices, axis, false, result_ty)
@@ -5257,7 +5282,7 @@ impl<'a> TritonCodegen<'a> {
         _func: &Operand<'tcx>,
         _func_name: &str,
         args: &[Spanned<Operand<'tcx>>],
-        destination: &Place<'tcx>,
+        _destination: &Place<'tcx>,
         _target: &Option<BasicBlock>,
         _unwind: &UnwindAction,
         _call_source: &CallSource,
@@ -5266,7 +5291,7 @@ impl<'a> TritonCodegen<'a> {
         mlir_block: &BlockRef<'a, 'a>,
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<Option<Value<'a, 'a>>, MlirError> {
-        // args: [src, Option<mask>]
+        // args: [x, num_bins, Option<mask>]
         let src = self.codegen_operand(
             tcx,
             instance,
@@ -5276,27 +5301,24 @@ impl<'a> TritonCodegen<'a> {
             mlir_block,
             state,
         )?;
-        let mask = if args.len() > 1 {
-            self.codegen_option_operand(
-                tcx,
-                instance,
-                mir,
-                &args[1].node,
-                location,
-                mlir_block,
-                state,
-            )?
-        } else {
-            None
-        };
-
-        let dest_ty = destination.ty(mir, tcx).ty;
-        let dest_ty = instance.instantiate_mir_and_normalize_erasing_regions(
+        // The mask is the third argument; reading the second passed `num_bins` as the mask.
+        let mask = self.codegen_option_operand(
             tcx,
-            TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(tcx, dest_ty),
-        );
-        let result_ty = self.type_mapper.map_type(self.module.context(), &tcx, &dest_ty);
+            instance,
+            mir,
+            &args[2].node,
+            location,
+            mlir_block,
+            state,
+        )?;
+
+        // One count per bin: `tensor<num_bins x i32>`. The MIR destination, a generic
+        // `I32Tensor`, maps to a dynamically shaped tensor, which `tt.histogram` rejects.
+        let num_bins = self.to_scalar_int(tcx, instance, &args[1].node).map_err(|_| {
+            MlirError::CodegenFailed { err: "histogram: `num_bins` must be a constant".to_string() }
+        })?;
+        let i32_ty = IntegerType::new(self.module.context(), 32).into();
+        let result_ty = tensor_type(&[i64::from(num_bins.to_i32())], i32_ty).into();
 
         let op: Operation<'a> = histogram(self.module.context(), location, src, mask, result_ty)
             .map_err(|e| MlirError::CreateOperation { err: e })?
