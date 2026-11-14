@@ -239,16 +239,33 @@ fn riscv_target_feature_flag_overrides_spec_features() {
     assert!(features.iter().any(|f| f == "d"), "`-v` removed `d`: {features:?}");
 }
 
+/// Both backends, as `(target, name)` pairs; `name` keeps each compile's output files apart.
+const LOOP_TARGETS: [(&str, &str); 2] =
+    [("riscv64-generic", "riscv"), ("nvptx64-nvidia-cuda", "cuda")];
+
+/// Compiles `file` for `target` and returns the MLIR the backend emitted for it.
+fn compile_to_mlir(file: &str, target: &str, output_name: &str) -> String {
+    let result = try_compile(&data_file(file), target, output_name, &["--emit=asm"]);
+    assert!(result.is_ok(), "expected {file} to compile for {target}: {result:?}");
+    std::fs::read_to_string(format!("/tmp/kernel-{output_name}.mlir"))
+        .unwrap_or_else(|e| panic!("read the MLIR for {file} on {target}: {e}"))
+}
+
 #[test]
-fn riscv_target_lowers_back_to_back_loops() {
+fn back_to_back_loops_lower_for_every_target() {
     // teenygrad#156: when one `for` loop's exit flows straight into the next loop, the block
     // between them can come after the second loop's header in MIR order. The init-block search
-    // ignored it, so the second loop was never built and codegen panicked in codegen_goto. Only
-    // RISC-V is checked: on nvptx64 the test prelude's `Range::next` inlines into a shape the
-    // loop detector doesn't recognise, so even a single loop fails there.
-    let src = data_file("triton_back_to_back_loops.rs");
-    let result = try_compile(&src, "riscv64-generic", "riscv_back_to_back_loops", &["--emit=asm"]);
-    assert!(result.is_ok(), "expected back-to-back loops to compile for RISC-V: {result:?}");
+    // ignored it, so the second loop was never built and codegen panicked in codegen_goto.
+    //
+    // teenyc-3jo: both loops are `for _ in ..`, so their bodies never take the value out of
+    // `Some`. On nvptx64 `Range::next` inlines into a Some/None-then-switch shape, and the loop
+    // detector rejected it for lacking an induction local; the `Option` then had no SSA form.
+    for (target, name) in LOOP_TARGETS {
+        let mlir = compile_to_mlir("triton_back_to_back_loops.rs", target, &format!("{name}_b2b"));
+        // RISC-V's MIR has no `Option` left in these loops, so they lower as scf.while instead.
+        let loops = mlir.matches(" = scf.for ").count() + mlir.matches(" = scf.while ").count();
+        assert_eq!(loops, 2, "expected two loops on {target}:\n{mlir}");
+    }
 }
 
 /// `(lower, upper)` operands of each `scf.for` in `mlir`, in order.
@@ -265,18 +282,31 @@ fn scf_for_bounds(mlir: &str) -> Vec<(String, String)> {
 }
 
 #[test]
-fn riscv_target_lowers_each_loop_over_its_own_range() {
+fn each_loop_runs_over_its_own_range_for_every_target() {
     // teenyc-16j: each scf.for must run over its own loop's range. The lowering started every
     // loop at 0, so `START..n` ran n times instead of n - START. `entry_point(n, s, m)` runs
     // `3..n` and then `s..m`.
-    let src = data_file("triton_range_bounds.rs");
-    let result = try_compile(&src, "riscv64-generic", "riscv_range_bounds", &["--emit=asm"]);
-    assert!(result.is_ok(), "expected the range-bounds kernel to compile: {result:?}");
-
-    let mlir = std::fs::read_to_string("/tmp/kernel-riscv_range_bounds.mlir")
-        .expect("read the kernel's MLIR");
-    let bounds = scf_for_bounds(&mlir);
     let expected = [("%c3_i32", "%arg0"), ("%arg1", "%arg2")]
         .map(|(lower, upper)| (lower.to_string(), upper.to_string()));
-    assert_eq!(bounds, expected, "scf.for bounds in:\n{mlir}");
+    for (target, name) in LOOP_TARGETS {
+        let mlir =
+            compile_to_mlir("triton_range_bounds.rs", target, &format!("{name}_range_bounds"));
+        assert_eq!(scf_for_bounds(&mlir), expected, "scf.for bounds on {target} in:\n{mlir}");
+    }
+}
+
+#[test]
+fn counted_while_loop_stays_a_while_loop_for_every_target() {
+    // A hand-written `while i < n { ..; i += 2 }` has the same `counter < end` header as an
+    // inlined `Range::next`, minus the `Option`. Lowering it as a counted scf.for would run it
+    // once per value below n instead of once per step, so it must stay an scf.while even though
+    // `for _ in ..` loops no longer need an induction local (teenyc-3jo).
+    for (target, name) in LOOP_TARGETS {
+        let mlir = compile_to_mlir("triton_counted_while.rs", target, &format!("{name}_while"));
+        assert!(
+            !mlir.contains("scf.for"),
+            "while loop became a counted scf.for on {target}:\n{mlir}"
+        );
+        assert!(mlir.contains("scf.while"), "expected an scf.while on {target}:\n{mlir}");
+    }
 }
