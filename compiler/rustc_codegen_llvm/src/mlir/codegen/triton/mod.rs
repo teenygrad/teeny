@@ -242,6 +242,9 @@ pub(crate) struct CodegenState<'c, 'p> {
     /// Every loop in the function, so that a loop body, or an `scf.if` arm in one, can build
     /// the loops nested in it.
     pub(crate) loop_nest: Rc<LoopNest>,
+    /// Set while lowering the arms of a loop-body `scf.if`. An `if` nested in an arm then leaves
+    /// the loop's back-edge `scf.yield` to the outermost `if`.
+    pub(crate) in_scf_if_arm: bool,
     /// Statically-known discriminant values for Option<T> locals (from SetDiscriminant).
     /// Used by `codegen_switch_int` to constant-fold branches on Option discriminants.
     pub(crate) const_disc_locals: ConstDiscLocals,
@@ -313,6 +316,7 @@ impl<'c, 'p> CodegenState<'c, 'p> {
             loop_back_edge_bb: None,
             skip_bbs: HashSet::new(),
             loop_nest: Rc::default(),
+            in_scf_if_arm: false,
             const_disc_locals: HashMap::new(),
             phi_join_locals: HashMap::new(),
             phi_block_args: HashMap::new(),
@@ -2254,6 +2258,15 @@ impl<'a> TritonCodegen<'a> {
             // by the nested loop that owns it.
             if state.skip_bbs.contains(&body_bb) || nested_blocks.contains(&body_bb) {
                 continue;
+            }
+            // The back edge's scf.yield ends the body; a block left to lower after it would be
+            // dropped along with the loop, which no longer does anything (teenyc-2uq).
+            if body_block.terminator().is_some() {
+                return Err(MlirError::CodegenFailed {
+                    err: format!(
+                        "loop body block {body_bb:?} is left to lower after the loop's back edge"
+                    ),
+                });
             }
             let nested = self.codegen_nested_loop(
                 tcx,
