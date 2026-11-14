@@ -238,3 +238,15 @@ fn riscv_target_feature_flag_overrides_spec_features() {
     assert!(!features.iter().any(|f| f == "v"), "`-v` left `v` enabled: {features:?}");
     assert!(features.iter().any(|f| f == "d"), "`-v` removed `d`: {features:?}");
 }
+
+#[test]
+fn riscv_target_lowers_back_to_back_loops() {
+    // teenygrad#156: when one `for` loop's exit flows straight into the next loop, the block
+    // between them can come after the second loop's header in MIR order. The init-block search
+    // ignored it, so the second loop was never built and codegen panicked in codegen_goto. Only
+    // RISC-V is checked: on nvptx64 the test prelude's `Range::next` inlines into a shape the
+    // loop detector doesn't recognise, so even a single loop fails there.
+    let src = data_file("triton_back_to_back_loops.rs");
+    let result = try_compile(&src, "riscv64-generic", "riscv_back_to_back_loops", &["--emit=asm"]);
+    assert!(result.is_ok(), "expected back-to-back loops to compile for RISC-V: {result:?}");
+}
