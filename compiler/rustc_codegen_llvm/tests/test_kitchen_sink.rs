@@ -929,9 +929,9 @@ mod tests {
         compile_dyn_descriptor("store");
     }
 
-    // teenyc-2m7: a local with no SSA form that is assigned in more than one place must fail to
-    // compile instead of silently using one assignment's value. A codegen error panics inside
-    // rustc and reaches the test through `run_compiler`.
+    // teenyc-2m7: a local assigned in more than one place must be merged where the paths meet,
+    // or fail to compile, rather than silently use one assignment's value. A codegen error
+    // panics inside rustc and reaches the test through `run_compiler`.
     fn compile_multi_def(kind: &str) {
         let _ = fmt()
             .with_env_filter(
@@ -963,15 +963,17 @@ mod tests {
         compile_multi_def("block_ptr");
     }
 
+    // Options and tuples merge where paths meet (teenyc-3a1), but a reduction axis must still
+    // be known at compile time.
     #[test]
-    #[should_panic(expected = "is assigned in more than one place")]
+    #[should_panic(expected = "expected a compile-time Option<i32>")]
     fn test_multi_def_option_rejected() {
         compile_multi_def("option");
     }
 
+    // A tuple chosen at run time merges field by field (teenyc-3a1).
     #[test]
-    #[should_panic(expected = "is assigned in more than one place")]
-    fn test_multi_def_tuple_rejected() {
+    fn test_multi_def_tuple_merged() {
         compile_multi_def("tuple");
     }
 }

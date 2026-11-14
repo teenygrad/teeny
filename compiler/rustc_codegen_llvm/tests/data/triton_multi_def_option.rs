@@ -36,11 +36,10 @@ macro_rules! include {
 
 include!("triton_prelude.rs");
 
-// teenyc-2m7: the backend keeps values with no SSA form in side tables keyed by MIR local, one
-// entry per local. A local assigned in more than one place (here, chosen by `first` at run time)
-// can't be represented that way, so it must be a compile error rather than silently using the
-// value of whichever assignment was recorded.
-// An `Option` (`option_table`): the reduction axis.
+// teenyc-2m7: a local assigned in more than one place (here, chosen by `first` at run time) must
+// not silently take the value of whichever assignment was recorded. An `Option` now merges where
+// the paths meet (teenyc-3a1), but this one is a reduction axis, which Triton needs at compile
+// time, so it is still an error.
 fn multi_def<T: Triton, D: Float>(src: T::Pointer<D>, dst: T::Pointer<D>, n: i32, first: bool) {
     let ptrs = T::zeros::<T::Pointer<D>>(&[16, 16]);
     let x = T::load::<D, 2>(ptrs, None, None, &[0, 1], None, None, None, false);

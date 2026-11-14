@@ -49,7 +49,7 @@ use rustc_span::Span;
 use rustc_span::Spanned;
 
 use crate::mlir::codegen::triton::location::span_to_location;
-use crate::mlir::codegen::triton::{BlockPtr, CodegenState, TritonCodegen};
+use crate::mlir::codegen::triton::{BlockPtr, CodegenState, OptionValue, TritonCodegen};
 use crate::mlir::errors::MlirError;
 
 /// Which extreme an index reduction keeps.
@@ -3244,8 +3244,11 @@ impl<'a> TritonCodegen<'a> {
             }
             Operand::Copy(p) | Operand::Move(p) => {
                 match state.option_table.get(&p.local).ok_or_else(fail)? {
-                    None => Ok(None),
-                    Some(value) => Self::constant_i32(*value).map(Some).ok_or_else(fail),
+                    OptionValue::None => Ok(None),
+                    OptionValue::Some(value) => {
+                        Self::constant_i32(*value).map(Some).ok_or_else(fail)
+                    }
+                    OptionValue::Merged { .. } => Err(fail()),
                 }
             }
             Operand::RuntimeChecks(_) => Err(fail()),

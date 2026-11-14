@@ -413,7 +413,7 @@ fn nested_ifs_in_a_loop_lower_as_nested_scf_ifs_for_every_target() {
         let mlir =
             compile_to_mlir("triton_nested_if_in_loop.rs", target, &format!("{name}_nested_if"));
         assert_eq!(loop_nesting(&mlir), [("scf.for", 0)], "no loop on {target}:\n{mlir}");
-        assert_stores_loop_result(&mlir, target);
+        assert_store_is_computed(&mlir, target);
 
         // An if/else with code after it, and a loop in an inner `if`.
         let mlir =
@@ -426,7 +426,7 @@ fn nested_ifs_in_a_loop_lower_as_nested_scf_ifs_for_every_target() {
             loops[1..].iter().all(|&(op, depth)| op == "scf.for" && depth >= 3),
             "expected the inner loop in the nested scf.ifs on {target}:\n{mlir}"
         );
-        assert_stores_loop_result(&mlir, target);
+        assert_store_is_computed(&mlir, target);
     }
 }
 
@@ -454,11 +454,42 @@ fn do_while_loop_carries_its_accumulator() {
     assert!(result.is_err(), "expected the RISC-V backend to reject the do-while loop");
 }
 
-/// The kernel stores what its loop accumulated, not the initial zeros (`%cst`).
-fn assert_stores_loop_result(mlir: &str, target: &str) {
+/// The kernel stores a value it computed (a loop's result, or one merged from both arms of an
+/// `if`), not a constant (`%cst`).
+fn assert_store_is_computed(mlir: &str, target: &str) {
     let store = mlir.lines().find(|l| l.contains("tt.store")).unwrap_or_default();
-    assert!(
-        !store.contains("%cst"),
-        "the store doesn't use the loop's result on {target}:\n{mlir}"
+    assert!(!store.contains("%cst"), "the kernel stores a constant on {target}:\n{mlir}");
+}
+
+#[test]
+fn values_chosen_by_an_if_merge_for_every_target() {
+    // teenyc-3a1: an Option or tuple local assigned on both arms of an `if` was rejected ("is
+    // assigned in more than one place"), since only plain values were merged where paths meet.
+    // An Option now merges as an `i1` "is Some" flag and its payload, a tuple field by field.
+    // And a local assigned a different constant on each arm was folded to one of them.
+    let cases = [
+        ("triton_option_join.rs", "option-join"),
+        ("triton_tuple_join.rs", "tuple-join"),
+        ("triton_option_loop.rs", "option-loop"),
+        ("triton_constant_chosen_by_if.rs", "constant-chosen-by-if"),
+    ];
+    for (file, name) in cases {
+        for target in ["nvptx64-nvidia-cuda", "riscv64-generic"] {
+            let mlir = compile_to_mlir(file, target, &format!("{name}-{target}"));
+            assert_store_is_computed(&mlir, target);
+        }
+    }
+}
+
+#[test]
+fn an_option_chosen_at_run_time_is_rejected_as_an_optional_operand() {
+    // Triton's optional operands (here a load mask) must be present or absent at compile time,
+    // so a mask that is `Some` on one path and `None` on the other is an error, not a guess.
+    let result = try_compile(
+        &data_file("triton_merged_option_mask.rs"),
+        "nvptx64-nvidia-cuda",
+        "merged-option-mask",
+        &["--emit=asm"],
     );
+    assert!(result.is_err(), "expected a mask chosen at run time to be rejected");
 }
