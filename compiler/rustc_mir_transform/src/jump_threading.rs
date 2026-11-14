@@ -81,7 +81,14 @@ impl<'tcx> crate::MirPass<'tcx> for JumpThreading {
         // targets, similar to how inline assembly cannot be duplicated on all targets.
         // Conservatively prevent this by disabling the pass.
         // See also issue #137086.
-        PassPolicy::optional(ctx.mir_opt_level() >= 2 && !ctx.target.is_like_gpu)
+        //
+        // teeny: a Triton kernel's control flow is uniform across its program (every thread
+        // takes the same path), so duplicating a call onto exclusive paths is harmless there.
+        // The `mlir` backend relies on the pass to remove the `Option` round trip of an inlined
+        // `Range::next`, which otherwise keeps a lifted loop from being uplifted to `scf.for`
+        // (and so from being pipelined) (teenyc-3a1).
+        let triton = ctx.opts.frontend == Some(rustc_session::config::Frontend::Triton);
+        PassPolicy::optional(ctx.mir_opt_level() >= 2 && (triton || !ctx.target.is_like_gpu))
     }
 
     #[instrument(skip_all level = "debug")]

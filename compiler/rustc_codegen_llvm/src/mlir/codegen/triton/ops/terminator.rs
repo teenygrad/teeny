@@ -880,23 +880,37 @@ impl<'a> TritonCodegen<'a> {
     ) -> Result<(), MlirError> {
         let ctx = self.module.context();
 
-        // Emit: %const = arith.constant val : T
-        //        %cmp  = arith.cmpi eq, %discr, %const : T
-        //        cf.cond_br %cmp, ^target_bb, ^otherwise_bb
         let discr_mlir_ty = discr_value.r#type();
-        let val_attr = IntegerAttribute::new(discr_mlir_ty, val as i64);
-        let const_op: Operation<'a> =
-            melior::dialect::arith::constant(ctx, val_attr.into(), location).into();
-        let val_const: Value<'a, 'a> = const_op.result(0).expect("switch const").into();
-        mlir_block.append_operation(const_op);
+        let is_bool = IntegerType::try_from(discr_mlir_ty).is_ok_and(|ty| ty.width() == 1);
+        let (cmp_result, target_bb, otherwise_bb) = if is_bool {
+            // A switch on a bool branches on the bool itself rather than on `b == val`. A loop
+            // lifted from these branches then guards its body with an `scf.if` on the same value
+            // as its `scf.condition`, which is what lets canonicalization move the body into the
+            // loop's `after` region and uplift a counted loop to `scf.for` (teenyc-3a1).
+            if val == 0 {
+                (discr_value, otherwise_bb, target_bb)
+            } else {
+                (discr_value, target_bb, otherwise_bb)
+            }
+        } else {
+            // Emit: %const = arith.constant val : T
+            //        %cmp  = arith.cmpi eq, %discr, %const : T
+            //        cf.cond_br %cmp, ^target_bb, ^otherwise_bb
+            let val_attr = IntegerAttribute::new(discr_mlir_ty, val as i64);
+            let const_op: Operation<'a> =
+                melior::dialect::arith::constant(ctx, val_attr.into(), location).into();
+            let val_const: Value<'a, 'a> = const_op.result(0).expect("switch const").into();
+            mlir_block.append_operation(const_op);
 
-        let i1_ty = IntegerType::new(ctx, 1).into();
-        let cmp_op: Operation<'a> =
-            create_cmpi(ctx, location, Predicate::EQ, discr_value, val_const, i1_ty)
-                .map_err(|e| MlirError::CreateOperation { err: e })?
-                .into();
-        let cmp_result: Value<'a, 'a> = cmp_op.result(0).expect("cmpi result").into();
-        mlir_block.append_operation(cmp_op);
+            let i1_ty = IntegerType::new(ctx, 1).into();
+            let cmp_op: Operation<'a> =
+                create_cmpi(ctx, location, Predicate::EQ, discr_value, val_const, i1_ty)
+                    .map_err(|e| MlirError::CreateOperation { err: e })?
+                    .into();
+            let cmp_result: Value<'a, 'a> = cmp_op.result(0).expect("cmpi result").into();
+            mlir_block.append_operation(cmp_op);
+            (cmp_result, target_bb, otherwise_bb)
+        };
 
         // If both branch targets are inside the active scf.for body, a plain
         // cf.cond_br would point two arms at the same MLIR block (invalid).
