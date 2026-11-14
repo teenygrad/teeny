@@ -37,8 +37,8 @@ macro_rules! include {
 include!("triton_prelude.rs");
 
 // A loop inside an `if` inside a `while` loop stepping by 2. The `if` must lower to an scf.if in
-// the scf.while body, with the `for` loop built in its arm (teenyc-9nm): an `if` in a `while` body
-// used to panic because the while loop never recorded its back edge.
+// the `while` loop's body, with the `for` loop built in its arm (teenyc-9nm): an `if` in a `while`
+// body used to panic because the while loop never recorded its back edge.
 fn loop_in_if_in_while<T: Triton, D: Float, const BLOCK: i32>(n: i32, b: i32) {
     let ptrs = T::zeros::<T::Pointer<D>>(&[BLOCK]);
     let mut acc = T::zeros::<D>(&[BLOCK]);

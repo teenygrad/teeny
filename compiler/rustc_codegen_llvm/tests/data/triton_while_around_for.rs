@@ -36,9 +36,9 @@ macro_rules! include {
 
 include!("triton_prelude.rs");
 
-// A `while` loop stepping by 2 around a `for` loop. The `while` must stay an scf.while with the
-// `for` nested inside it: the inner loop's `Some` payload is not the outer loop's variable, so it
-// mustn't make the outer loop look like a counted range loop.
+// A `while` loop stepping by 2 around a `for` loop. The `for` must stay nested inside it, and the
+// `while` must keep its step of 2: the inner loop's `Some` payload is not the outer loop's
+// variable, so it mustn't make the outer loop look like a unit-step range loop.
 fn while_around_for<T: Triton, D: Float, const BLOCK: i32>(n: i32, b: i32) {
     let ptrs = T::zeros::<T::Pointer<D>>(&[BLOCK]);
     let mut acc = T::zeros::<D>(&[BLOCK]);

@@ -248,11 +248,13 @@ fn compile_to_mlir(file: &str, target: &str, output_name: &str) -> String {
     compile_to_mlir_with(file, target, output_name, &[])
 }
 
-/// Like [`compile_to_mlir`], with the frontend matching `for` and `while` loops itself
-/// (`-Zmlir-loops-as-cf=no`) rather than leaving every loop to the Triton backend's
-/// control-flow structuring. These tests check the frontend's `scf` loops.
-fn compile_matching_loops(file: &str, target: &str, output_name: &str) -> String {
-    compile_to_mlir_with(file, target, output_name, &["-Zmlir-loops-as-cf=no"])
+/// Compiles `file` for `target` and returns its Triton IR: the kernel after the Triton backend
+/// has structured its control flow (Backend::structureControlFlow). The frontend lowers every
+/// loop as plain branches, so loop structure is checked here (teenyc-3a1).
+fn compile_to_ttir(file: &str, target: &str, output_name: &str) -> String {
+    compile_to_mlir(file, target, output_name);
+    std::fs::read_to_string(format!("/tmp/kernel-{output_name}.ttir"))
+        .unwrap_or_else(|e| panic!("read the TTIR for {file} on {target}: {e}"))
 }
 
 fn compile_to_mlir_with(file: &str, target: &str, output_name: &str, args: &[&str]) -> String {
@@ -274,10 +276,8 @@ fn back_to_back_loops_lower_for_every_target() {
     // detector rejected it for lacking an induction local; the `Option` then had no SSA form.
     for (target, name) in LOOP_TARGETS {
         let mlir =
-            compile_matching_loops("triton_back_to_back_loops.rs", target, &format!("{name}_b2b"));
-        // RISC-V's MIR has no `Option` left in these loops, so they lower as scf.while instead.
-        let loops = mlir.matches(" = scf.for ").count() + mlir.matches(" = scf.while ").count();
-        assert_eq!(loops, 2, "expected two loops on {target}:\n{mlir}");
+            compile_to_ttir("triton_back_to_back_loops.rs", target, &format!("{name}_b2b"));
+        assert_eq!(loop_nesting(&mlir).len(), 2, "expected two loops on {target}:\n{mlir}");
     }
 }
 
@@ -303,36 +303,38 @@ fn each_loop_runs_over_its_own_range_for_every_target() {
         .map(|(lower, upper)| (lower.to_string(), upper.to_string()));
     for (target, name) in LOOP_TARGETS {
         let mlir =
-            compile_matching_loops("triton_range_bounds.rs", target, &format!("{name}_range_bounds"));
+            compile_to_ttir("triton_range_bounds.rs", target, &format!("{name}_range_bounds"));
         assert_eq!(scf_for_bounds(&mlir), expected, "scf.for bounds on {target} in:\n{mlir}");
     }
 }
 
 #[test]
-fn counted_while_loop_stays_a_while_loop_for_every_target() {
+fn counted_while_loop_keeps_its_step_for_every_target() {
     // A hand-written `while i < n { ..; i += 2 }` has the same `counter < end` header as an
-    // inlined `Range::next`, minus the `Option`. Lowering it as a counted scf.for would run it
-    // once per value below n instead of once per step, so it must stay an scf.while even though
-    // `for _ in ..` loops no longer need an induction local (teenyc-3jo).
+    // inlined `Range::next`, minus the `Option`. Lowering it as a unit-step loop would run it once
+    // per value below n instead of once per step (teenyc-3jo), so if it becomes an `scf.for`, its
+    // step must be 2.
     for (target, name) in LOOP_TARGETS {
-        let mlir =
-            compile_matching_loops("triton_counted_while.rs", target, &format!("{name}_while"));
-        assert!(
-            !mlir.contains("scf.for"),
-            "while loop became a counted scf.for on {target}:\n{mlir}"
-        );
-        assert!(mlir.contains("scf.while"), "expected an scf.while on {target}:\n{mlir}");
+        let mlir = compile_to_ttir("triton_counted_while.rs", target, &format!("{name}_while"));
+        let loops: Vec<&str> =
+            mlir.lines().filter(|l| l.contains("scf.for ") || l.contains("scf.while ")).collect();
+        assert_eq!(loops.len(), 1, "expected one loop on {target}:\n{mlir}");
+        if loops[0].contains("scf.for ") {
+            assert!(loops[0].contains(" step %c2_i32"), "loop lost its step on {target}:\n{mlir}");
+        }
     }
 }
 
-/// Each `scf.for` / `scf.while` in `mlir` as `(op, depth)`, in order, where depth counts the loops
-/// it sits inside (from the MLIR's two-space indentation, the function body being at four).
+/// Each `scf.for` / `scf.while` in `mlir` as `(op, depth)`, in order, where depth counts the
+/// regions it sits inside (from the MLIR's two-space indentation, the function body being at
+/// four).
 fn loop_nesting(mlir: &str) -> Vec<(&'static str, usize)> {
     mlir.lines()
         .filter_map(|line| {
-            let op = ["scf.for", "scf.while"]
-                .into_iter()
-                .find(|op| line.contains(&format!(" = {op} ")))?;
+            let trimmed = line.trim_start();
+            let op = ["scf.for", "scf.while"].into_iter().find(|op| {
+                trimmed.starts_with(&format!("{op} ")) || line.contains(&format!(" = {op} "))
+            })?;
             let indent = line.len() - line.trim_start().len();
             Some((op, (indent - 4) / 2))
         })
@@ -346,7 +348,7 @@ fn nested_loops_lower_as_nested_loops_for_every_target() {
     // with its index at 0 (and on nvptx64 the whole nest was lost).
     for (target, name) in LOOP_TARGETS {
         let mlir =
-            compile_matching_loops("triton_nested_loops.rs", target, &format!("{name}_nested"));
+            compile_to_ttir("triton_nested_loops.rs", target, &format!("{name}_nested"));
         assert_eq!(
             loop_nesting(&mlir),
             [("scf.for", 0), ("scf.for", 1)],
@@ -363,22 +365,35 @@ fn deeply_nested_loops_lower_as_nested_loops_for_every_target() {
     // `Option` left in its MIR and lowers as an scf.while, nested all the same.
     for (target, name) in LOOP_TARGETS {
         let mlir =
-            compile_matching_loops("triton_nested_loops_deep.rs", target, &format!("{name}_deep"));
+            compile_to_ttir("triton_nested_loops_deep.rs", target, &format!("{name}_deep"));
         let depths: Vec<usize> = loop_nesting(&mlir).into_iter().map(|(_, depth)| depth).collect();
         assert_eq!(depths, [0, 1, 2], "expected three nested loops on {target}:\n{mlir}");
     }
 }
 
+/// The step of each `scf.for` in `mlir`, in order.
+fn scf_for_steps(mlir: &str) -> Vec<String> {
+    mlir.lines()
+        .filter_map(|line| {
+            let rest = line.split_once("scf.for ")?.1.split_once(" step ")?.1;
+            Some(rest.split_whitespace().next()?.to_string())
+        })
+        .collect()
+}
+
 #[test]
-fn while_loop_around_a_for_loop_stays_a_while_loop_for_every_target() {
+fn while_loop_around_a_for_loop_lowers_as_nested_loops_for_every_target() {
+    // The `while i < n { ..; i += 2 }` is counted, so the backend uplifts it to an scf.for with
+    // its step of 2, around the inner `for`.
     for (target, name) in LOOP_TARGETS {
         let mlir =
-            compile_matching_loops("triton_while_around_for.rs", target, &format!("{name}_while_for"));
+            compile_to_ttir("triton_while_around_for.rs", target, &format!("{name}_while_for"));
         assert_eq!(
             loop_nesting(&mlir),
-            [("scf.while", 0), ("scf.for", 1)],
-            "expected an scf.for nested in an scf.while on {target}:\n{mlir}"
+            [("scf.for", 0), ("scf.for", 1)],
+            "expected an scf.for nested in the while loop on {target}:\n{mlir}"
         );
+        assert_eq!(scf_for_steps(&mlir), ["%c2_i32", "%c1_i32"], "loop steps on {target}:\n{mlir}");
     }
 }
 
@@ -389,7 +404,7 @@ fn loops_inside_or_after_an_if_in_a_loop_lower_as_nested_loops_for_every_target(
     // runs into) was rejected.
     for (target, name) in LOOP_TARGETS {
         let mlir =
-            compile_matching_loops("triton_loop_in_if_in_loop.rs", target, &format!("{name}_loop_in_if"));
+            compile_to_ttir("triton_loop_in_if_in_loop.rs", target, &format!("{name}_loop_in_if"));
         let depths: Vec<usize> = loop_nesting(&mlir).into_iter().map(|(_, depth)| depth).collect();
         // The first nest: the inner loop inside the scf.if, one level deeper again.
         assert_eq!(depths.first(), Some(&0), "no outer loop on {target}:\n{mlir}");
@@ -407,17 +422,19 @@ fn loops_inside_or_after_an_if_in_a_loop_lower_as_nested_loops_for_every_target(
 #[test]
 fn loop_inside_an_if_inside_a_while_loop_lowers_for_every_target() {
     for (target, name) in LOOP_TARGETS {
-        let mlir = compile_matching_loops(
+        let mlir = compile_to_ttir(
             "triton_loop_in_if_in_while.rs",
             target,
             &format!("{name}_loop_in_if_in_while"),
         );
-        // The scf.for sits in an scf.if arm, two levels inside the scf.while.
+        // The inner loop sits in an scf.if arm, two levels inside the while loop, which is
+        // counted (`i += 2`) and so uplifted to an scf.for with that step.
         assert_eq!(
             loop_nesting(&mlir),
-            [("scf.while", 0), ("scf.for", 2)],
-            "expected an scf.for in an scf.if in an scf.while on {target}:\n{mlir}"
+            [("scf.for", 0), ("scf.for", 2)],
+            "expected an scf.for in an scf.if in the while loop on {target}:\n{mlir}"
         );
+        assert_eq!(scf_for_steps(&mlir), ["%c2_i32", "%c1_i32"], "loop steps on {target}:\n{mlir}");
     }
 }
 
@@ -427,12 +444,12 @@ fn nested_ifs_in_a_loop_lower_as_nested_scf_ifs_for_every_target() {
     // lowered after the loop's yield, and the loop was folded away: the kernel stored zeros.
     for (target, name) in LOOP_TARGETS {
         let mlir =
-            compile_matching_loops("triton_nested_if_in_loop.rs", target, &format!("{name}_nested_if"));
+            compile_to_ttir("triton_nested_if_in_loop.rs", target, &format!("{name}_nested_if"));
         assert_eq!(loop_nesting(&mlir), [("scf.for", 0)], "no loop on {target}:\n{mlir}");
         assert_store_is_computed(&mlir, target);
 
         // An if/else with code after it, and a loop in an inner `if`.
-        let mlir = compile_matching_loops(
+        let mlir = compile_to_ttir(
             "triton_nested_ifs_in_loop.rs",
             target,
             &format!("{name}_nested_ifs"),
@@ -470,10 +487,10 @@ fn do_while_loop_carries_its_accumulator() {
 
 #[test]
 fn every_loop_compiles_when_lowered_as_plain_branches() {
-    // teenyc-3a1: by default (-Zmlir-loops-as-cf) no loop is matched as a `for` or `while`;
-    // every loop is lowered to plain branches and Backend::structureControlFlow lifts them back
-    // to scf in the Triton backend. Each loop shape must compile through the whole pipeline, to
-    // assembly, on every target.
+    // teenyc-3a1: the frontend matches no loop as a `for` or `while`; every loop is lowered to
+    // plain branches and Backend::structureControlFlow lifts them back to scf in the Triton
+    // backend. Each loop shape must compile through the whole pipeline, to assembly, on every
+    // target.
     let files = [
         "triton_back_to_back_loops.rs",
         "triton_counted_while.rs",
@@ -490,10 +507,9 @@ fn every_loop_compiles_when_lowered_as_plain_branches() {
     ];
     for file in files {
         for target in ["nvptx64-nvidia-cuda", "riscv64-generic"] {
-            let name = format!("loops-as-cf-{}-{target}", file.trim_end_matches(".rs"));
+            let name = format!("plain-branches-{}-{target}", file.trim_end_matches(".rs"));
             let result = try_compile(&data_file(file), target, &name, &["--emit=asm"]);
             assert!(result.is_ok(), "expected {file} to compile for {target}: {result:?}");
-            // Nothing was matched, so the frontend's own output has no structured loops.
             let mlir = std::fs::read_to_string(format!("/tmp/kernel-{name}.mlir"))
                 .unwrap_or_else(|e| panic!("read the MLIR for {file} on {target}: {e}"));
             assert!(
@@ -504,8 +520,6 @@ fn every_loop_compiles_when_lowered_as_plain_branches() {
     }
 }
 
-/// The kernel stores a value it computed (a loop's result, or one merged from both arms of an
-/// `if`), not a constant (`%cst`).
 #[test]
 fn a_loop_counter_keeps_its_exit_value_for_every_target() {
     // teenyc-3a1: uplifting a lifted `scf.while` to `scf.for` (scf::upliftWhileToForLoop)
@@ -525,6 +539,8 @@ fn a_loop_counter_keeps_its_exit_value_for_every_target() {
     }
 }
 
+/// The kernel stores a value it computed (a loop's result, or one merged from both arms of an
+/// `if`), not a constant (`%cst`).
 fn assert_store_is_computed(mlir: &str, target: &str) {
     let store = mlir.lines().find(|l| l.contains("tt.store")).unwrap_or_default();
     assert!(!store.contains("%cst"), "the kernel stores a constant on {target}:\n{mlir}");

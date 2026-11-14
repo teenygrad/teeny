@@ -14,16 +14,12 @@
  * limitations under the License.
  */
 
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::collections::HashMap;
 
-use melior::dialect::scf;
 use melior::ir::attribute::{DenseElementsAttribute, FloatAttribute, IntegerAttribute};
-use melior::ir::operation::{OperationBuilder, OperationLike};
+use melior::ir::operation::OperationLike;
 use melior::ir::r#type::{IntegerType, RankedTensorType, ShapedTypeLike, TypeLike};
-use melior::ir::{
-    Block, BlockLike, BlockRef, Location, Operation, Region, RegionLike, Value, ValueLike,
-};
+use melior::ir::{BlockLike, BlockRef, Location, Operation, Value, ValueLike};
 use rustc_middle::mir::{
     BasicBlock, Body, CallSource, Local, Operand, Place, SwitchTargets, Terminator, TerminatorKind,
     UnwindAction,
@@ -37,7 +33,7 @@ use rustc_span::Span;
 use rustc_span::Spanned;
 
 use crate::mlir::codegen::triton::location::span_to_location;
-use crate::mlir::codegen::triton::{CodegenState, LoopNest, OptionValue, PhiArg, TritonCodegen};
+use crate::mlir::codegen::triton::{CodegenState, OptionValue, PhiArg, TritonCodegen};
 use crate::mlir::errors::MlirError;
 
 // Used inside codegen_terminator_call where 'a and 'tcx are concrete — no HRTB needed.
@@ -810,9 +806,6 @@ impl<'a> TritonCodegen<'a> {
         match cases.as_slice() {
             [] => self.codegen_goto(location, &otherwise_bb, mlir_block, basic_blocks, state),
             [(val, target_bb)] => self.codegen_switch_binary(
-                tcx,
-                instance,
-                mir,
                 discr_value,
                 *val,
                 *target_bb,
@@ -835,9 +828,6 @@ impl<'a> TritonCodegen<'a> {
                 if self.is_unreachable_block(mir, otherwise_bb) =>
             {
                 self.codegen_switch_binary(
-                    tcx,
-                    instance,
-                    mir,
                     discr_value,
                     *val0,
                     *target0,
@@ -860,15 +850,12 @@ impl<'a> TritonCodegen<'a> {
     }
 
     /// Lowers a binary discriminant check (`discr == val ? target_bb : otherwise_bb`) to
-    /// `cf.cond_br` (or `scf.if`, inside an active loop body). Shared by the true
+    /// `cf.cond_br`. Shared by the true
     /// single-explicit-case `SwitchInt` and the two-explicit-cases-with-unreachable
     /// -otherwise pattern, which differ only in how `otherwise_bb` was derived.
     #[allow(clippy::too_many_arguments)]
-    fn codegen_switch_binary<'tcx>(
+    fn codegen_switch_binary(
         &self,
-        tcx: TyCtxt<'tcx>,
-        instance: &Instance<'tcx>,
-        mir: &Body<'tcx>,
         discr_value: Value<'a, 'a>,
         val: u128,
         target_bb: BasicBlock,
@@ -912,30 +899,6 @@ impl<'a> TritonCodegen<'a> {
             (cmp_result, target_bb, otherwise_bb)
         };
 
-        // If both branch targets are inside the active scf.for body, a plain
-        // cf.cond_br would point two arms at the same MLIR block (invalid).
-        // Emit scf.if instead, processing each arm's MIR blocks inline.
-        if let Some(header_bb) = state.loop_header_bb {
-            let true_in_loop =
-                target_bb == header_bb || state.loop_body_bbs.contains(&target_bb);
-            let false_in_loop =
-                otherwise_bb == header_bb || state.loop_body_bbs.contains(&otherwise_bb);
-            if true_in_loop && false_in_loop {
-                return self.codegen_loop_body_switch_as_scf_if(
-                    tcx,
-                    instance,
-                    mir,
-                    cmp_result,
-                    target_bb,
-                    otherwise_bb,
-                    mlir_block,
-                    basic_blocks,
-                    state,
-                    location,
-                );
-            }
-        }
-
         // Degenerate: both arms go to the same block (optimizer merged identical paths).
         // Emit cf.br instead to avoid Triton's makeTTGIR crashing on a cond_br with
         // two identical successors.
@@ -972,28 +935,6 @@ impl<'a> TritonCodegen<'a> {
         basic_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<(), MlirError> {
-        // Back-edge detection: emit scf.yield instead of cf.br when inside a loop body.
-        if let Some(header_bb) = state.loop_header_bb {
-            if *target == header_bb {
-                let yield_vals: Vec<Value<'a, 'a>> = state
-                    .loop_iter_carry_locals
-                    .iter()
-                    .map(|local| {
-                        *state.ssa_values.get(local).unwrap_or_else(|| {
-                            panic!("scf.yield: iter-carry local {:?} not in ssa_values", local)
-                        })
-                    })
-                    .collect();
-                let yield_op = scf::r#yield(&yield_vals, location);
-                mlir_block.append_operation(yield_op);
-                return Ok(());
-            }
-            // Within-body jump: all body BBs share a single MLIR block, so skip cf.br.
-            if state.loop_body_bbs.contains(target) {
-                return Ok(());
-            }
-        }
-
         let target_block = *basic_blocks.get(target).unwrap_or_else(|| {
             panic!(
                 "codegen_goto: target {:?} not in basic_blocks (known: {:?})",
@@ -1016,299 +957,6 @@ impl<'a> TritonCodegen<'a> {
         Ok(())
     }
 
-    /// Emit an `scf.if` in place of a `cf.cond_br` when both SwitchInt targets are inside
-    /// the active `scf.for` body. Each arm processes its chain of body blocks inline,
-    /// yielding the current iter-carry values to the `scf.if`. After the `scf.if`, the
-    /// iter-carry locals are updated with the results, and the arm-chain blocks are marked
-    /// as `skip_bbs` so the outer body loop doesn't re-process them.
-    #[allow(clippy::too_many_arguments)]
-    fn codegen_loop_body_switch_as_scf_if<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        instance: &Instance<'tcx>,
-        mir: &Body<'tcx>,
-        cond: Value<'a, 'a>,
-        true_target: BasicBlock,
-        false_target: BasicBlock,
-        mlir_block: &BlockRef<'a, 'a>,
-        basic_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
-        state: &mut CodegenState<'a, 'a>,
-        location: Location<'a>,
-    ) -> Result<(), MlirError> {
-        let back_edge_bb = state
-            .loop_back_edge_bb
-            .expect("codegen_loop_body_switch_as_scf_if: loop_back_edge_bb not set");
-
-        let loop_body_bbs = state.loop_body_bbs.clone();
-        let iter_carry_locals = state.loop_iter_carry_locals.clone();
-
-        let nest = Rc::clone(&state.loop_nest);
-        let true_chain = collect_arm_chain(mir, true_target, back_edge_bb, &loop_body_bbs, &nest);
-        let false_chain = collect_arm_chain(mir, false_target, back_edge_bb, &loop_body_bbs, &nest);
-
-        let iter_carry_types: Vec<melior::ir::Type<'a>> = iter_carry_locals
-            .iter()
-            .map(|local| {
-                state
-                    .ssa_values
-                    .get(local)
-                    .unwrap_or_else(|| {
-                        panic!("scf.if: iter-carry local {:?} not in ssa_values", local)
-                    })
-                    .r#type()
-            })
-            .collect();
-
-        let if_op: Operation<'a> = OperationBuilder::new("scf.if", location)
-            .add_operands(&[cond])
-            .add_results(&iter_carry_types)
-            .add_regions([Region::new(), Region::new()])
-            .build()
-            .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
-
-        // Taken before the arms are lowered: an `if` nested in an arm marks its own chains,
-        // which may take in the back edge.
-        let back_edge_was_in_skip = state.skip_bbs.contains(&back_edge_bb);
-        let enclosing_is_arm = std::mem::replace(&mut state.in_scf_if_arm, true);
-        let saved_ssa = state.ssa_values.clone();
-
-        let then_region = if_op.region(0).expect("scf.if then region");
-        let then_block_ref = then_region.append_block(Block::new(&[]));
-        self.codegen_scf_if_arm(
-            tcx,
-            instance,
-            mir,
-            &true_chain,
-            &then_block_ref,
-            &iter_carry_locals,
-            basic_blocks,
-            state,
-            location,
-        )?;
-
-        // Restore snapshot before processing false arm.
-        state.ssa_values = saved_ssa.clone();
-
-        let else_region = if_op.region(1).expect("scf.if else region");
-        let else_block_ref = else_region.append_block(Block::new(&[]));
-        self.codegen_scf_if_arm(
-            tcx,
-            instance,
-            mir,
-            &false_chain,
-            &else_block_ref,
-            &iter_carry_locals,
-            basic_blocks,
-            state,
-            location,
-        )?;
-        state.in_scf_if_arm = enclosing_is_arm;
-
-        // Restore snapshot so post-if state is neutral.
-        state.ssa_values = saved_ssa;
-
-        // Collect results before consuming the op.
-        let if_results: Vec<Value<'a, 'a>> = (0..iter_carry_locals.len())
-            .map(|i| if_op.result(i).expect("scf.if result").into())
-            .collect();
-
-        mlir_block.append_operation(if_op);
-
-        // Update iter-carry locals with scf.if results (then or else path).
-        for (i, &local) in iter_carry_locals.iter().enumerate() {
-            state.ssa_values.insert(local, if_results[i]);
-        }
-
-        // Mark arm-chain blocks so the outer scf.for body loop skips them.
-        for &bb in &true_chain {
-            state.skip_bbs.insert(bb);
-        }
-        for &bb in &false_chain {
-            state.skip_bbs.insert(bb);
-        }
-
-        // If back_edge_bb was absorbed into one of the arm chains (newly added to skip_bbs),
-        // the outer scf.for body loop will never reach it to emit the back-edge scf.yield.
-        // Emit it here instead, using the iter-carry values updated by the scf.if results.
-        // An `if` nested in an arm leaves that to the outermost one: the arm it sits in ends
-        // with its own yield to its scf.if.
-        if !enclosing_is_arm && !back_edge_was_in_skip && state.skip_bbs.contains(&back_edge_bb) {
-            let yield_vals: Vec<Value<'a, 'a>> = state
-                .loop_iter_carry_locals
-                .iter()
-                .map(|local| {
-                    *state.ssa_values.get(local).unwrap_or_else(|| {
-                        panic!(
-                            "scf.yield after absorbed back_edge: iter-carry {:?} not in ssa_values",
-                            local
-                        )
-                    })
-                })
-                .collect();
-            mlir_block.append_operation(scf::r#yield(&yield_vals, location));
-        }
-
-        Ok(())
-    }
-
-    /// Lower one arm of a loop-body `scf.if`, its chain of blocks, into `arm_block`, then yield
-    /// the enclosing loop's carried values from it.
-    ///
-    /// A loop nested in the chain is built in place. An `if` that ends the chain becomes an
-    /// `scf.if` nested in the arm, whose own arms run on to the back edge. Ignoring that `if`
-    /// left the rest of the body to be lowered after the loop's yield, and the loop, which then
-    /// changed nothing, was folded away (teenyc-2uq).
-    #[allow(clippy::too_many_arguments)]
-    fn codegen_scf_if_arm<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        instance: &Instance<'tcx>,
-        mir: &Body<'tcx>,
-        chain: &[BasicBlock],
-        arm_block: &BlockRef<'a, 'a>,
-        iter_carry_locals: &[Local],
-        basic_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
-        state: &mut CodegenState<'a, 'a>,
-        location: Location<'a>,
-    ) -> Result<(), MlirError> {
-        for &bb in chain {
-            // A loop in the arm: built here, and the chain carries on at its exit block.
-            let nested = self.codegen_nested_loop(
-                tcx,
-                instance,
-                mir,
-                bb,
-                arm_block,
-                state,
-                basic_blocks,
-                location,
-            )?;
-            if nested.is_some() {
-                continue;
-            }
-            let bb_data = &mir.basic_blocks[bb];
-            for stmt in &bb_data.statements {
-                self.codegen_statement(tcx, instance, mir, stmt, arm_block, state)?;
-            }
-            match &bb_data.terminator().kind {
-                // Execute the call and store its result (e.g. `acc = acc + z`).
-                TerminatorKind::Call {
-                    func,
-                    args,
-                    destination,
-                    target,
-                    unwind,
-                    call_source,
-                    fn_span,
-                } => {
-                    let call_loc = span_to_location(self.module.context(), tcx, *fn_span);
-                    self.codegen_terminator_call(
-                        tcx,
-                        instance,
-                        mir,
-                        func,
-                        args,
-                        destination,
-                        target,
-                        unwind,
-                        call_source,
-                        fn_span,
-                        call_loc,
-                        arm_block,
-                        basic_blocks,
-                        state,
-                    )?;
-                }
-                // The `if` that ends the chain, lowered as an scf.if nested in this arm.
-                TerminatorKind::SwitchInt { targets, .. } => {
-                    let stays_in_loop = |target: BasicBlock| {
-                        Some(target) == state.loop_header_bb
-                            || state.loop_body_bbs.contains(&target)
-                            || self.is_unreachable_block(mir, target)
-                    };
-                    if !targets.all_targets().iter().copied().all(stays_in_loop) {
-                        return Err(MlirError::CodegenFailed {
-                            err: format!(
-                                "a branch at {bb:?}, in an `if` in a loop body, leaves the loop, \
-                                 which isn't supported"
-                            ),
-                        });
-                    }
-                    self.codegen_terminator(
-                        tcx,
-                        instance,
-                        mir,
-                        bb_data.terminator(),
-                        arm_block,
-                        state,
-                        basic_blocks,
-                    )?;
-                }
-                // A `goto`, which the chain follows.
-                _ => {}
-            }
-        }
-        let yield_vals: Vec<Value<'a, 'a>> = iter_carry_locals
-            .iter()
-            .map(|local| {
-                *state.ssa_values.get(local).unwrap_or_else(|| {
-                    panic!("scf.if yield: iter-carry {:?} not in ssa_values", local)
-                })
-            })
-            .collect();
-        arm_block.append_operation(scf::r#yield(&yield_vals, location));
-        Ok(())
-    }
-}
-
-/// Collect a linear chain of body blocks starting from `start`, up to and including
-/// `back_edge_bb` if the chain reaches it. Follows Goto and Call (normal) terminators
-/// within the body, stopping at SwitchInt or when the successor leaves the loop body. A loop
-/// nested in the body is stepped over, from its init block (kept in the chain) to its exit.
-///
-/// Including `back_edge_bb` is important when it contains statements (e.g. `acc = move _9`)
-/// that must execute inside the scf.if arm before the arm's yield collects the updated value.
-fn collect_arm_chain<'tcx>(
-    mir: &Body<'tcx>,
-    start: BasicBlock,
-    back_edge_bb: BasicBlock,
-    body_bbs: &HashSet<BasicBlock>,
-    nest: &LoopNest,
-) -> Vec<BasicBlock> {
-    if start == back_edge_bb {
-        return Vec::new();
-    }
-    let mut chain = Vec::new();
-    let mut current = start;
-    let mut visited: HashSet<BasicBlock> = HashSet::new();
-    loop {
-        if !visited.insert(current) {
-            break;
-        }
-        if !body_bbs.contains(&current) {
-            break;
-        }
-        chain.push(current);
-        // Include back_edge_bb for its statements but do not follow its outgoing edge.
-        if current == back_edge_bb {
-            break;
-        }
-        // A nested loop's init block stands for the whole loop, which the arm builds in place.
-        if let Some(exit_bb) = nest.exit_of_loop_entered_at(current) {
-            current = exit_bb;
-            continue;
-        }
-        match &mir.basic_blocks[current].terminator().kind {
-            TerminatorKind::Goto { target } => {
-                current = *target;
-            }
-            TerminatorKind::Call { target: Some(target), .. } if body_bbs.contains(target) => {
-                current = *target;
-            }
-            _ => break,
-        }
-    }
-    chain
 }
 
 impl<'a> TritonCodegen<'a> {

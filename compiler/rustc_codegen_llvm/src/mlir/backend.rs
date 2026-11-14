@@ -468,6 +468,19 @@ fn write_compiled_module(
         info!("MLIR written to {} ({} bytes)", mlir_path.display(), mlir_src.len());
     }
 
+    // The Triton IR beside it: the same kernel once the Triton backend has structured its
+    // control flow (Backend::structureControlFlow), which the frontend leaves as plain branches.
+    if let Some(ttir) = module.module_llvm.compiler.get_ttir() {
+        let ttir_path = cgcx
+            .output_filenames
+            .path(rustc_session::config::OutputType::Object)
+            .as_path()
+            .with_extension("ttir");
+        std::fs::write(&ttir_path, ttir.as_bytes())
+            .unwrap_or_else(|e| panic!("Failed to write TTIR to {}: {}", ttir_path.display(), e));
+        info!("TTIR written to {} ({} bytes)", ttir_path.display(), ttir.len());
+    }
+
     CompiledModule {
         name: module.name,
         kind: module.kind,

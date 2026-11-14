@@ -2679,10 +2679,6 @@ options! {
         e.g., by miri; implies -Zmir-opt-level=0 (default: no)"),
     mir_strip_debuginfo: MirStripDebugInfo = (MirStripDebugInfo::None, parse_mir_strip_debuginfo, [TRACKED],
         "Whether to remove some of the MIR debug info from methods.  Default: None"),
-    mlir_loops_as_cf: bool = (true, parse_bool, [TRACKED],
-        "(teeny) lower every loop to plain branches in the `mlir` codegen backend and leave \
-        structuring them to the Triton backend, instead of matching `for` and `while` loops \
-        (default: yes)"),
     move_size_limit: Option<usize> = (None, parse_opt_number, [TRACKED],
         "the size at which the `large_assignments` lint starts to be emitted"),
     namespaced_crates: bool = (false, parse_bool, [TRACKED],

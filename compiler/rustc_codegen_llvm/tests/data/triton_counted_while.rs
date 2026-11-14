@@ -37,7 +37,7 @@ macro_rules! include {
 include!("triton_prelude.rs");
 
 // A `while` loop whose counter steps by 2. Its header compares the counter against `n` just like
-// an inlined `Range::next` does, but it is not a range loop and must stay an scf.while.
+// an inlined `Range::next` does, but it must keep its step of 2, not become a unit-step loop.
 fn counted_while<T: Triton, D: Float, const BLOCK: i32>(n: i32) {
     let ptrs = T::zeros::<T::Pointer<D>>(&[BLOCK]);
     let mut a = T::zeros::<D>(&[BLOCK]);
