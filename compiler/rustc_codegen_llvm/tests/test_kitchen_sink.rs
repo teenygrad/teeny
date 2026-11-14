@@ -795,6 +795,26 @@ mod tests {
         let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_verifier_error_reported");
     }
 
+    // An invalid op whose result is unused must fail to compile, not be folded away by the
+    // canonicalizer before anything verifies it.
+    #[test]
+    #[should_panic(expected = "codegen produced invalid MLIR")]
+    fn test_unused_invalid_op_rejected() {
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_verifier_error_unused.rs");
+        let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_unused_invalid_op_rejected");
+    }
+
+    // `DotFormat`s with no `tt.dot_scaled` element type must fail to compile rather than be
+    // lowered as another format.
+    #[test]
+    #[should_panic(expected = "lhs format `DotFormat::Int8` has no `tt.dot_scaled` element type")]
+    fn test_dot_scaled_unsupported_format_rejected() {
+        let compiler = LlvmCompiler::new();
+        let file = env::current_dir().unwrap().join("tests/data/triton_dot_scaled_int8.rs");
+        let _ = compiler.compile(&file, "nvptx64-nvidia-cuda", "test_dot_scaled_int8");
+    }
+
     // teenyc-27y: a reshape whose element count differs from its input's must fail to compile;
     // it used to return the input unchanged. A codegen error panics inside rustc and reaches the
     // test through `run_compiler`.

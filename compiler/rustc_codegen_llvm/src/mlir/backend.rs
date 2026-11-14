@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use melior::diagnostic::{Diagnostic, DiagnosticSeverity};
+use melior::ir::operation::OperationLike;
 use melior::pass;
 use melior::pass::PassManager;
 use rustc_codegen_ssa::back::lto::{ThinModule, ThinShared};
@@ -185,13 +186,20 @@ fn cleanup_mlir_module(mlir_module: &mut MlirModule<'static>) -> Result<(), Mlir
             is_error
         }
     });
-    let result = pass_manager.run(mlir_module.llmod_mut());
+    // Verify what codegen built before any pass runs. The canonicalizer can fold away malformed
+    // IR, such as ops left after a loop body's terminator or an invalid op whose result is unused,
+    // which turned codegen bugs into kernels that compiled and silently computed the wrong result
+    // (teenyc-2uq).
+    let result = if mlir_module.llmod().as_operation().verify() {
+        pass_manager.run(mlir_module.llmod_mut()).map_err(|e| e.to_string())
+    } else {
+        Err("codegen produced invalid MLIR".to_string())
+    };
     mlir_module.context().detach_diagnostic_handler(handler);
 
     result.map_err(|e| {
         let errors = errors.take();
-        let err =
-            if errors.is_empty() { e.to_string() } else { format!("{e}:\n{}", errors.join("\n")) };
+        let err = if errors.is_empty() { e } else { format!("{e}:\n{}", errors.join("\n")) };
         MlirError::CodegenFailed { err }
     })
 }
