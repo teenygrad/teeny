@@ -67,11 +67,27 @@ use types::is_option_ty;
 
 type SsaValues<'c, 'p> = HashMap<Local, Value<'c, 'p>>;
 
-/// Tracks `Option<T>` MIR locals that must not be materialised as MLIR SSA values.
-/// `None` entry  → the local holds the `None` variant (no inner value).
-/// `Some(v)` entry → the local holds `Some(v)` with this MLIR value as the inner.
-/// These locals are NEVER inserted into `SsaValues`.
-type OptionTable<'c, 'p> = LocalTable<Option<Value<'c, 'p>>>;
+/// The value of an `Option<T>` local. These locals are never inserted into `SsaValues`.
+#[derive(Clone, Copy)]
+pub(crate) enum OptionValue<'c, 'p> {
+    /// Statically `None`.
+    None,
+    /// Statically `Some`, holding this value.
+    Some(Value<'c, 'p>),
+    /// `Some` or `None` depending on the path taken to a join: the merge of the variants that
+    /// reach it, as block arguments (see `branch_operands`). `payload` is meaningful only where
+    /// `is_some` (an `i1`) holds.
+    Merged { is_some: Value<'c, 'p>, payload: Value<'c, 'p> },
+}
+
+impl<'c, 'p> From<Option<Value<'c, 'p>>> for OptionValue<'c, 'p> {
+    fn from(value: Option<Value<'c, 'p>>) -> Self {
+        value.map_or(OptionValue::None, OptionValue::Some)
+    }
+}
+
+/// Tracks `Option<T>` MIR locals.
+type OptionTable<'c, 'p> = LocalTable<OptionValue<'c, 'p>>;
 
 /// Tracks tuple MIR locals (including the return place `_0` for tuple-returning functions).
 /// The vec contains the individual MLIR values for each tuple field in order.
@@ -99,11 +115,12 @@ type PtrToDynArray = LocalTable<Local>;
 type SliceDynValues<'c, 'p> = LocalTable<Vec<Value<'c, 'p>>>;
 
 /// A side table for MIR locals whose values have no single SSA form (Options, tuples, constant
-/// and runtime arrays, slices, block pointers, descriptor block shapes). Unlike `ssa_values`,
-/// which gets block arguments at joins and loop headers, these tables are flow-insensitive: one
-/// entry per local. That is only sound for a local with a single definition, so recording a
-/// local that is assigned in more than one reachable place (e.g. chosen by an `if`) is an
-/// error, rather than silently keeping the value from one assignment.
+/// and runtime arrays, slices, block pointers, descriptor block shapes), one entry per local.
+///
+/// Options and tuples are merged at joins like `ssa_values` (see `branch_operands`), except
+/// around the loops lowered as `scf.for` / `scf.while`, which only carry `ssa_values`. The other
+/// tables can't be merged at all. Recording a local that is assigned in more than one place it
+/// can't be merged from is an error, rather than silently keeping one assignment's value.
 pub(crate) struct LocalTable<V> {
     entries: HashMap<Local, V>,
     multiply_assigned: Rc<MultiplyAssigned>,
@@ -124,6 +141,14 @@ impl<V> LocalTable<V> {
         self.entries.get(local)
     }
 
+    fn entries(&self) -> &HashMap<Local, V> {
+        &self.entries
+    }
+
+    fn replace_entries(&mut self, entries: HashMap<Local, V>) {
+        self.entries = entries;
+    }
+
     pub(crate) fn contains_key(&self, local: &Local) -> bool {
         self.entries.contains_key(local)
     }
@@ -133,8 +158,8 @@ impl<V> LocalTable<V> {
             let places: Vec<String> = spans.iter().map(|span| format!("{span:?}")).collect();
             return Err(MlirError::CodegenFailed {
                 err: format!(
-                    "{local:?} is assigned in more than one place ({}), but its value ({}) has \
-                     no SSA form to merge them; assign it once",
+                    "{local:?} is assigned in more than one place ({}), but its value ({}) \
+                     can't be merged where they meet; assign it once",
                     places.join(", "),
                     self.kind
                 ),
@@ -148,11 +173,14 @@ impl<V> LocalTable<V> {
 /// Locals with more than one definition, mapped to the source span of each definition.
 type MultiplyAssigned = HashMap<Local, Vec<Span>>;
 
+/// Locals with more than one definition, mapped to the block and source span of each.
+type Definitions = HashMap<Local, Vec<(BasicBlock, Span)>>;
+
 /// Locals with more than one whole-local definition (assignment or call destination) in the
 /// `reachable` blocks of `mir`. Blocks pruned by constant folding don't count, so a definition in
 /// a dead branch doesn't make a local ambiguous.
-fn multiply_assigned_locals(mir: &Body<'_>, reachable: &HashSet<BasicBlock>) -> MultiplyAssigned {
-    let mut definitions: MultiplyAssigned = HashMap::new();
+fn multiply_assigned_locals(mir: &Body<'_>, reachable: &HashSet<BasicBlock>) -> Definitions {
+    let mut definitions: Definitions = HashMap::new();
     for (bb, block) in mir.basic_blocks.iter_enumerated() {
         if !reachable.contains(&bb) {
             continue;
@@ -169,7 +197,7 @@ fn multiply_assigned_locals(mir: &Body<'_>, reachable: &HashSet<BasicBlock>) -> 
         });
         for (place, span) in assigned.chain(called) {
             if place.projection.is_empty() {
-                definitions.entry(place.local).or_default().push(span);
+                definitions.entry(place.local).or_default().push((bb, span));
             }
         }
     }
@@ -202,6 +230,26 @@ pub(crate) struct BlockPtr<'c, 'p> {
     pub(crate) block_shape: Vec<i64>,
     #[expect(dead_code, reason = "read when block-pointer load/store is added to the Triton API")]
     pub(crate) order: Vec<i64>,
+}
+
+/// The block arguments holding a local's merged value at a join.
+#[derive(Clone)]
+pub(crate) enum PhiArg<'c, 'p> {
+    Value(Value<'c, 'p>),
+    /// An Option: whether it is `Some` (an `i1`) and its payload.
+    Option {
+        is_some: Value<'c, 'p>,
+        payload: Value<'c, 'p>,
+    },
+    /// A tuple: one argument per field.
+    Tuple(Vec<Value<'c, 'p>>),
+}
+
+/// The state of the join-merged locals at some point: `ssa_values`, Options and tuples.
+pub(crate) struct SsaSnapshot<'c, 'p> {
+    values: SsaValues<'c, 'p>,
+    options: HashMap<Local, OptionValue<'c, 'p>>,
+    tuples: HashMap<Local, Vec<Value<'c, 'p>>>,
 }
 
 /// Codegen state threaded through all statement/terminator handlers.
@@ -252,14 +300,33 @@ pub(crate) struct CodegenState<'c, 'p> {
     /// The MIR locals that need a block argument (a phi) at each block of the function body,
     /// from SSA construction (see `ssa`).
     pub(crate) phi_join_locals: HashMap<BasicBlock, Vec<Local>>,
-    /// (block, local) → the block argument holding that local's merged value.
-    pub(crate) phi_block_args: HashMap<(BasicBlock, Local), Value<'c, 'p>>,
+    /// (block, local) → the block arguments holding that local's merged value.
+    pub(crate) phi_block_args: HashMap<(BasicBlock, Local), PhiArg<'c, 'p>>,
+    /// The MLIR type of the payload of each `Option<T>` local that needs a block argument,
+    /// where `T` maps to one: a branch carrying `None` passes a placeholder of this type.
+    pub(crate) phi_option_payload_types: HashMap<Local, melior::ir::Type<'c>>,
     /// Blocks with phis whose arguments are fixed: the first branch lowered into a block creates
     /// them (see `branch_operands`).
     pub(crate) phi_blocks_entered: HashSet<BasicBlock>,
 }
 
 impl<'c, 'p> CodegenState<'c, 'p> {
+    /// The values of the locals that are merged at joins, to resume from in the blocks that a
+    /// block dominates.
+    fn ssa_snapshot(&self) -> SsaSnapshot<'c, 'p> {
+        SsaSnapshot {
+            values: self.ssa_values.clone(),
+            options: self.option_table.entries().clone(),
+            tuples: self.tuple_fields.entries().clone(),
+        }
+    }
+
+    fn restore_ssa_snapshot(&mut self, snapshot: &SsaSnapshot<'c, 'p>) {
+        self.ssa_values = snapshot.values.clone();
+        self.option_table.replace_entries(snapshot.options.clone());
+        self.tuple_fields.replace_entries(snapshot.tuples.clone());
+    }
+
     /// Takes the active loop's context, leaving none, so a nested loop can be built with its own.
     fn take_loop_context(&mut self) -> LoopContext {
         LoopContext {
@@ -280,10 +347,27 @@ impl<'c, 'p> CodegenState<'c, 'p> {
         self.skip_bbs = context.skip_bbs;
     }
 
-    /// Gives every `LocalTable` the function's multiply-assigned locals.
-    fn set_multiply_assigned(&mut self, multiply_assigned: &Rc<MultiplyAssigned>) {
-        self.option_table.set_multiply_assigned(multiply_assigned);
-        self.tuple_fields.set_multiply_assigned(multiply_assigned);
+    /// Gives every `LocalTable` the function's multiply-assigned locals that it can't merge.
+    /// Options and tuples are merged at joins, except for definitions in `loop_blocks` (lowered
+    /// as `scf.for` / `scf.while`, which carry only `ssa_values`).
+    fn set_multiply_assigned(
+        &mut self,
+        definitions: &Definitions,
+        loop_blocks: &HashSet<BasicBlock>,
+    ) {
+        let spans = |defs: &[(BasicBlock, Span)]| defs.iter().map(|&(_, span)| span).collect();
+        let in_loops: MultiplyAssigned = definitions
+            .iter()
+            .filter(|(_, defs)| defs.iter().any(|(bb, _)| loop_blocks.contains(bb)))
+            .map(|(&local, defs)| (local, spans(defs)))
+            .collect();
+        let in_loops = Rc::new(in_loops);
+        self.option_table.set_multiply_assigned(&in_loops);
+        self.tuple_fields.set_multiply_assigned(&in_loops);
+
+        let multiply_assigned: MultiplyAssigned =
+            definitions.iter().map(|(&local, defs)| (local, spans(defs))).collect();
+        let multiply_assigned = &Rc::new(multiply_assigned);
         self.const_arrays.set_multiply_assigned(multiply_assigned);
         self.ptr_to_const_array.set_multiply_assigned(multiply_assigned);
         self.slice_shape.set_multiply_assigned(multiply_assigned);
@@ -317,6 +401,7 @@ impl<'c, 'p> CodegenState<'c, 'p> {
             const_disc_locals: HashMap::new(),
             phi_join_locals: HashMap::new(),
             phi_block_args: HashMap::new(),
+            phi_option_payload_types: HashMap::new(),
             phi_blocks_entered: HashSet::new(),
         }
     }
@@ -511,22 +596,54 @@ impl WhileLoopInfo {
     }
 }
 
-/// Pre-scan all MIR blocks to collect statically-known discriminant values.
+/// The locals of `mir` with a statically known value, and the blocks reachable once the
+/// switches on them are folded, in DFS preorder.
 ///
-/// Handles two patterns:
-/// 1. `SetDiscriminant { place, variant_index }` → `place.local` has variant_index as discriminant
-/// 2. `_d = Discriminant(_opt)` where `_opt` already has a known discriminant → `_d` inherits it
-/// 3. `_local = const VALUE` where VALUE is a scalar constant (e.g. `_149 = const USE_BIAS`)
+/// The two depend on each other: a definition in a block that a folded switch never reaches
+/// doesn't count against a local's value (e.g. the `Some` arm of a `USE_BIAS = false` branch).
+/// Starting from every block, each round drops the blocks the known values prove unreachable,
+/// until nothing changes. Every round's answer holds for any execution, since an execution only
+/// runs definitions in blocks the round considers reachable.
+fn known_locals_and_reachable_blocks<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: &Instance<'tcx>,
+    mir: &Body<'tcx>,
+) -> (HashMap<Local, u64>, HashSet<BasicBlock>, Vec<BasicBlock>) {
+    let mut considered: HashSet<BasicBlock> = mir.basic_blocks.indices().collect();
+    loop {
+        let known = compute_const_disc_locals(tcx, instance, mir, &considered);
+        let (reachable, ordered) = compute_reachable_blocks(tcx, instance, mir, &known);
+        if reachable == considered {
+            return (known, reachable, ordered);
+        }
+        considered = reachable;
+    }
+}
+
+/// How a whole-local definition determines the local's value, for `compute_const_disc_locals`.
+enum KnownDef {
+    /// A constant, or the variant set by `SetDiscriminant`.
+    Const(u64),
+    /// The discriminant of another local, or a copy of it.
+    From(Local),
+    /// Anything else: a computed value, a call result, an enum aggregate.
+    Unknown,
+}
+
+/// The locals with a statically known value: a discriminant (for `Option`s set by
+/// `SetDiscriminant`) or a scalar constant, following `Discriminant` and copies. A local is
+/// known only if every definition of it in the `considered` blocks gives the same value, so a
+/// local chosen by an `if` (`f = 1` on one arm, `f = 2` on the other) isn't folded to either.
 ///
-/// Constants are instantiated via `instance` so that const generic parameters (e.g. `USE_BIAS`)
-/// get their concrete values (e.g. `false`) after monomorphization.
+/// Constants are instantiated via `instance`, so const generic parameters (e.g. `USE_BIAS`) get
+/// their concrete values after monomorphization.
 fn compute_const_disc_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: &Instance<'tcx>,
     mir: &Body<'tcx>,
+    considered: &HashSet<BasicBlock>,
 ) -> HashMap<Local, u64> {
     use rustc_middle::mir::interpret::Scalar;
-    let mut result: HashMap<Local, u64> = HashMap::new();
 
     let extract_scalar_const = |c: &ConstOperand<'tcx>| -> Option<u64> {
         // Instantiate the constant (substitutes generic params like USE_BIAS → false).
@@ -548,59 +665,68 @@ fn compute_const_disc_locals<'tcx>(
         }
     };
 
-    // Pass 1: collect SetDiscriminant statements and plain scalar const assignments.
-    for (_, bb_data) in mir.basic_blocks.iter_enumerated() {
+    let mut defs: HashMap<Local, Vec<KnownDef>> = HashMap::new();
+    for (bb, bb_data) in mir.basic_blocks.iter_enumerated() {
+        if !considered.contains(&bb) {
+            continue;
+        }
         for stmt in &bb_data.statements {
-            match &stmt.kind {
+            let (place, def) = match &stmt.kind {
                 StatementKind::SetDiscriminant { place, variant_index } => {
-                    if place.projection.is_empty() {
-                        result.insert(place.local, variant_index.as_u32() as u64);
-                    }
+                    (**place, KnownDef::Const(variant_index.as_u32() as u64))
                 }
                 StatementKind::Assign(assign) => {
                     let (place, rvalue) = assign.as_ref();
-                    if place.projection.is_empty() {
-                        if let Rvalue::Use(Operand::Constant(c), _) = rvalue {
-                            if let Some(v) = extract_scalar_const(c) {
-                                result.insert(place.local, v);
-                            }
+                    let def = match rvalue {
+                        Rvalue::Use(Operand::Constant(c), _) => {
+                            extract_scalar_const(c).map_or(KnownDef::Unknown, KnownDef::Const)
                         }
-                    }
+                        Rvalue::Discriminant(src) => KnownDef::From(src.local),
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), _)
+                            if p.projection.is_empty() =>
+                        {
+                            KnownDef::From(p.local)
+                        }
+                        _ => KnownDef::Unknown,
+                    };
+                    (*place, def)
                 }
-                _ => {}
+                _ => continue,
+            };
+            if place.projection.is_empty() {
+                defs.entry(place.local).or_default().push(def);
             }
+        }
+        if let rustc_middle::mir::TerminatorKind::Call { destination, .. } =
+            &bb_data.terminator().kind
+            && destination.projection.is_empty()
+        {
+            defs.entry(destination.local).or_default().push(KnownDef::Unknown);
         }
     }
 
-    // Pass 2: propagate through Discriminant-taking and copy assignments.
+    // A local becomes known once all its definitions resolve to one value; resolving one can
+    // resolve the locals copied from it, so repeat until nothing changes.
+    let mut result: HashMap<Local, u64> = HashMap::new();
     let mut changed = true;
     while changed {
         changed = false;
-        for (_, bb_data) in mir.basic_blocks.iter_enumerated() {
-            for stmt in &bb_data.statements {
-                if let StatementKind::Assign(assign) = &stmt.kind {
-                    let (place, rvalue) = assign.as_ref();
-                    if place.projection.is_empty() {
-                        let known = match rvalue {
-                            Rvalue::Discriminant(src) => result.get(&src.local).copied(),
-                            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), _)
-                                if p.projection.is_empty() =>
-                            {
-                                result.get(&p.local).copied()
-                            }
-                            _ => None,
-                        };
-                        if let Some(v) = known {
-                            if result.insert(place.local, v).is_none() {
-                                changed = true;
-                            }
-                        }
-                    }
-                }
+        for (local, local_defs) in &defs {
+            if result.contains_key(local) {
+                continue;
+            }
+            let mut values = local_defs.iter().map(|def| match def {
+                KnownDef::Const(value) => Some(*value),
+                KnownDef::From(src) => result.get(src).copied(),
+                KnownDef::Unknown => None,
+            });
+            let Some(Some(first)) = values.next() else { continue };
+            if values.all(|value| value == Some(first)) {
+                result.insert(*local, first);
+                changed = true;
             }
         }
     }
-
     result
 }
 
@@ -1858,7 +1984,7 @@ impl<'a> TritonCodegen<'a> {
             // For the Call-header pattern (Rust 1.93+): pre-populate the Range::next result local
             // as Some(iv) in the option_table so that `_induction = ((_next as Some).0)` resolves.
             if let Some(nrl) = loop_info.next_result_local {
-                state.option_table.insert(nrl, Some(iv))?;
+                state.option_table.insert(nrl, OptionValue::Some(iv))?;
             }
         }
 
@@ -2293,17 +2419,11 @@ impl<'a> TritonCodegen<'a> {
             //println!("[DEBUG] TritonCodegen::codegen_function: mir: {:?}", mir);
         }
 
-        // Pre-scan for statically-known discriminant values (e.g. Option locals set to None
-        // by const generics).  Used to constant-fold SwitchInt and prune dead blocks.
-        let const_disc_locals = compute_const_disc_locals(tcx, instance, mir);
+        // Statically known discriminants and constants (e.g. Options set to None by const
+        // generics) fold switches; only the blocks still reachable get MLIR blocks.
+        let (const_disc_locals, reachable_bbs, bfs_ordered_bbs) =
+            known_locals_and_reachable_blocks(tcx, instance, mir);
         state.const_disc_locals = const_disc_locals.clone();
-
-        // BFS reachability analysis: only reachable blocks get MLIR blocks.
-        // The returned vec preserves BFS order — use it for *processing* so that each
-        // block is processed only after all blocks that dominate it (i.e., SSA values
-        // from predecessor blocks are already in state.ssa_values).
-        let (reachable_bbs, bfs_ordered_bbs) =
-            compute_reachable_blocks(tcx, instance, mir, &const_disc_locals);
 
         // Detect all Range-based `for` loops. Loop body blocks live in the scf.for region, not
         // in the function region, so we skip creating MLIR blocks for them here.
@@ -2315,7 +2435,6 @@ impl<'a> TritonCodegen<'a> {
         for next_result in loop_infos.iter().filter_map(|l| l.next_result_local) {
             multiply_assigned.remove(&next_result);
         }
-        state.set_multiply_assigned(&Rc::new(multiply_assigned));
 
         // Detect while loops (after range loops, so they don't claim a `for` loop's header).
         let range_loop_headers: HashSet<BasicBlock> =
@@ -2326,6 +2445,7 @@ impl<'a> TritonCodegen<'a> {
         let nest = Rc::new(LoopNest::new(mir, loop_infos, while_loop_infos));
         state.loop_nest = Rc::clone(&nest);
         let loop_region_blocks = nest.loop_blocks();
+        state.set_multiply_assigned(&multiply_assigned, &loop_region_blocks);
 
         // Outermost loops, by the block that enters them: its `goto → header_bb` is intercepted
         // to emit the loop. Loops whose init block lies in another loop's body are built by that
@@ -2342,6 +2462,7 @@ impl<'a> TritonCodegen<'a> {
             &nest,
         );
         state.phi_join_locals = ssa_plan.phis.clone();
+        state.phi_option_payload_types = self.option_payload_types(tcx, instance, mir, &ssa_plan);
 
         // Create MLIR blocks for all non-loop-region, reachable MIR blocks.
         // Index order is fine for block *creation* — MLIR blocks just need to exist before
@@ -2360,7 +2481,7 @@ impl<'a> TritonCodegen<'a> {
                 for (param_idx, input_ty) in inputs.iter().enumerate() {
                     let local = Local::from_usize(param_idx + 1);
                     if is_option_ty(tcx, *input_ty) {
-                        state.option_table.insert(local, None)?;
+                        state.option_table.insert(local, OptionValue::None)?;
                     } else {
                         let value = block.add_argument(arg_types[mlir_arg_idx], location);
                         state.ssa_values.insert(local, value);
@@ -2382,15 +2503,24 @@ impl<'a> TritonCodegen<'a> {
         // its immediate dominator, plus its block arguments. Every value a block reads is then
         // defined in a block that dominates it, whatever path reached it. (Loop regions aren't
         // in the plan: codegen_scf_for_loop / codegen_scf_while_loop lower them.)
-        let mut values_at_end: HashMap<BasicBlock, SsaValues<'_, '_>> = HashMap::new();
+        let mut values_at_end: HashMap<BasicBlock, SsaSnapshot<'_, '_>> = HashMap::new();
         for &bb in &ssa_plan.order {
             let bb_data = &mir.basic_blocks[bb];
             if let Some(idom) = ssa_plan.idom.get(&bb) {
-                state.ssa_values = values_at_end[idom].clone();
+                state.restore_ssa_snapshot(&values_at_end[idom]);
             }
             for local in ssa_plan.phis.get(&bb).into_iter().flatten() {
-                if let Some(&arg) = state.phi_block_args.get(&(bb, *local)) {
-                    state.ssa_values.insert(*local, arg);
+                match state.phi_block_args.get(&(bb, *local)).cloned() {
+                    Some(PhiArg::Value(arg)) => {
+                        state.ssa_values.insert(*local, arg);
+                    }
+                    Some(PhiArg::Option { is_some, payload }) => {
+                        state
+                            .option_table
+                            .insert(*local, OptionValue::Merged { is_some, payload })?;
+                    }
+                    Some(PhiArg::Tuple(fields)) => state.tuple_fields.insert(*local, fields)?,
+                    None => {}
                 }
             }
 
@@ -2435,12 +2565,48 @@ impl<'a> TritonCodegen<'a> {
                     &basic_blocks,
                 )?;
             }
-            values_at_end.insert(bb, state.ssa_values.clone());
+            values_at_end.insert(bb, state.ssa_snapshot());
         }
 
         self.module.mlir.body().append_operation(func_op.into());
 
         Ok(())
+    }
+
+    /// The MLIR payload type of each `Option<T>` local that needs a block argument, where `T`
+    /// maps to a scalar: a branch carrying `None` into the join passes a placeholder of it.
+    /// (A tensor's MIR type maps to no concrete shape, so a `None` tensor Option can only be
+    /// merged once a `Some` has fixed the arguments.)
+    fn option_payload_types<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        plan: &ssa::SsaPlan,
+    ) -> HashMap<Local, melior::ir::Type<'a>> {
+        let mut types = HashMap::new();
+        for &local in plan.phis.values().flatten() {
+            let ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                tcx,
+                TypingEnv::fully_monomorphized(),
+                EarlyBinder::bind(tcx, mir.local_decls[local].ty),
+            );
+            if !is_option_ty(tcx, ty) {
+                continue;
+            }
+            let TyKind::Adt(_, args) = ty.kind() else { continue };
+            let payload_ty = args.type_at(0);
+            if matches!(
+                payload_ty.kind(),
+                TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::Bool
+            ) {
+                types.insert(
+                    local,
+                    self.type_mapper.map_type(self.module.context(), &tcx, &payload_ty),
+                );
+            }
+        }
+        types
     }
 
     fn codegen_basic_block<'tcx>(
@@ -2557,7 +2723,7 @@ impl<'a> TritonCodegen<'a> {
                             })
                         }
                         // `None::<T>` as a constant — no inner value.
-                        Operand::Constant(_) => None,
+                        Operand::Constant(_) => OptionValue::None,
                         Operand::RuntimeChecks(_) => {
                             todo!("RuntimeChecks operand not yet supported")
                         }
@@ -3009,10 +3175,21 @@ impl<'a> TritonCodegen<'a> {
                     EarlyBinder::bind(tcx, src_ty),
                 );
                 if is_option_ty(tcx, norm_src_ty) {
-                    // The discriminant of an Option is statically known from the option_table.
                     let discr: i64 = match state.option_table.get(&src_place.local) {
-                        Some(None) => 0,    // None variant
-                        Some(Some(_)) => 1, // Some variant
+                        Some(OptionValue::None) => 0,
+                        Some(OptionValue::Some(_)) => 1,
+                        // Chosen at run time: the discriminant is the merged `is_some` flag.
+                        Some(&OptionValue::Merged { is_some, .. }) => {
+                            let i8_ty = IntegerType::new(self.module.context(), 8).into();
+                            let op: Operation<'a> =
+                                melior::dialect::arith::extui(is_some, i8_ty, location).into();
+                            let result = op
+                                .result(0)
+                                .map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+                            mlir_block.append_operation(op);
+                            state.ssa_values.insert(place.local, result.into());
+                            return Ok(());
+                        }
                         None => panic!(
                             "Option local {:?} not found in option_table for Discriminant",
                             src_place.local
@@ -3267,8 +3444,7 @@ impl<'a> TritonCodegen<'a> {
         state: &mut CodegenState<'a, 'a>,
     ) -> Result<(), MlirError> {
         if variant_index.as_usize() == 0 {
-            // None variant — no inner value.
-            state.option_table.insert(place.local, None)?;
+            state.option_table.insert(place.local, OptionValue::None)?;
         } else {
             // Some(inner) — codegen the single field and stash it.
             let inner_op = index_vec
@@ -3281,7 +3457,7 @@ impl<'a> TritonCodegen<'a> {
             );
             let inner_value = self
                 .codegen_operand(tcx, instance, inner_op, inner_ty, location, mlir_block, state)?;
-            state.option_table.insert(place.local, Some(inner_value))?;
+            state.option_table.insert(place.local, OptionValue::Some(inner_value))?;
         }
         Ok(())
     }
@@ -3306,7 +3482,7 @@ impl<'a> TritonCodegen<'a> {
         if is_option_ty(tcx, norm_ty) {
             if variant_index.as_usize() == 0 {
                 // Two-phase None: discriminant set to 0.
-                state.option_table.insert(place.local, None)?;
+                state.option_table.insert(place.local, OptionValue::None)?;
             } else {
                 // Two-phase Some: inner value was written into ssa_values[place.local] by
                 // a preceding field-assignment via Place::Downcast projection.  Promote it.
@@ -3316,7 +3492,7 @@ impl<'a> TritonCodegen<'a> {
                         place.local
                     )
                 });
-                state.option_table.insert(place.local, Some(inner))?;
+                state.option_table.insert(place.local, OptionValue::Some(inner))?;
             }
             return Ok(());
         }
@@ -3675,9 +3851,24 @@ impl<'a> TritonCodegen<'a> {
         if is_option_ty(tcx, ty) {
             let inner = match operand {
                 Operand::Copy(p) | Operand::Move(p) => {
-                    *state.option_table.get(&p.local).unwrap_or_else(|| {
+                    match *state.option_table.get(&p.local).unwrap_or_else(|| {
                         panic!("Option local {:?} not found in option_table", p.local)
-                    })
+                    }) {
+                        OptionValue::None => None,
+                        OptionValue::Some(value) => Some(value),
+                        // Triton's optional operands (masks, accumulators) must be present or
+                        // absent when the kernel is compiled.
+                        OptionValue::Merged { .. } => {
+                            return Err(MlirError::CodegenFailed {
+                                err: format!(
+                                    "{:?} is `Some` or `None` depending on the path taken, but \
+                                     this optional operand must be one or the other at compile \
+                                     time",
+                                    p.local
+                                ),
+                            });
+                        }
+                    }
                 }
                 // `None::<T>` constant — no inner value.
                 Operand::Constant(_) => None,
@@ -3763,9 +3954,14 @@ impl<'a> TritonCodegen<'a> {
         | [ProjectionElem::Field(_, _)] = place.projection.as_slice()
         {
             if let Some(opt_val) = state.option_table.get(&place.local) {
-                return Ok(opt_val.unwrap_or_else(|| {
-                    panic!("Accessing field of None Option local {:?}", place.local)
-                }));
+                return Ok(match *opt_val {
+                    OptionValue::Some(value) => value,
+                    // Read only where the discriminant says `Some` (MIR's downcast).
+                    OptionValue::Merged { payload, .. } => payload,
+                    OptionValue::None => {
+                        panic!("Accessing field of None Option local {:?}", place.local)
+                    }
+                });
             }
         }
 

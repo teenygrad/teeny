@@ -18,9 +18,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use melior::dialect::scf;
-use melior::ir::attribute::IntegerAttribute;
+use melior::ir::attribute::{DenseElementsAttribute, FloatAttribute, IntegerAttribute};
 use melior::ir::operation::{OperationBuilder, OperationLike};
-use melior::ir::r#type::IntegerType;
+use melior::ir::r#type::{IntegerType, RankedTensorType, ShapedTypeLike, TypeLike};
 use melior::ir::{
     Block, BlockLike, BlockRef, Location, Operation, Region, RegionLike, Value, ValueLike,
 };
@@ -37,7 +37,7 @@ use rustc_span::Span;
 use rustc_span::Spanned;
 
 use crate::mlir::codegen::triton::location::span_to_location;
-use crate::mlir::codegen::triton::{CodegenState, LoopNest, TritonCodegen};
+use crate::mlir::codegen::triton::{CodegenState, LoopNest, OptionValue, PhiArg, TritonCodegen};
 use crate::mlir::errors::MlirError;
 
 // Used inside codegen_terminator_call where 'a and 'tcx are concrete — no HRTB needed.
@@ -932,8 +932,10 @@ impl<'a> TritonCodegen<'a> {
         let true_block = *basic_blocks.get(&target_bb).expect("switch target block");
         let false_block = *basic_blocks.get(&otherwise_bb).expect("switch otherwise block");
 
-        let true_phi_args = branch_operands(target_bb, true_block, state, location)?;
-        let false_phi_args = branch_operands(otherwise_bb, false_block, state, location)?;
+        let true_phi_args =
+            self.branch_operands(target_bb, true_block, mlir_block, state, location)?;
+        let false_phi_args =
+            self.branch_operands(otherwise_bb, false_block, mlir_block, state, location)?;
 
         let cond_br_op = melior::dialect::cf::cond_br(
             ctx,
@@ -986,7 +988,7 @@ impl<'a> TritonCodegen<'a> {
             )
         });
 
-        let phi_args = branch_operands(*target, target_block, state, location)?;
+        let phi_args = self.branch_operands(*target, target_block, mlir_block, state, location)?;
 
         let br_op: Operation<'a> = if phi_args.is_empty() {
             create_cf_br(self.module.context(), location, &*target_block)
@@ -1295,40 +1297,176 @@ fn collect_arm_chain<'tcx>(
     chain
 }
 
-/// The operands of a branch to `target`: the value of each local that `target` merges, in the
-/// order of its block arguments.
-///
-/// The first branch lowered into a block fixes its arguments: one per merged local that has an
-/// SSA value there, typed like that value, so a tensor gets its concrete shape rather than the
-/// generic one its MIR type maps to. A merged local with no SSA value (an `Option` or a tuple,
-/// kept in side tables) gets none. In reverse postorder that first branch precedes the block
-/// itself, so its arguments exist by the time it is lowered.
-pub(crate) fn branch_operands<'a>(
-    target: BasicBlock,
-    target_block: BlockRef<'a, 'a>,
-    state: &mut CodegenState<'a, 'a>,
-    location: Location<'a>,
-) -> Result<Vec<Value<'a, 'a>>, MlirError> {
-    let Some(phi_locals) = state.phi_join_locals.get(&target).cloned() else {
-        return Ok(Vec::new());
-    };
-    let first_branch = state.phi_blocks_entered.insert(target);
-    let mut operands = Vec::with_capacity(phi_locals.len());
-    for local in phi_locals {
-        let value = state.ssa_values.get(&local).copied();
-        if first_branch {
-            let Some(value) = value else { continue };
-            let arg = target_block.add_argument(value.r#type(), location);
-            state.phi_block_args.insert((target, local), arg);
-            operands.push(value);
-        } else if state.phi_block_args.contains_key(&(target, local)) {
-            operands.push(value.ok_or_else(|| MlirError::CodegenFailed {
-                err: format!(
-                    "{local:?} has no value on this branch to {target:?}, which merges it from \
-                     another path"
-                ),
-            })?);
+impl<'a> TritonCodegen<'a> {
+    /// The operands of a branch from `block` to `target`: the value of each local that `target`
+    /// merges, in the order of its block arguments.
+    ///
+    /// The first branch lowered into a block fixes its arguments, typed like the values it
+    /// carries, so a tensor gets its concrete shape rather than the generic one its MIR type
+    /// maps to. A merged local takes one argument per SSA value: one for a plain value, one per
+    /// field of a tuple, and an `i1` "is `Some`" flag plus the payload for an Option. A merged
+    /// local with no value on that first branch gets none. In reverse postorder that first branch
+    /// precedes the block itself, so its arguments exist by the time it is lowered.
+    pub(crate) fn branch_operands(
+        &self,
+        target: BasicBlock,
+        target_block: BlockRef<'a, 'a>,
+        block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+        location: Location<'a>,
+    ) -> Result<Vec<Value<'a, 'a>>, MlirError> {
+        let Some(phi_locals) = state.phi_join_locals.get(&target).cloned() else {
+            return Ok(Vec::new());
+        };
+        let first_branch = state.phi_blocks_entered.insert(target);
+        let mut operands = Vec::new();
+        for local in phi_locals {
+            if first_branch {
+                let Some(values) = self.merged_values(local, block, state, location, None)? else {
+                    continue;
+                };
+                let arg = match values {
+                    PhiArg::Value(value) => {
+                        operands.push(value);
+                        PhiArg::Value(target_block.add_argument(value.r#type(), location))
+                    }
+                    PhiArg::Option { is_some, payload } => {
+                        operands.extend([is_some, payload]);
+                        PhiArg::Option {
+                            is_some: target_block.add_argument(is_some.r#type(), location),
+                            payload: target_block.add_argument(payload.r#type(), location),
+                        }
+                    }
+                    PhiArg::Tuple(fields) => {
+                        operands.extend(&fields);
+                        PhiArg::Tuple(
+                            fields
+                                .iter()
+                                .map(|field| target_block.add_argument(field.r#type(), location))
+                                .collect(),
+                        )
+                    }
+                };
+                state.phi_block_args.insert((target, local), arg);
+            } else if let Some(arg) = state.phi_block_args.get(&(target, local)).cloned() {
+                let values = self.merged_values(local, block, state, location, Some(&arg))?;
+                match (values, &arg) {
+                    (Some(PhiArg::Value(value)), PhiArg::Value(_)) => operands.push(value),
+                    (Some(PhiArg::Option { is_some, payload }), PhiArg::Option { .. }) => {
+                        operands.extend([is_some, payload]);
+                    }
+                    (Some(PhiArg::Tuple(fields)), PhiArg::Tuple(arg_fields))
+                        if fields.len() == arg_fields.len() =>
+                    {
+                        operands.extend(fields);
+                    }
+                    (None, _) => {
+                        return Err(MlirError::CodegenFailed {
+                            err: format!(
+                                "{local:?} has no value on this branch to {target:?}, which \
+                                 merges it from another path"
+                            ),
+                        });
+                    }
+                    _ => {
+                        return Err(MlirError::CodegenFailed {
+                            err: format!(
+                                "{local:?} has a different kind of value on this branch to \
+                                 {target:?} than on another path into it"
+                            ),
+                        });
+                    }
+                }
+            }
         }
+        Ok(operands)
     }
-    Ok(operands)
+
+    /// A zero of `ty`, standing in for the payload of a `None` Option `local` at a join (it is
+    /// never read: the merged `is_some` flag is false on that path).
+    fn placeholder_payload(
+        &self,
+        local: Local,
+        ty: melior::ir::Type<'a>,
+        block: &BlockRef<'a, 'a>,
+        location: Location<'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        let ctx = self.module.context();
+        let scalar_zero = |ty: melior::ir::Type<'a>| -> Option<melior::ir::Attribute<'a>> {
+            if ty.is_integer() {
+                Some(IntegerAttribute::new(ty, 0).into())
+            } else if ty.is_float() {
+                Some(FloatAttribute::new(ctx, ty, 0.0).into())
+            } else {
+                None
+            }
+        };
+        let attr = match RankedTensorType::try_from(ty) {
+            Ok(tensor) => scalar_zero(tensor.element())
+                .and_then(|zero| DenseElementsAttribute::new(ty, &[zero]).ok().map(Into::into)),
+            Err(_) => scalar_zero(ty),
+        };
+        let attr = attr.ok_or_else(|| MlirError::CodegenFailed {
+            err: format!(
+                "{local:?} is `None` on one path and `Some` on another, but its payload type \
+                 ({ty}) has no placeholder value to merge them with"
+            ),
+        })?;
+        let op = melior::dialect::arith::constant(ctx, attr, location);
+        let result = op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+        block.append_operation(op);
+        Ok(result.into())
+    }
+
+    /// The SSA values of `local` at the end of `block`, as they are passed to a join. A `None`
+    /// Option passes `false` and a zero placeholder payload, of `arg`'s payload type when the
+    /// join's arguments are already fixed.
+    fn merged_values(
+        &self,
+        local: Local,
+        block: &BlockRef<'a, 'a>,
+        state: &CodegenState<'a, 'a>,
+        location: Location<'a>,
+        arg: Option<&PhiArg<'a, 'a>>,
+    ) -> Result<Option<PhiArg<'a, 'a>>, MlirError> {
+        if let Some(&value) = state.ssa_values.get(&local) {
+            return Ok(Some(PhiArg::Value(value)));
+        }
+        if let Some(fields) = state.tuple_fields.get(&local) {
+            return Ok(Some(PhiArg::Tuple(fields.clone())));
+        }
+        let Some(&option) = state.option_table.get(&local) else { return Ok(None) };
+        let ctx = self.module.context();
+        let flag = |value: bool| -> Result<Value<'a, 'a>, MlirError> {
+            let op = melior::dialect::arith::constant(
+                ctx,
+                IntegerAttribute::new(IntegerType::new(ctx, 1).into(), i64::from(value)).into(),
+                location,
+            );
+            let result =
+                op.result(0).map_err(|e| MlirError::CodegenFailed { err: e.to_string() })?;
+            block.append_operation(op);
+            Ok(result.into())
+        };
+        let (is_some, payload) = match option {
+            OptionValue::Some(payload) => (flag(true)?, payload),
+            OptionValue::Merged { is_some, payload } => (is_some, payload),
+            OptionValue::None => {
+                let payload_ty = match arg {
+                    Some(PhiArg::Option { payload, .. }) => payload.r#type(),
+                    _ => *state.phi_option_payload_types.get(&local).ok_or_else(|| {
+                        MlirError::CodegenFailed {
+                            err: format!(
+                                "{local:?} is `None` on one path and `Some` on another, and its \
+                                 payload type isn't known where the paths meet (a tensor Option \
+                                 must be `Some` on the first path lowered into the join)"
+                            ),
+                        }
+                    })?,
+                };
+                (flag(false)?, self.placeholder_payload(local, payload_ty, block, location)?)
+            }
+        };
+        Ok(Some(PhiArg::Option { is_some, payload }))
+    }
 }
