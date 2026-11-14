@@ -310,3 +310,76 @@ fn counted_while_loop_stays_a_while_loop_for_every_target() {
         assert!(mlir.contains("scf.while"), "expected an scf.while on {target}:\n{mlir}");
     }
 }
+
+/// Each `scf.for` / `scf.while` in `mlir` as `(op, depth)`, in order, where depth counts the loops
+/// it sits inside (from the MLIR's two-space indentation, the function body being at four).
+fn loop_nesting(mlir: &str) -> Vec<(&'static str, usize)> {
+    mlir.lines()
+        .filter_map(|line| {
+            let op = ["scf.for", "scf.while"]
+                .into_iter()
+                .find(|op| line.contains(&format!(" = {op} ")))?;
+            let indent = line.len() - line.trim_start().len();
+            Some((op, (indent - 4) / 2))
+        })
+        .collect()
+}
+
+#[test]
+fn nested_loops_lower_as_nested_loops_for_every_target() {
+    // teenygrad#155: a loop nested in another wasn't built as a loop of its own. Its header
+    // became an scf.if around one copy of its body, and its back edge was dropped, so it ran once
+    // with its index at 0 (and on nvptx64 the whole nest was lost).
+    for (target, name) in LOOP_TARGETS {
+        let mlir = compile_to_mlir("triton_nested_loops.rs", target, &format!("{name}_nested"));
+        assert_eq!(
+            loop_nesting(&mlir),
+            [("scf.for", 0), ("scf.for", 1)],
+            "expected an scf.for nested in an scf.for on {target}:\n{mlir}"
+        );
+        // The inner loop's induction value must feed the index (`i * b + j`), not a constant 0.
+        assert!(!mlir.contains("scf.if"), "inner loop became an scf.if on {target}:\n{mlir}");
+    }
+}
+
+#[test]
+fn deeply_nested_loops_lower_as_nested_loops_for_every_target() {
+    // Three levels, with `for _` at the top and bottom. On RISC-V the innermost `for _` has no
+    // `Option` left in its MIR and lowers as an scf.while, nested all the same.
+    for (target, name) in LOOP_TARGETS {
+        let mlir = compile_to_mlir("triton_nested_loops_deep.rs", target, &format!("{name}_deep"));
+        let depths: Vec<usize> = loop_nesting(&mlir).into_iter().map(|(_, depth)| depth).collect();
+        assert_eq!(depths, [0, 1, 2], "expected three nested loops on {target}:\n{mlir}");
+    }
+}
+
+#[test]
+fn while_loop_around_a_for_loop_stays_a_while_loop_for_every_target() {
+    for (target, name) in LOOP_TARGETS {
+        let mlir =
+            compile_to_mlir("triton_while_around_for.rs", target, &format!("{name}_while_for"));
+        assert_eq!(
+            loop_nesting(&mlir),
+            [("scf.while", 0), ("scf.for", 1)],
+            "expected an scf.for nested in an scf.while on {target}:\n{mlir}"
+        );
+    }
+}
+
+#[test]
+fn loop_inside_an_if_inside_a_loop_is_rejected_for_every_target() {
+    // teenyc-9nm: an `if` arm in a loop body is lowered as a straight chain of blocks, which
+    // can't hold a loop. It must fail to compile rather than drop the loop.
+    for (target, name) in LOOP_TARGETS {
+        let output_name = format!("{name}_loop_in_if");
+        let mlir_path = format!("/tmp/kernel-{output_name}.mlir");
+        let _ = std::fs::remove_file(&mlir_path);
+        let result =
+            try_compile(&data_file("triton_loop_in_if_in_loop.rs"), target, &output_name, &[]);
+        assert!(result.is_err(), "expected a loop in an if in a loop to be rejected on {target}");
+        assert!(
+            !std::path::Path::new(&mlir_path).exists(),
+            "MLIR was emitted for a loop in an if in a loop on {target}"
+        );
+    }
+}

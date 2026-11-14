@@ -239,6 +239,9 @@ pub(crate) struct CodegenState<'c, 'p> {
     /// Body blocks already processed inline inside a `scf.if` arm by the loop-body SwitchInt
     /// handler. `codegen_scf_for_loop` skips these in its outer body loop.
     pub(crate) skip_bbs: HashSet<BasicBlock>,
+    /// Blocks that enter a loop nested in another loop's body. Only `codegen_loop_body` can
+    /// build those loops; the loop-body SwitchInt handler rejects an arm that reaches one.
+    pub(crate) nested_loop_inits: HashSet<BasicBlock>,
     /// Statically-known discriminant values for Option<T> locals (from SetDiscriminant).
     /// Used by `codegen_switch_int` to constant-fold branches on Option discriminants.
     pub(crate) const_disc_locals: ConstDiscLocals,
@@ -257,6 +260,26 @@ pub(crate) struct CodegenState<'c, 'p> {
 }
 
 impl<'c, 'p> CodegenState<'c, 'p> {
+    /// Takes the active loop's context, leaving none, so a nested loop can be built with its own.
+    fn take_loop_context(&mut self) -> LoopContext {
+        LoopContext {
+            header_bb: self.loop_header_bb.take(),
+            iter_carry_locals: std::mem::take(&mut self.loop_iter_carry_locals),
+            body_bbs: std::mem::take(&mut self.loop_body_bbs),
+            back_edge_bb: self.loop_back_edge_bb.take(),
+            skip_bbs: std::mem::take(&mut self.skip_bbs),
+        }
+    }
+
+    /// Reinstates a loop context saved by [`Self::take_loop_context`].
+    fn restore_loop_context(&mut self, context: LoopContext) {
+        self.loop_header_bb = context.header_bb;
+        self.loop_iter_carry_locals = context.iter_carry_locals;
+        self.loop_body_bbs = context.body_bbs;
+        self.loop_back_edge_bb = context.back_edge_bb;
+        self.skip_bbs = context.skip_bbs;
+    }
+
     /// Gives every `LocalTable` the function's multiply-assigned locals.
     fn set_multiply_assigned(&mut self, multiply_assigned: &Rc<MultiplyAssigned>) {
         self.option_table.set_multiply_assigned(multiply_assigned);
@@ -289,6 +312,7 @@ impl<'c, 'p> CodegenState<'c, 'p> {
             loop_body_bbs: HashSet::new(),
             loop_back_edge_bb: None,
             skip_bbs: HashSet::new(),
+            nested_loop_inits: HashSet::new(),
             const_disc_locals: HashMap::new(),
             phi_join_locals: HashMap::new(),
             phi_block_args: HashMap::new(),
@@ -343,6 +367,96 @@ enum LoopBound {
     Local(Local),
 }
 
+/// The loop fields of [`CodegenState`] for one loop, saved while a loop nested in it is built.
+struct LoopContext {
+    header_bb: Option<BasicBlock>,
+    iter_carry_locals: Vec<Local>,
+    body_bbs: HashSet<BasicBlock>,
+    back_edge_bb: Option<BasicBlock>,
+    skip_bbs: HashSet<BasicBlock>,
+}
+
+/// A detected loop, as an index into [`LoopNest`]'s range or while loops.
+#[derive(Debug, Clone, Copy)]
+enum LoopRef {
+    Range(usize),
+    While(usize),
+}
+
+/// What follows a lowered loop in the block it was emitted into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopExit {
+    /// Branch to the loop's exit block, which has an MLIR block of its own.
+    Branch,
+    /// Carry on in the same block: the loop is nested in another loop's single-block body, and
+    /// its exit block is lowered next as part of that body.
+    FallThrough,
+}
+
+/// Every detected loop with the block that enters it and the blocks it owns, so that a loop body
+/// can build the loops nested inside it (teenygrad#155).
+struct LoopNest<'l> {
+    ranges: &'l [RangeLoopInfo],
+    whiles: &'l [WhileLoopInfo],
+    /// The block that enters each loop with a `goto` to its header.
+    inits: HashMap<BasicBlock, LoopRef>,
+    /// The init blocks of the outermost loops, which the function body lowers itself.
+    top_level_inits: HashMap<BasicBlock, LoopRef>,
+    /// Each loop's header with every block the loop owns.
+    regions: Vec<(BasicBlock, Vec<BasicBlock>)>,
+}
+
+impl<'l> LoopNest<'l> {
+    fn new(mir: &Body<'_>, ranges: &'l [RangeLoopInfo], whiles: &'l [WhileLoopInfo]) -> Self {
+        let loops = ranges
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (LoopRef::Range(i), l.header_bb, l.own_blocks()))
+            .chain(
+                whiles
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| (LoopRef::While(i), l.header_bb, l.own_blocks())),
+            );
+        let mut init_list = Vec::new();
+        let mut regions = Vec::new();
+        for (loop_ref, header_bb, own) in loops {
+            let own_set: HashSet<BasicBlock> = own.iter().copied().collect();
+            if let Some(init_bb) = find_loop_init_bb(mir, header_bb, &own_set) {
+                init_list.push((init_bb, loop_ref));
+            }
+            regions.push((header_bb, own));
+        }
+        let mut nest = LoopNest {
+            ranges,
+            whiles,
+            inits: init_list.iter().copied().collect(),
+            top_level_inits: HashMap::new(),
+            regions,
+        };
+        let loop_blocks = nest.loop_blocks();
+        nest.top_level_inits =
+            init_list.into_iter().filter(|(init_bb, _)| !loop_blocks.contains(init_bb)).collect();
+        nest
+    }
+
+    /// Every block owned by some loop.
+    fn loop_blocks(&self) -> HashSet<BasicBlock> {
+        self.regions.iter().flat_map(|(_, own)| own.iter().copied()).collect()
+    }
+
+    /// The blocks owned by loops whose header lies in `body`, i.e. loops nested (at any depth) in
+    /// the loop with that body. The enclosing body skips them: the nested loop lowers them.
+    fn nested_blocks(&self, body: &[BasicBlock]) -> HashSet<BasicBlock> {
+        let body: HashSet<BasicBlock> = body.iter().copied().collect();
+        self.regions
+            .iter()
+            .filter(|(header_bb, _)| body.contains(header_bb))
+            .flat_map(|(_, own)| own.iter().copied())
+            .collect()
+    }
+}
+
 /// Information about a detected `while cond { body }` loop in the MIR.
 #[derive(Debug)]
 struct WhileLoopInfo {
@@ -358,6 +472,25 @@ struct WhileLoopInfo {
     exit_bb: BasicBlock,
     /// Locals that carry values across iterations (includes the condition-tested counter).
     iter_carry_locals: Vec<Local>,
+}
+
+impl RangeLoopInfo {
+    /// The header, the `Option` plumbing of an inlined or called `next`, and the body.
+    fn own_blocks(&self) -> Vec<BasicBlock> {
+        [self.header_bb]
+            .into_iter()
+            .chain(self.switch_bb)
+            .chain(self.extra_loop_region_bbs.iter().copied())
+            .chain(self.body_bbs.iter().copied())
+            .collect()
+    }
+}
+
+impl WhileLoopInfo {
+    /// The header and the body.
+    fn own_blocks(&self) -> Vec<BasicBlock> {
+        [self.header_bb].into_iter().chain(self.body_bbs.iter().copied()).collect()
+    }
 }
 
 /// Pre-scan all MIR blocks to collect statically-known discriminant values.
@@ -776,21 +909,22 @@ fn compute_phi_join_locals<'tcx>(
     result
 }
 
-/// The block outside every loop region that enters the loop at `header_bb` with a plain `goto`.
+/// The block outside the loop that enters it at `header_bb` with a plain `goto`. For a nested
+/// loop that block lies inside the enclosing loop's body.
 ///
 /// Block indices say nothing about where the init block sits relative to the header: when one
 /// loop's exit flows straight into the next loop, MIR can number that shared exit/init block
 /// after the second loop's header (teenygrad#156). The back edge needs no index test to exclude
-/// it either, since it lies inside the loop's own region.
+/// it either, since it lies inside the loop's own blocks.
 fn find_loop_init_bb(
     mir: &Body<'_>,
     header_bb: BasicBlock,
-    loop_region_blocks: &HashSet<BasicBlock>,
+    own_blocks: &HashSet<BasicBlock>,
 ) -> Option<BasicBlock> {
     use rustc_middle::mir::TerminatorKind;
 
     mir.basic_blocks.indices().find(|bb| {
-        !loop_region_blocks.contains(bb)
+        !own_blocks.contains(bb)
             && matches!(
                 &mir.basic_blocks[*bb].terminator().kind,
                 TerminatorKind::Goto { target } if *target == header_bb
@@ -835,7 +969,7 @@ fn detect_range_loop<'tcx>(
 /// (not matched by the Range-loop detector as having an Option::Some induction var).
 fn detect_while_loop<'tcx>(
     mir: &Body<'tcx>,
-    range_loop_blocks: &HashSet<BasicBlock>,
+    range_loop_headers: &HashSet<BasicBlock>,
 ) -> Vec<WhileLoopInfo> {
     use rustc_middle::mir::TerminatorKind;
 
@@ -846,16 +980,13 @@ fn detect_while_loop<'tcx>(
                 let header_bb = *target;
                 let back_edge_bb = bb;
 
-                // Skip blocks already claimed by a Range-based for-loop.
-                if range_loop_blocks.contains(&header_bb)
-                    || range_loop_blocks.contains(&back_edge_bb)
-                {
+                // A `for` loop's own back edge. Only headers are checked: a `while` loop may sit
+                // inside a `for` loop's body or contain one, and is lowered nested in it.
+                if range_loop_headers.contains(&header_bb) {
                     continue;
                 }
 
-                if let Some(info) =
-                    try_build_while_loop_info(mir, header_bb, back_edge_bb, range_loop_blocks)
-                {
+                if let Some(info) = try_build_while_loop_info(mir, header_bb, back_edge_bb) {
                     loops.push(info);
                 }
             }
@@ -868,7 +999,6 @@ fn try_build_while_loop_info<'tcx>(
     mir: &Body<'tcx>,
     header_bb: BasicBlock,
     back_edge_bb: BasicBlock,
-    range_loop_blocks: &HashSet<BasicBlock>,
 ) -> Option<WhileLoopInfo> {
     use rustc_middle::mir::TerminatorKind;
 
@@ -890,12 +1020,8 @@ fn try_build_while_loop_info<'tcx>(
             return None;
         };
 
-    // Collect body blocks, excluding any already in a range-loop region.
     let body_bbs = collect_body_blocks_ordered(mir, body_entry_bb, header_bb);
     if body_bbs.is_empty() || !body_bbs.contains(&back_edge_bb) {
-        return None;
-    }
-    if body_bbs.iter().any(|bb| range_loop_blocks.contains(bb)) {
         return None;
     }
 
@@ -1090,7 +1216,7 @@ fn try_build_range_loop_info<'tcx>(
     // shown this is an `Iterator::next` loop (it switches on the `Option` next returns), but a
     // bare `counter < end` header without one is just as likely a hand-written `while` loop,
     // which must not become a counted scf.for (teenyc-3jo).
-    let induction_local = find_induction_local_in_bbs(mir, &body_bbs);
+    let induction_local = find_induction_local(mir, hinfo.body_entry_bb, hinfo.next_result_local);
     if induction_local.is_none() && hinfo.switch_bb.is_none() {
         return None;
     }
@@ -1342,28 +1468,30 @@ fn collect_body_blocks_ordered<'tcx>(
     result
 }
 
-/// Find the induction local: a local assigned via a downcast+field projection on an Option local.
-fn find_induction_local_in_bbs<'tcx>(mir: &Body<'tcx>, body_bbs: &[BasicBlock]) -> Option<Local> {
-    for &bb in body_bbs {
-        for stmt in &mir.basic_blocks[bb].statements {
-            if let StatementKind::Assign(assign) = &stmt.kind {
-                let (dest, rvalue) = assign.as_ref();
-                if dest.projection.is_empty() {
-                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = rvalue {
-                        // Downcast+field projection = Option::Some unwrap
-                        let has_downcast = src
-                            .projection
-                            .iter()
-                            .any(|p| matches!(p, ProjectionElem::Downcast(_, _)));
-                        if has_downcast {
-                            return Some(dest.local);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+/// The induction local: the loop variable, taken out of the `Some` that `next` returned, at the
+/// start of the body. `next_result` is that `Option` when the header shows it.
+///
+/// Only the body's entry block is searched. Further in, the downcast found may be a nested loop's
+/// own, which would map the inner loop's variable to the outer loop's induction value and let an
+/// outer `while` or `for _` loop pass as one that reads its variable (teenygrad#155).
+fn find_induction_local(
+    mir: &Body<'_>,
+    body_entry_bb: BasicBlock,
+    next_result: Option<Local>,
+) -> Option<Local> {
+    mir.basic_blocks[body_entry_bb].statements.iter().find_map(|stmt| {
+        let StatementKind::Assign(assign) = &stmt.kind else {
+            return None;
+        };
+        let (dest, rvalue) = assign.as_ref();
+        let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = rvalue else {
+            return None;
+        };
+        let is_some_payload =
+            src.projection.iter().any(|p| matches!(p, ProjectionElem::Downcast(_, _)));
+        let from_next = next_result.is_none_or(|next| next == src.local);
+        (dest.projection.is_empty() && is_some_payload && from_next).then_some(dest.local)
+    })
 }
 
 /// Find loop-carried locals: call-destination locals that are used before their first assignment
@@ -1763,19 +1891,22 @@ impl<'a> TritonCodegen<'a> {
     }
 
     /// Generate a `scf.for` loop for a detected Range-based loop, emitting the op into
-    /// `init_mlir_block`. After the loop, control branches to `loop_info.exit_bb`.
+    /// `init_mlir_block`. After the loop, `exit` says whether control branches to
+    /// `loop_info.exit_bb` or carries on in `init_mlir_block`.
     #[allow(clippy::too_many_arguments)]
     fn codegen_scf_for_loop<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         instance: &Instance<'tcx>,
         mir: &Body<'tcx>,
+        nest: &LoopNest<'_>,
         loop_info: &RangeLoopInfo,
         init_mlir_block: &BlockRef<'a, 'a>,
         func_op: &Operation<'a>,
         state: &mut CodegenState<'a, 'a>,
         outer_basic_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
         location: Location<'a>,
+        exit: LoopExit,
     ) -> Result<(), MlirError> {
         let ctx = self.module.context();
         let i32_ty: melior::ir::Type<'_> = IntegerType::new(ctx, 32).into();
@@ -1876,24 +2007,18 @@ impl<'a> TritonCodegen<'a> {
         state.loop_body_bbs = loop_info.body_bbs.iter().copied().collect();
         state.loop_back_edge_bb = Some(loop_info.back_edge_bb);
 
-        // Process each body block in execution order.
-        for &body_bb in &loop_info.body_bbs {
-            if state.skip_bbs.contains(&body_bb) {
-                // Already processed inline inside a scf.if arm by the loop-body SwitchInt handler.
-                continue;
-            }
-            let bb_data = &mir.basic_blocks[body_bb];
-            self.codegen_basic_block(
-                tcx,
-                instance,
-                mir,
-                body_bb,
-                bb_data,
-                func_op,
-                state,
-                &combined_blocks,
-            )?;
-        }
+        self.codegen_loop_body(
+            tcx,
+            instance,
+            mir,
+            nest,
+            &loop_info.body_bbs,
+            &body_block_ref,
+            func_op,
+            state,
+            &combined_blocks,
+            location,
+        )?;
 
         // Clear loop context.
         state.loop_header_bb = None;
@@ -1915,13 +2040,14 @@ impl<'a> TritonCodegen<'a> {
             state.ssa_values.insert(local, for_results[i]);
         }
 
-        // Branch to the exit block.
-        let exit_block = *outer_basic_blocks.get(&loop_info.exit_bb).unwrap_or_else(|| {
-            panic!("scf.for: exit block {:?} not in basic_blocks", loop_info.exit_bb)
-        });
-        let br_op = rustc_mlir::shared::cf::create_cf_br(ctx, location, &exit_block)
-            .map_err(|e| MlirError::CreateOperation { err: e })?;
-        init_mlir_block.append_operation(br_op.into());
+        if exit == LoopExit::Branch {
+            let exit_block = *outer_basic_blocks.get(&loop_info.exit_bb).unwrap_or_else(|| {
+                panic!("scf.for: exit block {:?} not in basic_blocks", loop_info.exit_bb)
+            });
+            let br_op = rustc_mlir::shared::cf::create_cf_br(ctx, location, &exit_block)
+                .map_err(|e| MlirError::CreateOperation { err: e })?;
+            init_mlir_block.append_operation(br_op.into());
+        }
 
         Ok(())
     }
@@ -1934,12 +2060,14 @@ impl<'a> TritonCodegen<'a> {
         tcx: TyCtxt<'tcx>,
         instance: &Instance<'tcx>,
         mir: &Body<'tcx>,
+        nest: &LoopNest<'_>,
         loop_info: &WhileLoopInfo,
         init_mlir_block: &BlockRef<'a, 'a>,
         func_op: &Operation<'a>,
         state: &mut CodegenState<'a, 'a>,
         outer_basic_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
         location: Location<'a>,
+        exit: LoopExit,
     ) -> Result<(), MlirError> {
         let ctx = self.module.context();
 
@@ -2052,20 +2180,18 @@ impl<'a> TritonCodegen<'a> {
         state.loop_iter_carry_locals = loop_info.iter_carry_locals.clone();
         state.loop_body_bbs = loop_info.body_bbs.iter().copied().collect();
 
-        // Codegen each body block into the single after_block.
-        for &body_bb in &loop_info.body_bbs {
-            let bb_data = &mir.basic_blocks[body_bb];
-            self.codegen_basic_block(
-                tcx,
-                instance,
-                mir,
-                body_bb,
-                bb_data,
-                func_op,
-                state,
-                &combined_blocks,
-            )?;
-        }
+        self.codegen_loop_body(
+            tcx,
+            instance,
+            mir,
+            nest,
+            &loop_info.body_bbs,
+            &after_block_ref,
+            func_op,
+            state,
+            &combined_blocks,
+            location,
+        )?;
 
         // Clear loop context.
         state.loop_header_bb = None;
@@ -2085,14 +2211,95 @@ impl<'a> TritonCodegen<'a> {
             state.ssa_values.insert(local, while_results[i]);
         }
 
-        // Branch from the init block to the exit block.
-        let exit_block = *outer_basic_blocks.get(&loop_info.exit_bb).unwrap_or_else(|| {
-            panic!("scf.while: exit block {:?} not in basic_blocks", loop_info.exit_bb)
-        });
-        let br_op = rustc_mlir::shared::cf::create_cf_br(ctx, location, &exit_block)
-            .map_err(|e| MlirError::CreateOperation { err: e })?;
-        init_mlir_block.append_operation(br_op.into());
+        if exit == LoopExit::Branch {
+            let exit_block = *outer_basic_blocks.get(&loop_info.exit_bb).unwrap_or_else(|| {
+                panic!("scf.while: exit block {:?} not in basic_blocks", loop_info.exit_bb)
+            });
+            let br_op = rustc_mlir::shared::cf::create_cf_br(ctx, location, &exit_block)
+                .map_err(|e| MlirError::CreateOperation { err: e })?;
+            init_mlir_block.append_operation(br_op.into());
+        }
 
+        Ok(())
+    }
+
+    /// Lower a loop's body blocks, in execution order, into its single MLIR body block.
+    ///
+    /// A loop nested in the body is built in place where its init block is reached, and the
+    /// blocks it owns are left to it. Lowering them here instead, one after the other, turned
+    /// the nested loop's header into an `scf.if` and dropped its back edge as a jump within the
+    /// body, so it ran once (teenygrad#155).
+    #[allow(clippy::too_many_arguments)]
+    fn codegen_loop_body<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        nest: &LoopNest<'_>,
+        body_bbs: &[BasicBlock],
+        body_block: &BlockRef<'a, 'a>,
+        func_op: &Operation<'a>,
+        state: &mut CodegenState<'a, 'a>,
+        body_blocks: &HashMap<BasicBlock, BlockRef<'a, 'a>>,
+        location: Location<'a>,
+    ) -> Result<(), MlirError> {
+        let nested_blocks = nest.nested_blocks(body_bbs);
+        for &body_bb in body_bbs {
+            // Already lowered inside an scf.if arm by the loop-body SwitchInt handler, or lowered
+            // by the nested loop that owns it.
+            if state.skip_bbs.contains(&body_bb) || nested_blocks.contains(&body_bb) {
+                continue;
+            }
+            let bb_data = &mir.basic_blocks[body_bb];
+            let Some(&nested) = nest.inits.get(&body_bb) else {
+                self.codegen_basic_block(
+                    tcx,
+                    instance,
+                    mir,
+                    body_bb,
+                    bb_data,
+                    func_op,
+                    state,
+                    body_blocks,
+                )?;
+                continue;
+            };
+            // The init block's statements, then the nested loop in place of its `goto header`.
+            for stmt in &bb_data.statements {
+                self.codegen_statement(tcx, instance, mir, stmt, body_block, state)?;
+            }
+            let enclosing = state.take_loop_context();
+            let result = match nested {
+                LoopRef::Range(i) => self.codegen_scf_for_loop(
+                    tcx,
+                    instance,
+                    mir,
+                    nest,
+                    &nest.ranges[i],
+                    body_block,
+                    func_op,
+                    state,
+                    body_blocks,
+                    location,
+                    LoopExit::FallThrough,
+                ),
+                LoopRef::While(i) => self.codegen_scf_while_loop(
+                    tcx,
+                    instance,
+                    mir,
+                    nest,
+                    &nest.whiles[i],
+                    body_block,
+                    func_op,
+                    state,
+                    body_blocks,
+                    location,
+                    LoopExit::FallThrough,
+                ),
+            };
+            state.restore_loop_context(enclosing);
+            result?;
+        }
         Ok(())
     }
 
@@ -2214,47 +2421,21 @@ impl<'a> TritonCodegen<'a> {
         }
         state.set_multiply_assigned(&Rc::new(multiply_assigned));
 
-        // The set of MIR blocks that belong to any scf.for region.
-        let mut loop_region_blocks: HashSet<BasicBlock> = HashSet::new();
-        for l in &loop_infos {
-            loop_region_blocks.insert(l.header_bb);
-            if let Some(switch_bb) = l.switch_bb {
-                loop_region_blocks.insert(switch_bb);
-            }
-            for &b in &l.extra_loop_region_bbs {
-                loop_region_blocks.insert(b);
-            }
-            for &b in &l.body_bbs {
-                loop_region_blocks.insert(b);
-            }
-        }
+        // Detect while loops (after range loops, so they don't claim a `for` loop's header).
+        let range_loop_headers: HashSet<BasicBlock> =
+            loop_infos.iter().map(|l| l.header_bb).collect();
+        let while_loop_infos = detect_while_loop(mir, &range_loop_headers);
 
-        // Detect while loops (must run after range-loop detection so we can exclude their blocks).
-        let while_loop_infos = detect_while_loop(mir, &loop_region_blocks);
-        for wl in &while_loop_infos {
-            loop_region_blocks.insert(wl.header_bb);
-            for &b in &wl.body_bbs {
-                loop_region_blocks.insert(b);
-            }
-        }
+        // Loop bodies live in scf.for / scf.while regions, not in the function region.
+        let nest = LoopNest::new(mir, &loop_infos, &while_loop_infos);
+        let loop_region_blocks = nest.loop_blocks();
 
-        // Map from init_bb → index into loop_infos for each scf.for loop.
-        // The "init block" ends with `goto → header_bb`; we intercept it to emit scf.for.
-        let mut loop_init_bb_map: HashMap<BasicBlock, usize> = HashMap::new();
-        for (loop_idx, l) in loop_infos.iter().enumerate() {
-            if let Some(init_bb) = find_loop_init_bb(mir, l.header_bb, &loop_region_blocks) {
-                loop_init_bb_map.insert(init_bb, loop_idx);
-            }
-        }
-
-        // Map from init_bb → index into while_loop_infos for each scf.while loop.
-        // The "init block" ends with `goto → header_bb`; we intercept it to emit scf.while.
-        let mut while_loop_init_bb_map: HashMap<BasicBlock, usize> = HashMap::new();
-        for (loop_idx, wl) in while_loop_infos.iter().enumerate() {
-            if let Some(init_bb) = find_loop_init_bb(mir, wl.header_bb, &loop_region_blocks) {
-                while_loop_init_bb_map.insert(init_bb, loop_idx);
-            }
-        }
+        // Outermost loops, by the block that enters them: its `goto → header_bb` is intercepted
+        // to emit the loop. Loops whose init block lies in another loop's body are built by that
+        // loop.
+        let top_level_inits = &nest.top_level_inits;
+        state.nested_loop_inits =
+            nest.inits.keys().filter(|bb| !top_level_inits.contains_key(bb)).copied().collect();
 
         // Compute phi (block-argument) locals for join blocks in the non-loop CFG.
         let phi_join_locals =
@@ -2305,43 +2486,40 @@ impl<'a> TritonCodegen<'a> {
                 continue; // Handled inside codegen_scf_for_loop / codegen_scf_while_loop.
             }
 
-            if let Some(&loop_idx) = loop_init_bb_map.get(&bb) {
-                // Process init-block statements only, then build the scf.for in-place.
+            if let Some(&loop_ref) = top_level_inits.get(&bb) {
+                // Process init-block statements only, then build the loop in place.
                 let init_mlir_block = *basic_blocks.get(&bb).expect("init block");
                 for stmt in &bb_data.statements {
                     self.codegen_statement(tcx, instance, mir, stmt, &init_mlir_block, &mut state)?;
                 }
-                self.codegen_scf_for_loop(
-                    tcx,
-                    instance,
-                    mir,
-                    &loop_infos[loop_idx],
-                    &init_mlir_block,
-                    &func_op,
-                    &mut state,
-                    &basic_blocks,
-                    location,
-                )?;
-                continue;
-            }
-
-            if let Some(&loop_idx) = while_loop_init_bb_map.get(&bb) {
-                // Process init-block statements only, then build the scf.while in-place.
-                let init_mlir_block = *basic_blocks.get(&bb).expect("while init block");
-                for stmt in &bb_data.statements {
-                    self.codegen_statement(tcx, instance, mir, stmt, &init_mlir_block, &mut state)?;
+                match loop_ref {
+                    LoopRef::Range(i) => self.codegen_scf_for_loop(
+                        tcx,
+                        instance,
+                        mir,
+                        &nest,
+                        &loop_infos[i],
+                        &init_mlir_block,
+                        &func_op,
+                        &mut state,
+                        &basic_blocks,
+                        location,
+                        LoopExit::Branch,
+                    )?,
+                    LoopRef::While(i) => self.codegen_scf_while_loop(
+                        tcx,
+                        instance,
+                        mir,
+                        &nest,
+                        &while_loop_infos[i],
+                        &init_mlir_block,
+                        &func_op,
+                        &mut state,
+                        &basic_blocks,
+                        location,
+                        LoopExit::Branch,
+                    )?,
                 }
-                self.codegen_scf_while_loop(
-                    tcx,
-                    instance,
-                    mir,
-                    &while_loop_infos[loop_idx],
-                    &init_mlir_block,
-                    &func_op,
-                    &mut state,
-                    &basic_blocks,
-                    location,
-                )?;
                 continue;
             }
 

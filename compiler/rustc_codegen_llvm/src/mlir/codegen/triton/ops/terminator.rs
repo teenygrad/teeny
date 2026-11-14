@@ -1137,6 +1137,19 @@ impl<'a> TritonCodegen<'a> {
         let true_chain = collect_arm_chain(mir, true_target, back_edge_bb, &loop_body_bbs);
         let false_chain = collect_arm_chain(mir, false_target, back_edge_bb, &loop_body_bbs);
 
+        // An arm is lowered as a straight chain of blocks, so a loop it reaches can't be built
+        // here; lowering the chain anyway would drop the loop and miscompile silently.
+        if let Some(&init_bb) =
+            true_chain.iter().chain(&false_chain).find(|bb| state.nested_loop_inits.contains(bb))
+        {
+            return Err(MlirError::CodegenFailed {
+                err: format!(
+                    "a loop entered at {init_bb:?} is inside an `if` (or follows one) in a loop \
+                     body, which isn't supported yet (teenyc-9nm)"
+                ),
+            });
+        }
+
         let iter_carry_types: Vec<melior::ir::Type<'a>> = iter_carry_locals
             .iter()
             .map(|local| {
