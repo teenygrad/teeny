@@ -250,3 +250,33 @@ fn riscv_target_lowers_back_to_back_loops() {
     let result = try_compile(&src, "riscv64-generic", "riscv_back_to_back_loops", &["--emit=asm"]);
     assert!(result.is_ok(), "expected back-to-back loops to compile for RISC-V: {result:?}");
 }
+
+/// `(lower, upper)` operands of each `scf.for` in `mlir`, in order.
+fn scf_for_bounds(mlir: &str) -> Vec<(String, String)> {
+    mlir.lines()
+        .filter_map(|line| {
+            let rest = line.split_once("scf.for ")?.1;
+            let (_, rest) = rest.split_once(" = ")?;
+            let (lower, rest) = rest.split_once(" to ")?;
+            let (upper, _) = rest.split_once(" step ")?;
+            Some((lower.to_string(), upper.to_string()))
+        })
+        .collect()
+}
+
+#[test]
+fn riscv_target_lowers_each_loop_over_its_own_range() {
+    // teenyc-16j: each scf.for must run over its own loop's range. The lowering started every
+    // loop at 0, so `START..n` ran n times instead of n - START. `entry_point(n, s, m)` runs
+    // `3..n` and then `s..m`.
+    let src = data_file("triton_range_bounds.rs");
+    let result = try_compile(&src, "riscv64-generic", "riscv_range_bounds", &["--emit=asm"]);
+    assert!(result.is_ok(), "expected the range-bounds kernel to compile: {result:?}");
+
+    let mlir = std::fs::read_to_string("/tmp/kernel-riscv_range_bounds.mlir")
+        .expect("read the kernel's MLIR");
+    let bounds = scf_for_bounds(&mlir);
+    let expected = [("%c3_i32", "%arg0"), ("%arg1", "%arg2")]
+        .map(|(lower, upper)| (lower.to_string(), upper.to_string()));
+    assert_eq!(bounds, expected, "scf.for bounds in:\n{mlir}");
+}
