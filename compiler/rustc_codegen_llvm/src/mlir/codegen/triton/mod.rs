@@ -765,6 +765,28 @@ fn compute_phi_join_locals<'tcx>(
     result
 }
 
+/// The block outside every loop region that enters the loop at `header_bb` with a plain `goto`.
+///
+/// Block indices say nothing about where the init block sits relative to the header: when one
+/// loop's exit flows straight into the next loop, MIR can number that shared exit/init block
+/// after the second loop's header (teenygrad#156). The back edge needs no index test to exclude
+/// it either, since it lies inside the loop's own region.
+fn find_loop_init_bb(
+    mir: &Body<'_>,
+    header_bb: BasicBlock,
+    loop_region_blocks: &HashSet<BasicBlock>,
+) -> Option<BasicBlock> {
+    use rustc_middle::mir::TerminatorKind;
+
+    mir.basic_blocks.indices().find(|bb| {
+        !loop_region_blocks.contains(bb)
+            && matches!(
+                &mir.basic_blocks[*bb].terminator().kind,
+                TerminatorKind::Goto { target } if *target == header_bb
+            )
+    })
+}
+
 /// Detect all Range-based `for` loops in the MIR body.
 fn detect_range_loop<'tcx>(instance: Instance<'tcx>, mir: &Body<'tcx>) -> Vec<RangeLoopInfo> {
     use rustc_middle::mir::TerminatorKind;
@@ -2150,18 +2172,7 @@ impl<'a> TritonCodegen<'a> {
         // The "init block" ends with `goto → header_bb`; we intercept it to emit scf.for.
         let mut loop_init_bb_map: HashMap<BasicBlock, usize> = HashMap::new();
         for (loop_idx, l) in loop_infos.iter().enumerate() {
-            if let Some(init_bb) = mir.basic_blocks.indices().find(|&bb| {
-                if loop_region_blocks.contains(&bb) {
-                    return false;
-                }
-                if bb >= l.header_bb {
-                    return false;
-                }
-                matches!(
-                    &mir.basic_blocks[bb].terminator().kind,
-                    rustc_middle::mir::TerminatorKind::Goto { target } if *target == l.header_bb
-                )
-            }) {
+            if let Some(init_bb) = find_loop_init_bb(mir, l.header_bb, &loop_region_blocks) {
                 loop_init_bb_map.insert(init_bb, loop_idx);
             }
         }
@@ -2170,18 +2181,7 @@ impl<'a> TritonCodegen<'a> {
         // The "init block" ends with `goto → header_bb`; we intercept it to emit scf.while.
         let mut while_loop_init_bb_map: HashMap<BasicBlock, usize> = HashMap::new();
         for (loop_idx, wl) in while_loop_infos.iter().enumerate() {
-            if let Some(init_bb) = mir.basic_blocks.indices().find(|&bb| {
-                if loop_region_blocks.contains(&bb) {
-                    return false;
-                }
-                if bb >= wl.header_bb {
-                    return false;
-                }
-                matches!(
-                    &mir.basic_blocks[bb].terminator().kind,
-                    rustc_middle::mir::TerminatorKind::Goto { target } if *target == wl.header_bb
-                )
-            }) {
+            if let Some(init_bb) = find_loop_init_bb(mir, wl.header_bb, &loop_region_blocks) {
                 while_loop_init_bb_map.insert(init_bb, loop_idx);
             }
         }
