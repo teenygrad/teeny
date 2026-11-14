@@ -208,6 +208,9 @@ void CpuBackend::loadDialects(MLIRContext &context) {
 }
 
 LogicalResult CpuBackend::makeTTIR(MLIRContext &context, ModuleOp module) {
+  auto structured = structureControlFlow(context, module);
+  CHECK_RESULT(structured, "Failed to structure control flow.");
+
   PassManager pm(&context);
   if (m_debug) {
     pm.enableIRPrinting();

@@ -19,14 +19,142 @@
 #include <vector>
 
 #include "Backend.h"
+#include "UpliftWhileToFor.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/Transforms/CFGToSCF.h"
+
+#include "triton/Dialect/Triton/IR/Dialect.h"
 
 namespace mlir {
 namespace triton {
+
+namespace {
+
+/// MLIR's CFG-to-SCF lifting for `tt.func`. The stock transformation
+/// (ControlFlowToSCFTransformation, producing scf/cf/arith/ub ops) ends an
+/// infinite loop's region with `func.return`, so it only works on `func.func`;
+/// this one ends it with `tt.return` of poison values instead.
+///
+/// It wraps the stock transformation rather than subclassing it: LLVM is built
+/// without RTTI, so that class has no typeinfo for a subclass in this
+/// RTTI-enabled library to refer to. CFGToSCFInterface is header-only.
+class TritonControlFlowToSCF : public CFGToSCFInterface {
+public:
+  bool canConvertMultiSuccessorBranchOp(Operation *op) override {
+    return m_cf.canConvertMultiSuccessorBranchOp(op);
+  }
+
+  FailureOr<Operation *>
+  createStructuredBranchRegionOp(OpBuilder &builder, Operation *condOp,
+                                 TypeRange resultTypes,
+                                 MutableArrayRef<Region> regions) override {
+    return m_cf.createStructuredBranchRegionOp(builder, condOp, resultTypes,
+                                               regions);
+  }
+
+  LogicalResult createStructuredBranchRegionTerminatorOp(
+      Location loc, OpBuilder &builder, Operation *branchRegionOp,
+      Operation *replacedControlFlowOp, ValueRange results) override {
+    return m_cf.createStructuredBranchRegionTerminatorOp(
+        loc, builder, branchRegionOp, replacedControlFlowOp, results);
+  }
+
+  FailureOr<Operation *>
+  createStructuredDoWhileLoopOp(OpBuilder &builder, Operation *replacedOp,
+                                ValueRange loopVariablesInit, Value condition,
+                                ValueRange loopVariablesNextIter,
+                                Region &&loopBody) override {
+    return m_cf.createStructuredDoWhileLoopOp(
+        builder, replacedOp, loopVariablesInit, condition,
+        loopVariablesNextIter, std::move(loopBody));
+  }
+
+  Value getCFGSwitchValue(Location loc, OpBuilder &builder,
+                          unsigned value) override {
+    return m_cf.getCFGSwitchValue(loc, builder, value);
+  }
+
+  void createCFGSwitchOp(Location loc, OpBuilder &builder, Value flag,
+                         ArrayRef<unsigned> caseValues,
+                         BlockRange caseDestinations,
+                         ArrayRef<ValueRange> caseArguments, Block *defaultDest,
+                         ValueRange defaultArgs) override {
+    m_cf.createCFGSwitchOp(loc, builder, flag, caseValues, caseDestinations,
+                           caseArguments, defaultDest, defaultArgs);
+  }
+
+  Value getUndefValue(Location loc, OpBuilder &builder, Type type) override {
+    return m_cf.getUndefValue(loc, builder, type);
+  }
+
+  FailureOr<Operation *> createUnreachableTerminator(Location loc,
+                                                     OpBuilder &builder,
+                                                     Region &region) override {
+    auto func = dyn_cast<FuncOp>(region.getParentOp());
+    if (!func)
+      return emitError(loc, "cannot create an unreachable terminator for '")
+             << region.getParentOp()->getName() << "'";
+    auto results = llvm::map_to_vector(func.getResultTypes(), [&](Type type) {
+      return getUndefValue(loc, builder, type);
+    });
+    return ReturnOp::create(builder, loc, results).getOperation();
+  }
+
+private:
+  ControlFlowToSCFTransformation m_cf;
+};
+
+/// A zero of `type`, for an integer, index, float or Triton pointer type, or a
+/// ranked tensor of one; null for any other type.
+Value createZero(OpBuilder &builder, Location loc, Type type) {
+  auto tensor = dyn_cast<RankedTensorType>(type);
+  Type element = tensor ? tensor.getElementType() : type;
+  if (isa<IntegerType, IndexType, FloatType>(element)) {
+    TypedAttr zero = builder.getZeroAttr(element);
+    if (tensor)
+      zero = DenseElementsAttr::get(tensor, zero);
+    return arith::ConstantOp::create(builder, loc, zero);
+  }
+  if (isa<PointerType>(element)) {
+    Value address = arith::ConstantOp::create(builder, loc,
+                                              builder.getI64IntegerAttr(0));
+    Value null = IntToPtrOp::create(builder, loc, element, address);
+    return tensor ? SplatOp::create(builder, loc, tensor, null).getResult()
+                  : null;
+  }
+  return {};
+}
+
+/// Replaces each `ub.poison` in `module` with a zero of its type.
+///
+/// The CFG-to-SCF lifting passes poison for a value on a path where it is
+/// undefined, i.e. never read. Not every backend lowers poison: TritonCPU
+/// converts tensors to vectors but leaves `ub.poison` tensor-typed, so it
+/// can't be translated to LLVM IR. A zero is equally unobservable there.
+void replacePoisonWithZeros(ModuleOp module) {
+  SmallVector<ub::PoisonOp> poisons;
+  module.walk([&](ub::PoisonOp poison) { poisons.push_back(poison); });
+  for (ub::PoisonOp poison : poisons) {
+    OpBuilder builder(poison);
+    if (Value zero = createZero(builder, poison.getLoc(), poison.getType())) {
+      poison.replaceAllUsesWith(zero);
+      poison.erase();
+    }
+  }
+}
+
+} // namespace
 
 /// Replace every `cf.cond_br %c, ^bb, ^bb` with `cf.br ^bb` in the module.
 ///
@@ -73,6 +201,60 @@ void Backend::initializeLLVMTargets() {
     llvm::InitializeAllAsmParsers();
     llvm::InitializeAllAsmPrinters();
   });
+}
+
+LogicalResult Backend::structureControlFlow(MLIRContext &context,
+                                            ModuleOp module) {
+  // The lifting creates scf, cf (intermediate switches), arith (switch
+  // values) and ub (poison) operations.
+  context.loadDialect<scf::SCFDialect, cf::ControlFlowDialect,
+                      arith::ArithDialect, ub::UBDialect>();
+
+  TritonControlFlowToSCF transformation;
+  bool failedToLift = false;
+  module.walk([&](FuncOp func) {
+    if (func.getBody().empty())
+      return WalkResult::advance();
+    DominanceInfo dominance(func);
+    // Innermost regions first, as LiftControlFlowToSCF does, so a region's
+    // structured ops are already in place when its parent is lifted.
+    auto lift = [&](Operation *op) {
+      for (Region &region : op->getRegions()) {
+        if (failed(transformCFGToSCF(region, transformation, dominance)))
+          return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    };
+    if (func->walk<WalkOrder::PostOrder>(lift).wasInterrupted()) {
+      failedToLift = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (failedToLift) {
+    m_last_error = std::make_optional(Error::InvalidPass);
+    m_last_error_string = "Failed to structure control flow";
+    return failure();
+  }
+
+  // The lifted loops are do-while `scf.while`s carrying their condition;
+  // canonicalization reduces counted ones to the form that the uplift
+  // recognises (a single compare in `before`, the induction variable advanced
+  // by a loop-invariant step).
+  PassManager pm(&context);
+  pm.addPass(createCanonicalizerPass());
+  if (failed(pm.run(module.getOperation())))
+    return failure();
+
+  upliftWhileLoopsToFor(module);
+  // Folds the uplift's leftovers (the unused exit computations among them).
+  PassManager cleanup(&context);
+  cleanup.addPass(createCanonicalizerPass());
+  if (failed(cleanup.run(module.getOperation())))
+    return failure();
+
+  replacePoisonWithZeros(module);
+  return success();
 }
 
 LogicalResult Backend::applyPasses(MLIRContext &context, ModuleOp module,

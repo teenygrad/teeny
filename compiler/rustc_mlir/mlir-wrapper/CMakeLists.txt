@@ -78,10 +78,17 @@ set(WRAPPER_SOURCES
     triton/backend/CudaBackend.cpp
     triton/backend/CpuBackend.cpp
     triton/backend/RiscvBackend.cpp
+    triton/backend/UpliftWhileToFor.cpp
 )
 
 # Create static library
 add_library(mlir-wrapper STATIC ${WRAPPER_SOURCES})
+
+# UpliftWhileToFor.cpp instantiates an MLIR rewriter, whose vtable references
+# typeinfo that LLVM (built without RTTI) doesn't have, so it is compiled
+# without RTTI too.
+set_source_files_properties(triton/backend/UpliftWhileToFor.cpp PROPERTIES
+    COMPILE_OPTIONS -fno-rtti)
 
 # riscv64 libsleef.a cross-built by rustc_mlir/build.rs, which RiscvBackend
 # links into kernels that call SLEEF. Empty when it could not be built.

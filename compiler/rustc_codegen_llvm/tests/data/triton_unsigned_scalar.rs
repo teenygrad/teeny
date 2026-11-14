@@ -40,8 +40,9 @@ include!("triton_prelude.rs");
 // casts were emitted with the signed op. `n`, `m` and `x` are kernel arguments, so no operation
 // can fold.
 fn unsigned_scalar<T: Triton, const BLOCK_SIZE: i32>(n: u32, m: u32, x: f32) {
-    // div.u32, rem.u32 and setp.lt.u32.
-    let q = if n < m { n / m } else { n % m };
+    // div.u32, rem.u32 and setp.lt.u32. Each arm's op must survive knowing `n < m` (or not):
+    // `n / m` there is known to be 0, which LLVM folds away.
+    let q = if n < m { m / n } else { n % m };
     let u_ptrs = T::zeros::<T::Pointer<u32>>(&[BLOCK_SIZE]);
     T::store::<u32, 1>(u_ptrs, T::full::<u32>(&[BLOCK_SIZE], q), None, &[0], None, None);
     // cvt.rzi.u32.f32 and cvt.rn.f32.u32.

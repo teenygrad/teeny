@@ -153,6 +153,17 @@ public:
   virtual LogicalResult applyPasses(MLIRContext &context, ModuleOp module,
                                     Language language);
 
+  /// Structures the control flow of every `tt.func` in `module`: lifts its
+  /// `cf` branches into `scf.if` / `scf.while` (MLIR's CFG-to-SCF lifting),
+  /// canonicalizes, and uplifts counted `scf.while` loops to `scf.for`.
+  ///
+  /// The Rust frontend lowers control flow it doesn't recognise as structured
+  /// to plain branches, but Triton's pipelines expect structured control flow:
+  /// TritonCPU only vectorizes tensors inside `scf`, and loop pipelining only
+  /// sees `scf.for`. Each backend's makeTTIR calls this before its own passes.
+  virtual LogicalResult structureControlFlow(MLIRContext &context,
+                                             ModuleOp module);
+
   virtual LogicalResult makeTTIR(MLIRContext &context, ModuleOp module) = 0;
 
   virtual LogicalResult makeTTGIR(MLIRContext &context, ModuleOp module) = 0;

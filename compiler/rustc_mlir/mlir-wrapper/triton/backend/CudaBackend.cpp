@@ -295,6 +295,9 @@ std::optional<Error> CudaBackend::addCudaPass(PassManager &pm, CudaPass pass,
 }
 
 LogicalResult CudaBackend::makeTTIR(MLIRContext &context, ModuleOp module) {
+  auto structured = structureControlFlow(context, module);
+  CHECK_RESULT(structured, "Failed to structure control flow.");
+
   PassManager pm(&context);
   auto capability = getCapability();
   auto op = module.getOperation();

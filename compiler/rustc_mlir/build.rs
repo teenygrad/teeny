@@ -233,6 +233,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     for lib in ["TritonCPUToLLVM", "TritonCPUTransforms", "TritonToTritonCPU", "TritonCPUIR"] {
         println!("cargo:rustc-link-lib=static={lib}");
     }
+    // Backend::structureControlFlow subclasses ControlFlowToSCFTransformation. Like the
+    // archives above it must follow mlir-wrapper; the MLIR libraries it needs in turn are
+    // linked by mlir-sys.
+    println!("cargo:rustc-link-lib=static=MLIRControlFlowToSCF");
 
     // Link MLIR libraries
     let mlir_lib_dir = llvm.install_dir.join("lib");
