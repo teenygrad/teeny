@@ -311,14 +311,16 @@ struct RangeLoopInfo {
     back_edge_bb: BasicBlock,
     /// The block taken when the loop exits.
     exit_bb: BasicBlock,
-    /// The Range.start local that is incremented each iteration.
-    counter_local: Local,
+    /// The Range.start local that is incremented each iteration. None for a Call-header loop
+    /// whose body never reads the loop variable.
+    counter_local: Option<Local>,
     /// The first value of the induction variable (Range.start).
     start: LoopBound,
     /// The exclusive upper bound of the induction variable (Range.end).
     end: LoopBound,
-    /// The "k" induction local (pre-increment counter, extracted from Some).
-    induction_local: Local,
+    /// The "k" induction local (pre-increment counter, extracted from Some). None when the body
+    /// never reads the loop variable (`for _ in ..`).
+    induction_local: Option<Local>,
     /// Locals that carry values across iterations (loop-carried values).
     iter_carry_locals: Vec<Local>,
     /// For Call-header pattern (Rust 1.93+): the SwitchInt block after Range::next.
@@ -1083,10 +1085,17 @@ fn try_build_range_loop_info<'tcx>(
         return None;
     }
 
-    // Find the induction local: extracted from Option::Some via downcast projection
-    let induction_local = find_induction_local_in_bbs(mir, &body_bbs)?;
+    // Find the induction local: extracted from Option::Some via downcast projection. A body that
+    // never reads the loop variable (`for _ in ..`) has none. That's fine once the header has
+    // shown this is an `Iterator::next` loop (it switches on the `Option` next returns), but a
+    // bare `counter < end` header without one is just as likely a hand-written `while` loop,
+    // which must not become a counted scf.for (teenyc-3jo).
+    let induction_local = find_induction_local_in_bbs(mir, &body_bbs);
+    if induction_local.is_none() && hinfo.switch_bb.is_none() {
+        return None;
+    }
 
-    let counter_local = hinfo.counter_local_hint.unwrap_or(induction_local);
+    let counter_local = hinfo.counter_local_hint.or(induction_local);
 
     // Find loop-carried locals (used before assigned in topological order).
     let mut iter_carry_locals = find_iter_carry_locals(mir, &body_bbs);
@@ -1845,8 +1854,10 @@ impl<'a> TritonCodegen<'a> {
             let entry_block_ref = *combined_blocks.get(&loop_info.body_entry_bb).unwrap();
             let iv: Value<'a, 'a> = entry_block_ref.argument(0).unwrap().into();
             // Both the "k" local and the counter local map to the scf.for IV.
-            state.ssa_values.insert(loop_info.induction_local, iv);
-            state.ssa_values.insert(loop_info.counter_local, iv);
+            for local in [loop_info.induction_local, loop_info.counter_local].into_iter().flatten()
+            {
+                state.ssa_values.insert(local, iv);
+            }
             for (i, &local) in loop_info.iter_carry_locals.iter().enumerate() {
                 let arg: Value<'a, 'a> = entry_block_ref.argument(i + 1).unwrap().into();
                 state.ssa_values.insert(local, arg);
