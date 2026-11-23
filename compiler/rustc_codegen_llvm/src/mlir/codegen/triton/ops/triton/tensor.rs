@@ -1054,6 +1054,19 @@ impl<'a> TritonCodegen<'a> {
             return Ok(Some(src_value));
         }
 
+        // `bitcast` (arg 2) reinterprets the bits instead of converting the value, which is
+        // how a kernel reads packed integer data out of a float buffer. Without this the
+        // element types alone decide the conversion below, so `cast::<f32, i32>(x, _, true)`
+        // silently became an `fptosi` and the packed bytes were lost.
+        if self.const_bool_arg(tcx, instance, &args[2].node) {
+            // tt.bitcast requires equal element widths; MLIR's verifier rejects the rest.
+            let op = bitcast(self.module.context(), location, src_value, dest_mlir_ty)
+                .map_err(|e| MlirError::CreateOperation { err: e })?;
+            let result = op.result(0).expect("bitcast result");
+            mlir_block.append_operation(op);
+            return Ok(Some(result.into()));
+        }
+
         // Otherwise emit the appropriate arith conversion op.
         let src_elem_ty = if src_value.r#type().is_tensor() {
             src_value

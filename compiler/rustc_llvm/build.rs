@@ -290,6 +290,12 @@ fn build_triton(llvm_config: &Path, workspace_root: &Path) -> PathBuf {
         // clang 22, since GSanLibrary.cu uses __scoped_atomic_thread_fence,
         // which clang 18 does not have.
         .define("TRITON_GSAN_CLANGXX", "/usr/bin/clang++-22")
+        // LOCAL CHANGE, not for upstream: the NVIDIA GSan runtime compiles a .cu
+        // through the clang++ above, which is not installed here (and Ubuntu's
+        // `clang` package is 19, not 22). It is an experimental CUDA sanitizer and
+        // nothing on the RISC-V path uses it; the rest of the NVIDIA backend still
+        // builds, which Triton's core needs. Drop this line once clang 22 exists.
+        .define("TRITON_BUILD_NVIDIA_GSAN_RUNTIME", "OFF")
         .define("CMAKE_BUILD_TYPE", build_type)
         .define("CMAKE_INCLUDE_PATH", triton_src.join("third_party"))
         .out_dir(&triton_build_out)
