@@ -55,6 +55,9 @@ into a branch, as in the 1.99.0 merge `d1704734df1`. When doing so:
   upstream's new structure.
 - Keep this `AGENTS.md`; resolve any conflict on it in favour of the fork's
   version.
+- Keep the `if: github.repository == 'rust-lang/rust'` guard on
+  `calculate_matrix` in `.github/workflows/ci.yml`, so upstream's CI stays off
+  the fork.
 - Regenerate `Cargo.lock` with the build rather than hand-merging it.
 - Summarise notable resolutions in the merge commit message.
 
