@@ -35,6 +35,7 @@ use rustc_middle::ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv};
 use rustc_mlir::shared::arith::{Int, create_extsi, create_int_constant};
 use rustc_mlir::shared::builtin::tensor_type;
 use rustc_mlir::triton::program::{ProgramAxis, create_get_num_programs};
+use rustc_mlir::triton::tensor::RoundingMode;
 use rustc_target::spec::Arch;
 use rustc_mlir::triton::tensor::{
     CacheModifier, EvictionPolicy, InputPrecision, MemSemantic, MemSyncScope, PropagateNan, RmwOp,
@@ -972,10 +973,12 @@ impl<'a> TritonCodegen<'a> {
 
     /// `triton::Triton::cast` — element-wise type cast for tensors.
     ///
-    /// args[0] = input tensor, args[1] = rounding mode (optional enum), args[2] = saturate (bool)
+    /// args[0] = input tensor, args[1] = rounding mode (optional enum), args[2] = bitcast (bool)
     ///
     /// For the common case where src and dst element types are the same, returns the input as-is.
-    /// For type conversions, emits the appropriate `arith` cast operation.
+    /// A bitcast reinterprets the element bits as `tt.bitcast`; any other cast converts the
+    /// value with the appropriate `arith` cast operation. As in Triton's `cast`, a rounding mode
+    /// may only be given for a float narrowing, which rounds to nearest-even unless told otherwise.
     pub fn codegen_cast_call<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -1049,6 +1052,31 @@ impl<'a> TritonCodegen<'a> {
             dest_mlir_ty
         };
 
+        let reinterpret = self
+            .to_scalar_int(tcx, instance, &args[2].node)
+            .map(|s| s.to_bits_unchecked() != 0)
+            .map_err(|_| MlirError::CodegenFailed {
+                err: "cast: `bitcast` must be a compile-time constant".into(),
+            })?;
+        // The discriminants of teeny-triton's `FpDowncastRounding`, in declaration order.
+        let rounding = match self.const_option_int(
+            tcx,
+            instance,
+            mir,
+            &args[1].node,
+            "Option<FpDowncastRounding>",
+            state,
+        )? {
+            None => None,
+            Some(0) => Some(RoundingMode::RTNE),
+            Some(1) => Some(RoundingMode::RTZ),
+            Some(other) => {
+                return Err(MlirError::CodegenFailed {
+                    err: format!("cast: unknown `fp_downcast_rounding` discriminant {other}"),
+                });
+            }
+        };
+
         // If source and destination MLIR types are the same, the cast is a no-op.
         if src_value.r#type() == dest_mlir_ty {
             return Ok(Some(src_value));
@@ -1072,6 +1100,43 @@ impl<'a> TritonCodegen<'a> {
         } else {
             dest_mlir_ty
         };
+
+        let is_fp_narrowing = src_elem_ty.is_float()
+            && dst_elem_ty.is_float()
+            && Self::elem_bit_width(dst_elem_ty) < Self::elem_bit_width(src_elem_ty);
+        if rounding.is_some() && (reinterpret || !is_fp_narrowing) {
+            return Err(MlirError::CodegenFailed {
+                err: format!(
+                    "cast: `fp_downcast_rounding` is only for narrowing float casts, not \
+                     {}{src_elem_ty} -> {dst_elem_ty}",
+                    if reinterpret { "a bitcast " } else { "" }
+                ),
+            });
+        }
+
+        // Packed data (sub-byte quantised weights carried in f32 words) is read back out by
+        // reinterpreting the words' bits, which a value conversion would destroy.
+        if reinterpret {
+            let (src_bits, dst_bits) =
+                (Self::elem_bit_width(src_elem_ty), Self::elem_bit_width(dst_elem_ty));
+            if src_bits.is_none() || src_bits != dst_bits {
+                return Err(MlirError::CodegenFailed {
+                    err: format!(
+                        "cast: a bitcast needs element types of the same width, found \
+                         {src_elem_ty} -> {dst_elem_ty}"
+                    ),
+                });
+            }
+            let op = bitcast(self.module.context(), location, src_value, dest_mlir_ty)
+                .map_err(|e| MlirError::CreateOperation { err: e })?;
+            return self.append_result(op, mlir_block).map(Some);
+        }
+
+        if rounding == Some(RoundingMode::RTZ) {
+            return self
+                .truncf_towards_zero(src_value, dest_mlir_ty, dst_elem_ty, location, mlir_block)
+                .map(Some);
+        }
 
         // melior typed_unary_operations signature: (in_value, out_type, location)
         let cast_op: Operation<'a> = if src_elem_ty.is_float() && dst_elem_ty.is_float() {
@@ -1139,6 +1204,85 @@ impl<'a> TritonCodegen<'a> {
         let result = cast_op.result(0).expect("cast result");
         mlir_block.append_operation(cast_op);
         Ok(Some(result.into()))
+    }
+
+    /// Narrows the floats in `x` to `dest_ty`, rounding towards zero.
+    ///
+    /// Triton spells this `tt.fp_to_fp {rounding = rtz}`, but neither backend lowers it for us:
+    /// NVIDIA's only handles an f32 source, and the CPU one becomes a constrained `fptrunc`,
+    /// which assumes the rounding mode rather than setting it, so RISC-V's `fcvt.s.d` rounds to
+    /// nearest. Instead the value is rounded to nearest-even, which is at most one ulp from
+    /// rounding towards zero, and stepped one ulp back towards zero when that landed further
+    /// from zero than `x`. Stepping is decrementing the magnitude bits, which also turns an
+    /// overflow to infinity into the largest finite value; NaNs and exact values never step.
+    fn truncf_towards_zero(
+        &self,
+        x: Value<'a, 'a>,
+        dest_ty: melior::ir::Type<'a>,
+        dst_elem_ty: melior::ir::Type<'a>,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+    ) -> Result<Value<'a, 'a>, MlirError> {
+        use melior::dialect::arith::{CmpfPredicate, cmpf, extf, select, subi};
+        use melior::ir::ShapedTypeLike;
+
+        let context = self.module.context();
+        let emit = |op: Operation<'a>| self.append_result(op, mlir_block);
+        let build_err = |e: melior::error::Error| MlirError::CodegenFailed { err: e.to_string() };
+        let to_err = |e| MlirError::CreateOperation { err: e };
+        let unary = |name: &str, operand: Value<'a, 'a>, result_ty: melior::ir::Type<'a>| {
+            OperationBuilder::new(name, location)
+                .add_operands(&[operand])
+                .add_results(&[result_ty])
+                .build()
+                .map_err(build_err)
+        };
+
+        let (bits, one) = match Self::elem_bit_width(dst_elem_ty) {
+            Some(16) => (16, Int::I16(1)),
+            Some(32) => (32, Int::I32(1)),
+            Some(64) => (64, Int::I64(1)),
+            _ => {
+                return Err(MlirError::CodegenFailed {
+                    err: format!("cast: cannot round towards zero to {dst_elem_ty}"),
+                });
+            }
+        };
+        let int_elem: melior::ir::Type<'a> = IntegerType::new(context, bits).into();
+        let one = emit(create_int_constant(context, location, one).map_err(to_err)?.into())?;
+        let (int_ty, one) = match RankedTensorType::try_from(dest_ty) {
+            Ok(tensor) => {
+                let dims =
+                    tensor.dims().map_err(|e| MlirError::InvalidType { msg: e.to_string() })?;
+                let int_ty: melior::ir::Type<'a> = tensor_type(&dims, int_elem).into();
+                let one = emit(splat(context, location, one, int_ty).map_err(to_err)?.into())?;
+                (int_ty, one)
+            }
+            Err(_) => (int_elem, one),
+        };
+
+        let nearest = emit(unary("arith.truncf", x, dest_ty)?)?;
+        let widened = emit(extf(nearest, x.r#type(), location))?;
+        let widened_abs = emit(unary("math.absf", widened, x.r#type())?)?;
+        let x_abs = emit(unary("math.absf", x, x.r#type())?)?;
+        let overshot = emit(cmpf(context, CmpfPredicate::Ogt, widened_abs, x_abs, location))?;
+        let nearest_bits = emit(bitcast(context, location, nearest, int_ty).map_err(to_err)?)?;
+        let stepped = emit(subi(nearest_bits, one, location))?;
+        let chosen = emit(select(overshot, stepped, nearest_bits, location))?;
+        emit(bitcast(context, location, chosen, dest_ty).map_err(to_err)?)
+    }
+
+    /// The bit width of an integer or float element type, or `None` for any other type.
+    fn elem_bit_width(ty: melior::ir::Type<'a>) -> Option<u32> {
+        if let Ok(int_ty) = IntegerType::try_from(ty) {
+            return Some(int_ty.width());
+        }
+        match ty.to_string().as_str() {
+            "f16" | "bf16" => Some(16),
+            "f32" => Some(32),
+            "f64" => Some(64),
+            _ => None,
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -3206,9 +3350,7 @@ impl<'a> TritonCodegen<'a> {
         Ok(Some(result.into()))
     }
 
-    /// The compile-time value of an `Option<i32>` argument. It arrives either as a MIR constant
-    /// (`const Option::<i32>::Some(0_i32)`), destructured with const-eval, or as a local built
-    /// by an aggregate, whose `Some` payload in `option_table` is an `arith.constant`.
+    /// The compile-time value of an `Option<i32>` argument (see [`Self::const_option_int`]).
     fn const_option_i32<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -3217,8 +3359,32 @@ impl<'a> TritonCodegen<'a> {
         operand: &Operand<'tcx>,
         state: &CodegenState<'a, 'a>,
     ) -> Result<Option<i32>, MlirError> {
+        let value = self.const_option_int(tcx, instance, mir, operand, "Option<i32>", state)?;
+        value
+            .map(|v| {
+                i32::try_from(v).map_err(|_| MlirError::CodegenFailed {
+                    err: format!("expected a compile-time Option<i32>, got {operand:?}"),
+                })
+            })
+            .transpose()
+    }
+
+    /// The compile-time value of an `Option` argument whose payload is an integer or a
+    /// fieldless enum (its discriminant). It arrives either as a MIR constant
+    /// (`const Option::<i32>::Some(0_i32)`), destructured with const-eval, or as a local built
+    /// by an aggregate, whose `Some` payload in `option_table` is an `arith.constant`.
+    /// `expected` names the argument's type in the error when it is neither.
+    fn const_option_int<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        operand: &Operand<'tcx>,
+        expected: &str,
+        state: &CodegenState<'a, 'a>,
+    ) -> Result<Option<i128>, MlirError> {
         let fail = || MlirError::CodegenFailed {
-            err: format!("expected a compile-time Option<i32>, got {operand:?}"),
+            err: format!("expected a compile-time {expected}, got {operand:?}"),
         };
         match operand {
             Operand::Constant(c) => {
@@ -3238,7 +3404,7 @@ impl<'a> TritonCodegen<'a> {
                     tcx.try_destructure_mir_constant_for_user_output(value, ty).ok_or_else(fail)?;
                 match parts.fields {
                     [] => Ok(None),
-                    [(ConstValue::Scalar(Scalar::Int(int)), _)] => Ok(Some(int.to_i32())),
+                    [(ConstValue::Scalar(Scalar::Int(int)), _)] => Ok(Some(int.to_int(int.size()))),
                     _ => Err(fail()),
                 }
             }
@@ -3246,7 +3412,7 @@ impl<'a> TritonCodegen<'a> {
                 match state.option_table.get(&p.local).ok_or_else(fail)? {
                     OptionValue::None => Ok(None),
                     OptionValue::Some(value) => {
-                        Self::constant_i32(*value).map(Some).ok_or_else(fail)
+                        Self::constant_i32(*value).map(|v| Some(v.into())).ok_or_else(fail)
                     }
                     OptionValue::Merged { .. } => Err(fail()),
                 }

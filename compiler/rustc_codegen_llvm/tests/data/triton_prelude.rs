@@ -470,6 +470,116 @@ pub mod core {
             }
         }
 
+        #[lang = "bitand"]
+        pub trait BitAnd<RHS = Self> {
+            type Output;
+            fn bitand(self, rhs: RHS) -> Self::Output;
+        }
+
+        // Just a dummy, the compiler will generate the correct implementation
+        impl BitAnd for i32 {
+            type Output = i32;
+            fn bitand(self, rhs: i32) -> Self::Output {
+                0
+            }
+        }
+
+        // Just a dummy, the compiler will generate the correct implementation
+        impl BitAnd for u32 {
+            type Output = u32;
+            fn bitand(self, rhs: u32) -> Self::Output {
+                0
+            }
+        }
+
+        #[lang = "bitor"]
+        pub trait BitOr<RHS = Self> {
+            type Output;
+            fn bitor(self, rhs: RHS) -> Self::Output;
+        }
+
+        // Just a dummy, the compiler will generate the correct implementation
+        impl BitOr for i32 {
+            type Output = i32;
+            fn bitor(self, rhs: i32) -> Self::Output {
+                0
+            }
+        }
+
+        // Just a dummy, the compiler will generate the correct implementation
+        impl BitOr for u32 {
+            type Output = u32;
+            fn bitor(self, rhs: u32) -> Self::Output {
+                0
+            }
+        }
+
+        #[lang = "bitxor"]
+        pub trait BitXor<RHS = Self> {
+            type Output;
+            fn bitxor(self, rhs: RHS) -> Self::Output;
+        }
+
+        // Just a dummy, the compiler will generate the correct implementation
+        impl BitXor for i32 {
+            type Output = i32;
+            fn bitxor(self, rhs: i32) -> Self::Output {
+                0
+            }
+        }
+
+        // Just a dummy, the compiler will generate the correct implementation
+        impl BitXor for u32 {
+            type Output = u32;
+            fn bitxor(self, rhs: u32) -> Self::Output {
+                0
+            }
+        }
+
+        #[lang = "shl"]
+        pub trait Shl<RHS = Self> {
+            type Output;
+            fn shl(self, rhs: RHS) -> Self::Output;
+        }
+
+        // Just a dummy, the compiler will generate the correct implementation
+        impl Shl for i32 {
+            type Output = i32;
+            fn shl(self, rhs: i32) -> Self::Output {
+                0
+            }
+        }
+
+        // Just a dummy, the compiler will generate the correct implementation
+        impl Shl for u32 {
+            type Output = u32;
+            fn shl(self, rhs: u32) -> Self::Output {
+                0
+            }
+        }
+
+        #[lang = "shr"]
+        pub trait Shr<RHS = Self> {
+            type Output;
+            fn shr(self, rhs: RHS) -> Self::Output;
+        }
+
+        // Just a dummy, the compiler will generate the correct implementation
+        impl Shr for i32 {
+            type Output = i32;
+            fn shr(self, rhs: i32) -> Self::Output {
+                0
+            }
+        }
+
+        // Just a dummy, the compiler will generate the correct implementation
+        impl Shr for u32 {
+            type Output = u32;
+            fn shr(self, rhs: u32) -> Self::Output {
+                0
+            }
+        }
+
         #[lang = "Range"]
         pub struct Range<Idx> {
             pub start: Idx,
@@ -2409,6 +2519,56 @@ pub mod triton {
                     #[inline(never)]
                     #[allow(clippy::zero_ptr)]
                     fn mul(self, _rhs: i32) -> Self::Output {
+                        LlvmTensor(0 as *mut i32)
+                    }
+                }
+
+                impl crate::core::ops::BitAnd<i32> for LlvmI32Tensor {
+                    type Output = LlvmI32Tensor;
+
+                    #[inline(never)]
+                    #[allow(clippy::zero_ptr)]
+                    fn bitand(self, _rhs: i32) -> Self::Output {
+                        LlvmTensor(0 as *mut i32)
+                    }
+                }
+
+                impl crate::core::ops::BitOr<i32> for LlvmI32Tensor {
+                    type Output = LlvmI32Tensor;
+
+                    #[inline(never)]
+                    #[allow(clippy::zero_ptr)]
+                    fn bitor(self, _rhs: i32) -> Self::Output {
+                        LlvmTensor(0 as *mut i32)
+                    }
+                }
+
+                impl crate::core::ops::BitXor<i32> for LlvmI32Tensor {
+                    type Output = LlvmI32Tensor;
+
+                    #[inline(never)]
+                    #[allow(clippy::zero_ptr)]
+                    fn bitxor(self, _rhs: i32) -> Self::Output {
+                        LlvmTensor(0 as *mut i32)
+                    }
+                }
+
+                impl crate::core::ops::Shl<i32> for LlvmI32Tensor {
+                    type Output = LlvmI32Tensor;
+
+                    #[inline(never)]
+                    #[allow(clippy::zero_ptr)]
+                    fn shl(self, _rhs: i32) -> Self::Output {
+                        LlvmTensor(0 as *mut i32)
+                    }
+                }
+
+                impl crate::core::ops::Shr<i32> for LlvmI32Tensor {
+                    type Output = LlvmI32Tensor;
+
+                    #[inline(never)]
+                    #[allow(clippy::zero_ptr)]
+                    fn shr(self, _rhs: i32) -> Self::Output {
                         LlvmTensor(0 as *mut i32)
                     }
                 }

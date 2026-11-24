@@ -575,6 +575,102 @@ fn a_countdown_loop_counter_keeps_its_exit_value_for_every_target() {
     }
 }
 
+#[test]
+fn a_bitcast_reinterprets_the_bits_for_every_target() {
+    // teenygrad#170: `T::cast(.., true)` converted by value (`arith.fptosi`), so f32 words
+    // carrying packed bytes could not be read back out. And `>>` on a tensor lowered to an
+    // unshaped `tensor<?xf32>` that failed to verify.
+    for (target, name) in LOOP_TARGETS {
+        let mlir = compile_to_ttir("triton_bitcast_shift.rs", target, &format!("{name}_bitcast"));
+        assert!(
+            mlir.contains("tt.bitcast") && !mlir.contains("arith.fptosi"),
+            "expected the cast to reinterpret the bits on {target}:\n{mlir}"
+        );
+        assert!(
+            mlir.lines().any(|l| l.contains("arith.shrsi") && l.contains("tensor<16xi32>")),
+            "expected an arithmetic shift of the i32 tensor on {target}:\n{mlir}"
+        );
+        assert_store_is_computed(&mlir, target);
+    }
+}
+
+#[test]
+fn bitcast_shifts_and_xor_compute_the_packed_value_for_every_target() {
+    // teenygrad#170: 1.5f32 is 0x3FC0_0000, so `((bits >> 16) & 0xFF) << 1 ^ 3` is 387 when the
+    // cast reinterprets the bits, and 3 when it converts the value. The kernel folds to a
+    // constant store, so the value the assembly materialises is the one it computed.
+    for target in ["nvptx64-nvidia-cuda", "riscv64-generic"] {
+        let name = format!("bitcast-constant-{target}");
+        compile_to_mlir("triton_bitcast_constant.rs", target, &name);
+        let asm = std::fs::read_to_string(format!("/tmp/kernel-{name}.asm"))
+            .unwrap_or_else(|e| panic!("read the assembly for {target}: {e}"));
+        assert!(
+            asm.lines().any(|l| {
+                let l = l.trim_end().trim_end_matches(';');
+                l.ends_with(", 387") && !l.trim_start().starts_with("//")
+            }),
+            "expected the kernel to store 387 on {target}:\n{asm}"
+        );
+    }
+}
+
+#[test]
+fn a_bitcast_between_different_widths_is_rejected() {
+    // A bitcast keeps every bit, so f32 to i16 has no meaning as one; it is an error rather
+    // than a silent value conversion (teenygrad#170).
+    for target in ["nvptx64-nvidia-cuda", "riscv64-generic"] {
+        let result = try_compile(
+            &data_file("triton_bitcast_width_mismatch.rs"),
+            target,
+            &format!("bitcast-width-mismatch-{target}"),
+            &["--emit=asm"],
+        );
+        assert!(result.is_err(), "expected a bitcast from f32 to i16 to be rejected on {target}");
+    }
+}
+
+#[test]
+fn a_cast_rounds_as_its_fp_downcast_rounding_says_for_every_target() {
+    // teenygrad#170: `fp_downcast_rounding` was ignored, so f64 to f32 always rounded to
+    // nearest-even. The kernel stores the low nibble of 1/3 rounded each way: 11 to nearest-even
+    // and 10 towards zero. It folds to constant stores, so both appear in the assembly.
+    for (target, op) in [("nvptx64-nvidia-cuda", "mov.b32"), ("riscv64-generic", "vmv.v.i")] {
+        let name = format!("cast-rounding-{target}");
+        compile_to_mlir("triton_cast_rounding.rs", target, &name);
+        let asm = std::fs::read_to_string(format!("/tmp/kernel-{name}.asm"))
+            .unwrap_or_else(|e| panic!("read the assembly for {target}: {e}"));
+        let stored: Vec<&str> = asm
+            .lines()
+            .filter(|l| l.trim_start().starts_with(op))
+            .map(|l| l.trim_end().trim_end_matches(';'))
+            .collect();
+        for value in [11, 10] {
+            assert!(
+                stored.iter().any(|l| l.ends_with(&format!(", {value}"))),
+                "expected the kernel to store {value} on {target}, found {stored:?}:\n{asm}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_rounding_mode_on_a_cast_that_does_not_narrow_a_float_is_rejected() {
+    // As in Triton's `cast`, only a float narrowing rounds; a rounding mode for any other cast
+    // (here f32 to i32) is an error rather than ignored (teenygrad#170).
+    for target in ["nvptx64-nvidia-cuda", "riscv64-generic"] {
+        let result = try_compile(
+            &data_file("triton_cast_rounding_not_narrowing.rs"),
+            target,
+            &format!("cast-rounding-not-narrowing-{target}"),
+            &["--emit=asm"],
+        );
+        assert!(
+            result.is_err(),
+            "expected a rounding mode on f32 to i32 to be rejected on {target}"
+        );
+    }
+}
+
 /// The kernel stores a value it computed (a loop's result, or one merged from both arms of an
 /// `if`), not a constant (`%cst`).
 fn assert_store_is_computed(mlir: &str, target: &str) {
