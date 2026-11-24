@@ -114,6 +114,11 @@ fn main() {
         _ => ArgFileCommand::new(rustc_driver),
     };
     cmd.args(&args).env(dylib_path_var(), env::join_paths(&dylib_path).unwrap());
+    // The stage compiler binary is named `teenyc`, and run under that name it says so in
+    // `--version`. Build scripts query the version through this shim, and some (`rustversion`'s)
+    // reject a version line that doesn't start with `rustc`, so keep the upstream name.
+    // See `VERSION_AS_RUSTC_VAR` in rustc_driver_impl.
+    cmd.env("TEENYC_VERSION_AS_RUSTC", "1");
 
     if let Some(crate_name) = crate_name
         && let Some(target) = env::var_os("RUSTC_TIME")

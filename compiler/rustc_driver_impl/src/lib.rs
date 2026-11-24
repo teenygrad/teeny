@@ -863,7 +863,7 @@ pub fn print_crate_info(
 /// Prints version information
 ///
 /// NOTE: this is a macro to support drivers built at a different time than the main `rustc_driver` crate.
-pub macro version($early_dcx: expr, $binary: literal, $matches: expr) {
+pub macro version($early_dcx: expr, $binary: expr, $matches: expr) {
     fn unw(x: Option<&str>) -> &str {
         x.unwrap_or("unknown")
     }
@@ -1175,6 +1175,20 @@ pub enum HandledOptions {
     HelpOnly(getopts::Matches),
 }
 
+/// Set by bootstrap's rustc shim so that `--version` keeps naming the compiler `rustc` while it
+/// builds the next stage: the shim runs the stage compiler binary, `teenyc`, and
+/// some build scripts (`rustversion`'s) reject a version line that doesn't start with `rustc`.
+const VERSION_AS_RUSTC_VAR: &str = "TEENYC_VERSION_AS_RUSTC";
+
+/// The name `--version` prints. This fork ships one compiler binary as both `teenyc` and `rustc`
+/// (cargo and rustup's proxies need the latter, see bootstrap's `dist.rs`), so it names the binary
+/// it was run as: the `rustc` copy that cargo and build scripts use has to keep saying `rustc`.
+fn version_binary_name(arg0: Option<&std::ffi::OsStr>, as_rustc: bool) -> &'static str {
+    let invoked_as_teenyc =
+        arg0.and_then(|arg0| Path::new(arg0).file_stem()).is_some_and(|stem| stem == "teenyc");
+    if invoked_as_teenyc && !as_rustc { "teenyc" } else { "rustc" }
+}
+
 /// Process command line options. Emits messages as appropriate. If compilation
 /// should continue, returns a getopts::Matches object parsed from args,
 /// otherwise returns `None`.
@@ -1265,7 +1279,9 @@ pub fn handle_options(early_dcx: &EarlyDiagCtxt, args: &[String]) -> HandledOpti
     }
 
     if matches.opt_present("version") {
-        version!(early_dcx, "rustc", &matches);
+        let arg0 = env::args_os().next();
+        let as_rustc = env::var_os(VERSION_AS_RUSTC_VAR).is_some();
+        version!(early_dcx, version_binary_name(arg0.as_deref(), as_rustc), &matches);
         return HandledOptions::None;
     }
 
@@ -1684,3 +1700,6 @@ pub fn main() -> ExitCode {
 
     exit_code
 }
+
+#[cfg(test)]
+mod tests;

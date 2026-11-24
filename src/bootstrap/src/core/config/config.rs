@@ -2268,7 +2268,9 @@ fn check_external_binary_version(
     let mut output = output.lines().next().unwrap().split(' ');
 
     let name = output.next().unwrap();
-    if name != component_name {
+    // This fork's compiler names itself `teenyc` when run under that name.
+    let is_teenyc_rustc = component_name == "rustc" && name == "teenyc";
+    if name != component_name && !is_teenyc_rustc {
         fail(&format!(
             "Expected to find {component_name} at {} but it claims to be {name}",
             program_path.display()
