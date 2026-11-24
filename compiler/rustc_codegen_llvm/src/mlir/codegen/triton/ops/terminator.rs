@@ -238,6 +238,8 @@ impl<'a> TritonCodegen<'a> {
             "core::ops::Sub::sub" => TritonCodegen::codegen_sub_call as LocalCallHandler<'a, 'tcx>,
             "core::ops::Neg::neg" => TritonCodegen::codegen_neg_call as LocalCallHandler<'a, 'tcx>,
             "core::ops::Div::div" => TritonCodegen::codegen_div_call as LocalCallHandler<'a, 'tcx>,
+            "core::ops::Shl::shl" => TritonCodegen::codegen_shl_call as LocalCallHandler<'a, 'tcx>,
+            "core::ops::Shr::shr" => TritonCodegen::codegen_shr_call as LocalCallHandler<'a, 'tcx>,
             "core::ops::BitAnd::bitand" => {
                 TritonCodegen::codegen_and_call as LocalCallHandler<'a, 'tcx>
             }

@@ -169,6 +169,86 @@ impl<'a> TritonCodegen<'a> {
         self.codegen_div(tcx, unsigned, location, lhs, rhs, mlir_block)
     }
 
+    pub fn codegen_shl_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        debug_assert!(args.len() == 2, "TritonCodegen::codegen_shl_call: args length must be 2");
+        let lhs = self.codegen_operand(
+            tcx,
+            instance,
+            &args[0].node,
+            args[0].node.ty(mir, tcx),
+            location,
+            mlir_block,
+            state,
+        )?;
+        let rhs = self.codegen_operand(
+            tcx,
+            instance,
+            &args[1].node,
+            args[1].node.ty(mir, tcx),
+            location,
+            mlir_block,
+            state,
+        )?;
+        self.codegen_shl(tcx, location, lhs, rhs, mlir_block)
+    }
+
+    pub fn codegen_shr_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: &Instance<'tcx>,
+        mir: &Body<'tcx>,
+        _func: &Operand<'tcx>,
+        _func_name: &str,
+        args: &[Spanned<Operand<'tcx>>],
+        _destination: &Place<'tcx>,
+        _target: &Option<BasicBlock>,
+        _unwind: &UnwindAction,
+        _call_source: &CallSource,
+        _fn_span: &Span,
+        location: Location<'a>,
+        mlir_block: &BlockRef<'a, 'a>,
+        state: &mut CodegenState<'a, 'a>,
+    ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        debug_assert!(args.len() == 2, "TritonCodegen::codegen_shr_call: args length must be 2");
+        let lhs = self.codegen_operand(
+            tcx,
+            instance,
+            &args[0].node,
+            args[0].node.ty(mir, tcx),
+            location,
+            mlir_block,
+            state,
+        )?;
+        let rhs = self.codegen_operand(
+            tcx,
+            instance,
+            &args[1].node,
+            args[1].node.ty(mir, tcx),
+            location,
+            mlir_block,
+            state,
+        )?;
+        // Rust's `>>` on a signed integer is arithmetic, on an unsigned one logical.
+        let signed = !Self::is_unsigned(tcx, instance, args[0].node.ty(mir, tcx));
+        self.codegen_shr(tcx, signed, location, lhs, rhs, mlir_block)
+    }
+
     pub fn codegen_and_call<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -1250,11 +1330,23 @@ impl<'a> TritonCodegen<'a> {
         rhs: Value<'a, 'a>,
         mlir_block: &BlockRef<'a, 'a>,
     ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        // A tensor shifted by a scalar broadcasts the scalar, as the other integer
+        // binary operators do; `arith.shli` needs both operands the same shape.
+        let (lhs, rhs) = match (lhs.r#type().is_tensor(), rhs.r#type().is_tensor()) {
+            (true, false) => (lhs, self.like_tensor(_tcx, location, lhs, rhs, mlir_block)?),
+            (false, true) => (self.like_tensor(_tcx, location, rhs, lhs, mlir_block)?, rhs),
+            _ => (lhs, rhs),
+        };
         let lhs_ty = lhs.r#type();
-        if lhs_ty.is_tensor() || rhs.r#type().is_tensor() {
-            todo!("TritonCodegen::codegen_shl tensor not yet supported")
-        }
-        if lhs_ty.is_integer() {
+        let is_int = if lhs_ty.is_tensor() {
+            RankedTensorType::try_from(lhs_ty)
+                .map_err(|e: melior::error::Error| MlirError::InvalidType { msg: e.to_string() })?
+                .element()
+                .is_integer()
+        } else {
+            lhs_ty.is_integer()
+        };
+        if is_int {
             let op: Operation<'a> = create_shli(self.module.context(), location, lhs, rhs)
                 .map_err(|e| MlirError::CreateOperation { err: e })?;
             let result = op.result(0).expect("Shl operation result not found");
@@ -1274,11 +1366,21 @@ impl<'a> TritonCodegen<'a> {
         rhs: Value<'a, 'a>,
         mlir_block: &BlockRef<'a, 'a>,
     ) -> Result<Option<Value<'a, 'a>>, MlirError> {
+        let (lhs, rhs) = match (lhs.r#type().is_tensor(), rhs.r#type().is_tensor()) {
+            (true, false) => (lhs, self.like_tensor(_tcx, location, lhs, rhs, mlir_block)?),
+            (false, true) => (self.like_tensor(_tcx, location, rhs, lhs, mlir_block)?, rhs),
+            _ => (lhs, rhs),
+        };
         let lhs_ty = lhs.r#type();
-        if lhs_ty.is_tensor() || rhs.r#type().is_tensor() {
-            todo!("TritonCodegen::codegen_shr tensor not yet supported")
-        }
-        if lhs_ty.is_integer() {
+        let is_int = if lhs_ty.is_tensor() {
+            RankedTensorType::try_from(lhs_ty)
+                .map_err(|e: melior::error::Error| MlirError::InvalidType { msg: e.to_string() })?
+                .element()
+                .is_integer()
+        } else {
+            lhs_ty.is_integer()
+        };
+        if is_int {
             let op: Operation<'a> = if signed {
                 create_shrsi(self.module.context(), location, lhs, rhs)
                     .map_err(|e| MlirError::CreateOperation { err: e })?
