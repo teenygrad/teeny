@@ -244,6 +244,11 @@ impl<'a> TritonCodegen<'a> {
             "core::ops::BitOr::bitor" => {
                 TritonCodegen::codegen_or_call as LocalCallHandler<'a, 'tcx>
             }
+            "core::ops::BitXor::bitxor" => {
+                TritonCodegen::codegen_xor_call as LocalCallHandler<'a, 'tcx>
+            }
+            "core::ops::Shl::shl" => TritonCodegen::codegen_shl_call as LocalCallHandler<'a, 'tcx>,
+            "core::ops::Shr::shr" => TritonCodegen::codegen_shr_call as LocalCallHandler<'a, 'tcx>,
             "triton::Triton::program_id" => {
                 TritonCodegen::codegen_program_id as LocalCallHandler<'a, 'tcx>
             }
